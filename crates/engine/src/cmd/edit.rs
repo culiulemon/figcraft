@@ -804,9 +804,15 @@ fn copy_props_of(doc: &Document, id: NodeId) -> Value {
         "strokeSides": n.stroke.sides, "startCap": n.stroke.cap_start, "endCap": n.stroke.cap_end,
         "strokeJoin": n.stroke.join, "miterLimit": n.stroke.miter_limit, "dashes": n.stroke.dashes,
         "widthProfile": super::props::width_points_json(n.stroke.width_profile.as_ref()), "brush": n.stroke.brush,
-        "effects": n.effects, "opacity": n.opacity, "blend": n.blend, "cornerRadius": n.corners.radii,
-        "cornerSmoothing": n.corners.smoothing,
+        "effects": n.effects, "opacity": n.opacity, "blend": n.blend,
     });
+    // A vector rounds each anchor on its own (`vector.edit.cornerRadius` keeps the radii in the
+    // network's vertices, its layer corners stay empty): there is no style radius to carry, and
+    // pasting the empty one would flatten every anchor's radius.
+    if !matches!(n.kind, NodeKind::Vector { .. }) {
+        v["cornerRadius"] = json!(n.corners.radii);
+        v["cornerSmoothing"] = json!(n.corners.smoothing);
+    }
     if let NodeKind::Text(t) = &n.kind {
         v["fontFamily"] = json!(t.style.font_family);
         v["fontStyle"] = json!(t.style.font_style);
