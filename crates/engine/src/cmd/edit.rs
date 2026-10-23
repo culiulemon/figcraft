@@ -801,6 +801,9 @@ fn copy_props_of(doc: &Document, id: NodeId) -> Value {
     let Some(n) = doc.node(id) else { return Value::Null };
     let mut v = json!({
         "fills": n.fills, "strokes": n.strokes, "strokeWeight": n.stroke.weight, "strokeAlign": n.stroke.align,
+        "strokeSides": n.stroke.sides, "startCap": n.stroke.cap_start, "endCap": n.stroke.cap_end,
+        "strokeJoin": n.stroke.join, "miterLimit": n.stroke.miter_limit, "dashes": n.stroke.dashes,
+        "widthProfile": super::props::width_points_json(n.stroke.width_profile.as_ref()), "brush": n.stroke.brush,
         "effects": n.effects, "opacity": n.opacity, "blend": n.blend, "cornerRadius": n.corners.radii,
         "cornerSmoothing": n.corners.smoothing,
     });

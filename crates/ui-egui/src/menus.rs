@@ -219,6 +219,11 @@ pub fn invoke(app: &mut FigApp, id: &str) {
         "collab.join" => crate::live::open_join(app, ""),
         // So is the server address for publishing (it carries the server key).
         "collab.publish" => crate::live::open_publish(app),
+        "edit.copyProperties" => {
+            if app.run(id, json!({})).is_some() {
+                app.toast(tr("Properties copied"));
+            }
+        }
         "edit.copy" | "edit.cut" => {
             let ids = app.session.selection();
             // For other apps: text layers' text, other layers as SVG; taken before a cut removes them.
