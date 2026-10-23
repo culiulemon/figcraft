@@ -360,6 +360,9 @@ pub(crate) enum Gesture {
         /// A Shift-press on this selected layer: it leaves the selection on release, unless the
         /// press became a drag.
         deselect: Option<NodeId>,
+        /// A press on one layer of a multi-selection that keeps the selection to drag it all: a
+        /// release without a drag selects just this layer.
+        keep: Option<NodeId>,
     },
     Resize {
         start: Point,
@@ -1211,13 +1214,15 @@ impl Session {
         });
         match target {
             Some(target) => {
-                // Clicking inside the current selection's box keeps it (drag them all).
+                // Clicking inside the current selection's box keeps it (drag them all); a click
+                // that doesn't become a drag narrows it to the clicked layer.
                 let in_sel_box = sel.len() > 1 && doc.bounds_of(&sel).is_some_and(|b| b.contains(ev.p())) && !ev.shift;
                 // Shift on a selected layer takes it out on release if the press doesn't become a
                 // drag; a drag moves the selection with it. Where no drag can start, it goes now.
                 let deselect = (ev.shift && sel.contains(&target)).then_some(target);
                 let without_target = || sel.iter().copied().filter(|x| *x != target).collect::<Vec<_>>();
-                let new_sel = if in_sel_box && (sel.contains(&target) || sel.iter().any(|s| doc.is_ancestor(*s, target))) {
+                let keep = (in_sel_box && !ev.cmd && (sel.contains(&target) || sel.iter().any(|s| doc.is_ancestor(*s, target)))).then_some(target);
+                let new_sel = if keep.is_some() {
                     sel.clone()
                 } else if ev.shift && deselect.is_none() {
                     let mut s2 = sel.clone();
@@ -1234,6 +1239,9 @@ impl Session {
                 if new_sel.is_empty() || doc.node(target).is_some_and(|n| n.locked) || ids.is_empty() {
                     if deselect.is_some() {
                         self.set_selection(without_target());
+                    } else if keep.is_some() {
+                        // No drag can start here, so the click narrows the selection now.
+                        self.set_selection(vec![target]);
                     }
                     return Ok(());
                 }
@@ -1250,7 +1258,7 @@ impl Session {
                     }
                     return Err(e);
                 }
-                self.tool.gesture = Gesture::Move { start: ev.p(), ids, targets, duplicate: ev.alt, moved: false, deselect };
+                self.tool.gesture = Gesture::Move { start: ev.p(), ids, targets, duplicate: ev.alt, moved: false, deselect, keep };
                 self.tool.overlay.cursor = if ev.alt { Cursor::Copy } else { Cursor::Default };
             }
             None => {
@@ -1759,7 +1767,7 @@ impl Session {
         self.tool.overlay.drop_cell = None;
         let drop_target = self.tool.overlay.drop_target.take();
         match g {
-            Gesture::Move { ids, moved, duplicate, start, deselect, .. } => {
+            Gesture::Move { ids, moved, duplicate, start, deselect, keep, .. } => {
                 if moved {
                     // A free move lands in the frame under the pointer (or the page) where it was
                     // dropped; layers in an auto layout frame already sit in their slot.
@@ -1804,6 +1812,13 @@ impl Session {
                     if let Some(d) = deselect {
                         let sel = self.selection().into_iter().filter(|x| *x != d).collect();
                         self.set_selection(sel);
+                    } else if let Some(k) = keep {
+                        // A click (not a drag) on one layer of a multi-selection selects just it.
+                        let doc = self.doc()?.clone();
+                        let sel = self.selection();
+                        if sel.len() > 1 && (sel.contains(&k) || sel.iter().any(|s| doc.is_ancestor(*s, k))) {
+                            self.set_selection(vec![k]);
+                        }
                     }
                     if deselect.is_none() && !(ev.shift || ev.cmd || duplicate) {
                         self.widget_click(start, ev.tol() * 2.0)?;

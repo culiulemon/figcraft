@@ -125,6 +125,8 @@ fn clicking_selects_by_the_documented_rules() {
         ((90.0, 30.0), NONE, vec![k.a], vec![k.b], "with a layer selected, its siblings select at its level"),
         ((520.0, 20.0), SHIFT, vec![k.c], vec![k.c, k.r], "Shift-click adds to the selection"),
         ((30.0, 130.0), SHIFT, vec![k.c, k.r], vec![k.r], "Shift-click on a selected layer removes it"),
+        ((520.0, 20.0), NONE, vec![k.r, k.empty], vec![k.r], "a click on one of several selected layers selects just it"),
+        ((520.0, 20.0), CMD, vec![k.r, k.empty], vec![k.r, k.empty], "silent: Cmd/Ctrl-click on a selected layer keeps the whole selection (pinned)"),
         ((520.0, 120.0), NONE, vec![], vec![k.r2], "a locked layer can't be selected on the canvas: the click goes to what is under it"),
         ((520.0, 220.0), NONE, vec![k.r], vec![], "a hidden layer can't be selected on the canvas (empty canvas deselects)"),
         ((390.0, 290.0), NONE, vec![k.r], vec![], "the background of a top-level frame with layers is like the canvas: a click deselects"),
@@ -298,6 +300,18 @@ fn locked_layers_selected_in_the_layers_panel_stay_put() {
     // Layers inside a locked layer are locked too.
     ex(&mut s, "object.toggleLock", json!({"ids": [k.g], "locked": true}));
     assert_eq!(handle_at(s.doc().unwrap(), &[k.a], Point::new(60.0, 60.0), 1.0), None);
+}
+
+#[test]
+fn dragging_one_of_several_selected_layers_moves_them_all() {
+    let mut s = Session::new();
+    let k = scene(&mut s);
+    let at = |s: &Session, i: NodeId| s.doc().unwrap().world_bounds(i).unwrap().origin();
+    ex(&mut s, "select.set", json!({"ids": [k.r, k.empty]}));
+    drag(&mut s, (520.0, 20.0), (540.0, 20.0), NONE);
+    assert_eq!(sorted(s.selection()), sorted(vec![k.r, k.empty]), "a drag on one of several selected layers keeps them all selected");
+    assert_eq!(at(&s, k.r), Point::new(520.0, 0.0), "the dragged layer moves");
+    assert_eq!(at(&s, k.empty), Point::new(620.0, 0.0), "and so do the others");
 }
 
 #[test]

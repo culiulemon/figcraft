@@ -274,8 +274,19 @@ pub fn input(app: &mut FigApp, ctx: &egui::Context, pos: Option<Pos2>, hovered: 
             Action::Reorder { .. } => CursorIcon::Grabbing,
         });
         if !down {
+            // A plain press on a reorder ring that didn't become a drag is a click on that layer:
+            // the selection narrows to it, as a click on the canvas would. With a modifier held
+            // the ring keeps Figma's meaning (Shift/Alt/Cmd on a selected layer), so it does nothing.
+            let plain = !ctx.input(|i| i.modifiers.shift || i.modifiers.alt || i.modifiers.command || i.modifiers.ctrl);
+            let clicked = match &drag.action {
+                Action::Reorder { source, .. } if plain && !drag.moved => Some(*source),
+                _ => None,
+            };
             let _ = app.session.commit_interaction();
             ctx.data_mut(|d| d.remove::<Drag>(drag_id()));
+            if let Some(id) = clicked {
+                app.session.set_selection(vec![id]);
+            }
         } else {
             ctx.data_mut(|d| d.insert_temp(drag_id(), drag));
         }
