@@ -96,7 +96,8 @@ New-Item -ItemType Directory -Force -Path $Stage | Out-Null
 $Exes = $Bins | ForEach-Object { "$_.exe" }
 foreach ($exe in $Exes) { Copy-Item (Join-Path $Bin $exe) $Stage }
 
-& (Join-Path $PSScriptRoot 'sign.ps1') @($Exes | ForEach-Object { Join-Path $Stage $_ })
+$SignFiles = @($Exes | ForEach-Object { Join-Path $Stage $_ })
+& (Join-Path $PSScriptRoot 'sign.ps1') @SignFiles
 
 # ---- MSI ---------------------------------------------------------------------------------------
 # The setup wizard's art, drawn here from the app icon so the MSI shows FigCraft rather than
