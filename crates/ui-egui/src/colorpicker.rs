@@ -3,7 +3,7 @@
 
 use egui::{Align2, Color32, CornerRadius, Id, Mesh, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use figcraft_color::{
-    Color, ColorStop, Gradient, GradientKind, Hsb, ImageFilters, ImageScaleMode, Paint, PaintKind, PatternAlign, PatternPaint, PatternTile,
+    BlendMode, Color, ColorStop, Gradient, GradientKind, Hsb, ImageFilters, ImageScaleMode, Paint, PaintKind, PatternAlign, PatternPaint, PatternTile,
 };
 use figcraft_doc::{NodeId, NodeKind};
 use serde_json::json;
@@ -117,6 +117,40 @@ fn current_paint(app: &FigApp, target: &PickerTarget) -> Option<Paint> {
     }
 }
 
+/// The command and its params that write `paint` to `target`, when the target can take it.
+fn paint_command(app: &FigApp, target: &PickerTarget, paint: &Paint) -> Option<(&'static str, serde_json::Value)> {
+    Some(match target {
+        PickerTarget::PluginField { .. } => return None,
+        PickerTarget::SelectionColor { targets, .. } => ("selection.setPaint", json!({"targets": targets, "paint": paint})),
+        PickerTarget::PageBackground => {
+            let c = paint.solid_color().unwrap_or(Color::DEFAULT_PAGE);
+            ("page.setBackground", json!({"color": c.to_css_hex()}))
+        }
+        PickerTarget::Paint { fills, index, ids } => {
+            (if *fills { "fill.set" } else { "stroke.set" }, json!({"ids": ids, "index": index, "paint": paint}))
+        }
+        PickerTarget::Effect { ids, index, secondary } => {
+            let mut e = ids.first().and_then(|i| app.session.doc().ok()?.node(*i)?.effects.get(*index).cloned())?;
+            if let Some(c) = e.color_mut(*secondary) {
+                *c = paint.solid_color().unwrap_or(Color::BLACK);
+            }
+            ("effect.set", json!({"ids": ids, "index": index, "effect": e}))
+        }
+        PickerTarget::TextRange { id, start, end } => ("text.style", json!({"id": id, "start": start, "end": end, "textFills": [paint]})),
+        PickerTarget::Variable { id, mode } => {
+            let c = paint.solid_color().unwrap_or(Color::BLACK);
+            ("variable.set", json!({"variable": id, "mode": mode, "value": c.to_css_hex()}))
+        }
+        PickerTarget::Style { id, index } => {
+            let mut paints = app.session.doc().ok().and_then(|d| style_paints(d, id))?;
+            if let Some(slot) = paints.get_mut(*index) {
+                *slot = paint.clone();
+            }
+            ("style.update", json!({"style": id, "value": paints}))
+        }
+    })
+}
+
 /// Write `paint` to the target. `live` edits are part of an ongoing drag.
 fn write(app: &mut FigApp, target: &PickerTarget, paint: &Paint, live: bool) {
     if let PickerTarget::PluginField { plugin, control, .. } = target {
@@ -131,45 +165,23 @@ fn write(app: &mut FigApp, target: &PickerTarget, paint: &Paint, live: bool) {
     if live {
         let _ = app.session.begin_interaction("Color");
     }
-    let r = match target {
-        PickerTarget::SelectionColor { targets, .. } => app.session.execute("selection.setPaint", &json!({"targets": targets, "paint": paint})),
-        PickerTarget::PageBackground => {
-            let c = paint.solid_color().unwrap_or(Color::DEFAULT_PAGE);
-            app.session.execute("page.setBackground", &json!({"color": c.to_css_hex()}))
-        }
-        PickerTarget::Paint { fills, index, ids } => {
-            app.session.execute(if *fills { "fill.set" } else { "stroke.set" }, &json!({"ids": ids, "index": index, "paint": paint}))
-        }
-        PickerTarget::Effect { ids, index, secondary } => {
-            let Some(mut e) = ids.first().and_then(|i| app.session.doc().ok()?.node(*i)?.effects.get(*index).cloned()) else { return };
-            if let Some(c) = e.color_mut(*secondary) {
-                *c = paint.solid_color().unwrap_or(Color::BLACK);
-            }
-            app.session.execute("effect.set", &json!({"ids": ids, "index": index, "effect": e}))
-        }
-        PickerTarget::TextRange { id, start, end } => {
-            app.session.execute("text.style", &json!({"id": id, "start": start, "end": end, "textFills": [paint]}))
-        }
-        PickerTarget::Variable { id, mode } => {
-            let c = paint.solid_color().unwrap_or(Color::BLACK);
-            app.session.execute("variable.set", &json!({"variable": id, "mode": mode, "value": c.to_css_hex()}))
-        }
-        PickerTarget::PluginField { .. } => return,
-        PickerTarget::Style { id, index } => {
-            let Some(mut paints) = app.session.doc().ok().and_then(|d| style_paints(d, id)) else { return };
-            if let Some(slot) = paints.get_mut(*index) {
-                *slot = paint.clone();
-            }
-            app.session.execute("style.update", &json!({"style": id, "value": paints}))
-        }
-    };
-    if let Err(e) = r {
+    let Some((cmd, params)) = paint_command(app, target, paint) else { return };
+    if let Err(e) = app.session.execute(cmd, &params) {
         app.toast(e.to_string());
     }
     // Drag previews (`live`) are not choices: a drag records only the colour it ends on. Not "an
     // interaction is open": editing text holds one, and its colour clicks are choices.
     if !live && let Some(c) = paint.solid_color() {
         remember_recent(app, c);
+    }
+}
+
+/// Show the target's paint with `blend` on the canvas while its blend mode row is hovered.
+pub(crate) fn preview_blend(app: &mut FigApp, ctx: &egui::Context, target: &PickerTarget, paint: &Paint, blend: BlendMode) {
+    let mut p = paint.clone();
+    p.blend = blend;
+    if let Some((cmd, params)) = paint_command(app, target, &p) {
+        app.preview_text(ctx, cmd, params);
     }
 }
 
@@ -556,7 +568,8 @@ pub fn show(app: &mut FigApp, ctx: &egui::Context) {
                     ui.add_space(16.0);
                     let resp = widgets::dropdown(ui, tr(paint.blend.label()), 208.0, Some(Icon::Blend)).on_hover_text(tr("Blend mode"));
                     crate::right::menu_popup(&resp).width(200.0).show(|ui| {
-                        if let Some(b) = crate::right::blend_menu(ui, false) {
+                        let ctx = ui.ctx().clone();
+                        if let Some(b) = crate::right::blend_menu(ui, false, |b| preview_blend(app, &ctx, &target, &paint, b)) {
                             paint.blend = b;
                             write(app, &target, &paint, false);
                         }

@@ -229,11 +229,16 @@ pub(crate) fn menu_style(s: &mut egui::Style) {
 /// (else its 600 px default area width) and keeps the size measured; rows ([`menu_row`]) take the
 /// larger of that width and their content, so the menu fits its content. Chain `.width(w)` for a
 /// menu at least `w` wide.
-/// The blend modes as menu items in groups (pass-through only for layers); the one picked.
-pub fn blend_menu(ui: &mut Ui, with_pass_through: bool) -> Option<BlendMode> {
+/// The blend modes as menu items in groups (pass-through only for layers); the one picked. Each
+/// row `preview`s its mode on the canvas while hovered.
+pub fn blend_menu(ui: &mut Ui, with_pass_through: bool, mut preview: impl FnMut(BlendMode)) -> Option<BlendMode> {
     let mut picked = None;
     for b in BlendMode::ALL.into_iter().filter(|b| with_pass_through || *b != BlendMode::PassThrough) {
-        if menu_item(ui, tr(b.label()), "") {
+        let resp = menu_row(ui, tr(b.label()), "", 0.0, |_, _, _| {});
+        if resp.hovered() {
+            preview(b);
+        }
+        if resp.clicked() {
             picked = Some(b);
             ui.close();
         }
@@ -242,6 +247,11 @@ pub fn blend_menu(ui: &mut Ui, with_pass_through: bool) -> Option<BlendMode> {
         }
     }
     picked
+}
+
+/// Show `blend` on `ids` on the canvas while its row in a blend mode menu is hovered.
+pub(crate) fn preview_blend(app: &mut FigApp, ctx: &egui::Context, ids: &[NodeId], blend: BlendMode) {
+    app.preview_text(ctx, "node.set", json!({"ids": ids, "props": {"blend": blend.label()}}));
 }
 
 pub fn menu_popup(anchor: &egui::Response) -> egui::Popup<'static> {
@@ -344,7 +354,7 @@ pub(crate) fn block(ui: &mut Ui, h: f32, inset_y: f32, add: impl FnOnce(&mut Ui)
 
 fn design(app: &mut FigApp, ui: &mut Ui) {
     let Ok(ds) = app.session.ds() else { return };
-    // The panel shows the document itself, not a live text preview over it.
+    // The panel shows the document itself, not a live preview over it.
     let doc = ds.text_preview.clone().unwrap_or_else(|| ds.doc.clone());
     let sel = ds.selection.clone();
     let vector_edit = ds.vector_edit.clone();
@@ -943,7 +953,8 @@ fn appearance(app: &mut FigApp, ui: &mut Ui, doc: &Document, sel: &[NodeId]) {
             let label = blend.map(|b| tr(b.label())).unwrap_or(tr("Mixed"));
             let resp = widgets::dropdown(ui, label, col * 2.0 + 8.0, Some(Icon::Blend));
             menu_popup(&resp).width(200.0).show(|ui| {
-                if let Some(b) = blend_menu(ui, true) {
+                let ctx = ui.ctx().clone();
+                if let Some(b) = blend_menu(ui, true, |b| preview_blend(app, &ctx, &ids, b)) {
                     app.set_props(&ids, json!({"blend": b.label()}));
                 }
             });

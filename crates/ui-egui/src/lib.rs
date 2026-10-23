@@ -77,6 +77,8 @@ mod a11y_tests;
 #[cfg(test)]
 mod async_dialog_tests;
 #[cfg(test)]
+mod blend_preview_tests;
+#[cfg(test)]
 mod branch_ui_tests;
 #[cfg(test)]
 mod canvas_double_click_tests;
@@ -609,8 +611,8 @@ pub struct UiState {
     pub style_grid: bool,
     /// Style folders closed in the style picker.
     pub style_folds: BTreeSet<String>,
-    /// The live text preview the panels show (`text.preview`'s command and params) and the
-    /// document revision it was shown at: it ends the first frame nothing asks for it.
+    /// The live preview the panels show (`text.preview`'s command and params) and the document
+    /// revision it was shown at: it ends the first frame nothing asks for it.
     pub text_preview: Option<(String, Value, u64)>,
     /// A panel asked for the preview this frame.
     pub text_preview_wanted: bool,
@@ -916,8 +918,9 @@ impl FigApp {
     }
 
     /// Show what `command params` would do on the canvas as a live preview (`text.preview`) while
-    /// a font family, font style, text style, named instance or axis slider is hovered or dragged. Call it every frame
-    /// the preview should stay: it ends on the first frame nothing asks for it.
+    /// a font family, font style, text style, named instance, blend mode or axis slider is hovered
+    /// or dragged. Call it every frame the preview should stay: it ends on the first frame nothing
+    /// asks for it.
     pub fn preview_text(&mut self, ctx: &egui::Context, command: &str, params: Value) {
         self.ui.text_preview_wanted = true;
         let revision = self.session.ds().map_or(0, |d| d.revision);
