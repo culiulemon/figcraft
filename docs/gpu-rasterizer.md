@@ -102,10 +102,17 @@ the CPU render within the parity tolerance; toggling the setting changes nothing
   composited with the node's opacity and blend mode; the pixels never leave the device. Parity
   (`the_gpu_layer_blur_matches_the_cpu_render`): mean channel difference 0.047/255, worst 33 on a
   blurred antialiased edge.
-- Next: drop and inner shadows, background blur, glass and grain as passes on the offscreen
-  layer, reusing the existing compute pipelines in `figcraft-gpu` and adding what vello lacks
-  (vello has only a blurred rounded rect, not a general filter). Each pass is compared to the
-  CPU's before the effect leaves the fallback list.
+- Landed: **drop shadows** on rounded, opaque rectangles (the common card): the shadow is vello's
+  blurred rounded rect — the card's own outline, offset and blurred — drawn under the card, which
+  hides it exactly where the CPU masks it. No offscreen layer, so a page of shadowed cards costs
+  almost nothing. Parity (`the_gpu_drop_shadow_matches_the_cpu_render`): mean 0.044/255, worst 31
+  (vello's Gaussian against the CPU's three-box approximation). Spread, `showBehind`, a
+  translucent card, a stroke, a non-uniform radius or a shadow alongside another effect fall back.
+- Next: drop shadows on anything else (spread, groups, translucent covers), inner shadows,
+  background blur, glass and grain as passes on the offscreen layer, reusing the existing compute
+  pipelines in `figcraft-gpu` and adding what vello lacks (vello has only a blurred rounded rect,
+  not a general filter). Each pass is compared to the CPU's before the effect leaves the fallback
+  list.
 
 Exit: the 30-shadow + 3-glass + 2-blur page renders entirely on the GPU, and its drag frame at
 2400 × 1600 stays at or under the 10–13 ms the CPU path reaches with the layer cache, at
@@ -201,5 +208,14 @@ stays on the fallback list.
     control-channel round trips between steps.
   - Shadows, background blur, glass, inner shadows and grain still put the page on the CPU, and a
     node with a blur *and* another effect does too (the CPU applies them in order).
-- Next: P3's other effects (shadows, backdrop blurs, glass, grain), which is what makes the
-  shadow/glass/blur page — the one that still costs 12–15 ms — run entirely on the GPU.
+- 2026-10-24: **P3 slice 2 landed** — drop shadows on rounded, opaque cards, straight in the
+  scene: no offscreen layer and no blur pass, so a page of 30 shadowed cards is drawn in one
+  frame.
+  - Release, 30 cards with radius-12 shadows: **0.74–0.82 ms a frame** on the GPU against 24–26 ms
+    for a full CPU render (`shadow_timings`); at 2320 × 1440 as well as 904 × 860, since the cost
+    is the scene, not the pixels. In the app, dragging a card on that page holds 1.2–2.2 ms a
+    frame (occasional GPU wake-ups spike to 7–10 ms, as on plain pages).
+  - Parity: mean 0.044/255, worst 31 (the soft edge), against the CPU's three-box blur.
+- Next: P3's other effects (spread and non-card shadows, inner shadows, backdrop blurs, glass,
+  grain), which is what makes the shadow/glass/blur page — the one that still costs 12–15 ms — run
+  entirely on the GPU.

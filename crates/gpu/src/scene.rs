@@ -123,19 +123,58 @@ enum Effects {
     None,
     /// One layer blur: its radius in document units.
     LayerBlur(f64),
-    /// Anything else (shadows, backdrop blurs, glass, grain, several effects).
+    /// Drop shadows a rounded, opaque rectangle can cast straight into the scene (their shape is
+    /// the rectangle's own outline, so no layer is needed).
+    Shadows(Vec<figcraft_doc::Shadow>),
+    /// Anything else (backdrop blurs, glass, grain, inner shadows, several kinds of effect).
     Other,
+}
+
+/// A shadow drawn without a layer: vello's blurred rounded rect, cut off where an opaque card
+/// covers it (as the CPU masks it).
+fn simple_shadows(n: &Node) -> Option<Vec<figcraft_doc::Shadow>> {
+    if !matches!(n.kind, NodeKind::Rectangle) || !n.children.is_empty() {
+        return None;
+    }
+    if n.corners.uniform().is_none() || n.corners.smoothing != 0.0 {
+        return None;
+    }
+    if n.opacity < 1.0 || !matches!(n.blend, BlendMode::PassThrough | BlendMode::Normal) || n.has_visible_stroke() {
+        return None;
+    }
+    // The card must cover the shadow where they overlap, or the shadow would show through it.
+    let [paint] = n.fills.as_slice() else { return None };
+    if paint.blend != BlendMode::Normal || paint.opacity < 1.0 {
+        return None;
+    }
+    let color = paint.solid_color()?;
+    if color.a < 1.0 {
+        return None;
+    }
+    let mut shadows = Vec::new();
+    for e in n.effects.iter().filter(|e| e.visible) {
+        let figcraft_doc::EffectKind::DropShadow(s) = &e.kind else { return None };
+        if s.spread != 0.0 || s.show_behind || s.blend != BlendMode::Normal {
+            return None;
+        }
+        shadows.push(s.clone());
+    }
+    (!shadows.is_empty()).then_some(shadows)
 }
 
 fn effects_of(n: &Node) -> Effects {
     let mut visible = n.effects.iter().filter(|e| e.visible);
     let Some(e) = visible.next() else { return Effects::None };
-    if visible.next().is_some() {
-        return Effects::Other;
+    let single = visible.next().is_none();
+    if single
+        && let figcraft_doc::EffectKind::LayerBlur(b) = &e.kind
+        && !b.is_progressive()
+    {
+        return Effects::LayerBlur(b.sanitized().radius);
     }
-    match &e.kind {
-        figcraft_doc::EffectKind::LayerBlur(b) if !b.is_progressive() => Effects::LayerBlur(b.sanitized().radius),
-        _ => Effects::Other,
+    match simple_shadows(n) {
+        Some(shadows) => Effects::Shadows(shadows),
+        None => Effects::Other,
     }
 }
 
@@ -162,6 +201,10 @@ impl Builder<'_> {
         match effects_of(n) {
             Effects::None => {}
             Effects::LayerBlur(radius) => return self.blurred_layer(n, parent_xf, depth, radius),
+            Effects::Shadows(shadows) => {
+                let xf = parent_xf * n.transform;
+                self.draw_shadows(n, &shadows, xf);
+            }
             Effects::Other => return Err(Unsupported::Effect),
         }
         // vello has no plus-darker composition: the CPU draws it.
@@ -178,6 +221,22 @@ impl Builder<'_> {
             s.pop_layer();
         }
         Ok(())
+    }
+
+    /// Drop shadows drawn without a layer: vello's blurred rounded rect is the card's own
+    /// silhouette offset and blurred, and the card paints over it (it hides the shadow exactly
+    /// where the CPU masks it, because the card is opaque).
+    fn draw_shadows(&mut self, n: &Node, shadows: &[figcraft_doc::Shadow], xf: Affine) {
+        let Some(radius) = n.corners.uniform() else { return };
+        let Some(scene) = &mut self.scene else { return };
+        let rect = KRect::new(0.0, 0.0, n.width, n.height);
+        for s in shadows {
+            let c = s.color.sanitized();
+            let at = KAffine::translate(s.offset) * k_affine(xf);
+            // The radius and the deviation are in the shape's own units (the transform scales
+            // them, and the blur with them).
+            scene.draw_blurred_rounded_rect(at, rect, PColor::new([c.r, c.g, c.b, c.a]), radius.max(0.0), (s.radius / 2.0).max(0.0));
+        }
     }
 
     /// A node with one layer blur: its content is drawn into a layer of its own, blurred on the

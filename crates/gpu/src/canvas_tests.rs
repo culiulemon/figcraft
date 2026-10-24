@@ -161,10 +161,22 @@ fn unsupported_pages_are_refused() {
     let p = d.first_page().unwrap();
     assert_eq!(scene::supported(&d, p), Ok(()));
 
-    // A drop shadow is a GPU pass of a later phase.
+    // A drop shadow on an opaque card is vello's blurred rounded rect, drawn under the card.
     let id = d.node(p).and_then(|n| n.children.first().copied()).unwrap();
     d.get_mut(id).unwrap().effects = vec![Effect::drop_shadow()];
+    assert_eq!(scene::supported(&d, p), Ok(()));
+    // A translucent card can't hide its shadow where it covers it: the CPU masks it per pixel.
+    let opaque = d.node(id).and_then(|n| n.fills.first().cloned()).unwrap();
+    d.get_mut(id).unwrap().fills[0].opacity = 0.5;
     assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Effect));
+    d.get_mut(id).unwrap().fills[0] = opaque;
+    // A shadow with a spread, or one that shows behind, needs the layer.
+    d.get_mut(id).unwrap().effects = vec![Effect::drop_shadow()];
+    if let Some(figcraft_doc::EffectKind::DropShadow(s)) = d.get_mut(id).ok().and_then(|n| n.effects.first_mut()).map(|e| &mut e.kind) {
+        s.spread = 6.0;
+    }
+    assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Effect));
+    d.get_mut(id).unwrap().effects = vec![Effect::drop_shadow()];
     // One layer blur is drawn on the GPU (its own layer, blurred there).
     d.get_mut(id).unwrap().effects = vec![Effect::layer_blur()];
     assert_eq!(scene::supported(&d, p), Ok(()));
@@ -215,6 +227,47 @@ fn the_gpu_layer_blur_matches_the_cpu_render() {
     let gpu = canvas.read(&device, &queue).unwrap();
     let (worst, mean, at, over) = diff(&cpu, &gpu);
     println!("layer blur parity: worst {worst} at {at:?}, mean {mean:.3}, {over} pixels differ by more than 8");
+    assert!(worst <= 128, "a channel differs by {worst} (mean {mean:.3})");
+    assert!(mean <= 2.0, "the mean difference is {mean:.3}");
+}
+
+/// A rounded white card with a drop shadow over a light ground.
+fn shadow_doc() -> Document {
+    let mut d = Document::new("gpu shadow");
+    let p = d.first_page().unwrap();
+    let ground = d.create(p, NodeKind::Rectangle, "ground", 60.0, 40.0, 480.0, 220.0).unwrap();
+    d.get_mut(ground).unwrap().fills = vec![Paint::solid(Color::from_hex("E8E8E8").unwrap_or(Color::WHITE))];
+    let card = d.create(p, NodeKind::Rectangle, "card", 200.0, 90.0, 200.0, 130.0).unwrap();
+    {
+        let n = d.get_mut(card).unwrap();
+        n.corners.radii = [16.0; 4];
+        n.fills = vec![Paint::solid(Color::WHITE)];
+        n.effects = vec![Effect::drop_shadow()];
+    }
+    d
+}
+
+#[test]
+fn the_gpu_drop_shadow_matches_the_cpu_render() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let d = shadow_doc();
+    let p = d.first_page().unwrap();
+    let (w, h) = PARITY;
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+    let cpu = render_view(&d, p, &view, &Options::default()).unwrap();
+    let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+    let built = {
+        let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+        scene::build_with(&d, p, &view, &mut layers)
+    };
+    let built = built.expect("the GPU draws a drop shadow");
+    assert!(canvas.render(&device, &queue, &built, scene::background(&d, p)).is_some());
+    let gpu = canvas.read(&device, &queue).unwrap();
+    let (worst, mean, at, over) = diff(&cpu, &gpu);
+    println!("drop shadow parity: worst {worst} at {at:?}, mean {mean:.3}, {over} pixels differ by more than 8");
     assert!(worst <= 128, "a channel differs by {worst} (mean {mean:.3})");
     assert!(mean <= 2.0, "the mean difference is {mean:.3}");
 }
@@ -322,6 +375,54 @@ fn layer_blur_timings() {
         5,
     );
     println!("layer blur, 1200 × 900: CPU {cpu:.2} ms | GPU build {build:.2} ms, frame {frame:.2} ms");
+}
+
+/// `n` shadowed cards (opaque, rounded) at `w` × `h`.
+fn shadow_cards(n: u32) -> Document {
+    let mut d = Document::new("gpu shadows");
+    let p = d.first_page().unwrap();
+    let colours = ["FFFFFF", "E03030", "2040E0", "20C060", "F0C830", "A040E0"];
+    for i in 0..n {
+        let (x, y) = (f64::from(i % 6) * 150.0 + 10.0, f64::from(i / 6) * 150.0 + 10.0);
+        let id = d.create(p, NodeKind::Rectangle, "Card", x, y, 130.0, 130.0).unwrap();
+        let node = d.get_mut(id).unwrap();
+        node.corners.radii = [16.0; 4];
+        node.fills = vec![Paint::solid(Color::from_hex(colours[i as usize % colours.len()]).unwrap_or(Color::WHITE))];
+        node.effects = vec![Effect::drop_shadow()];
+        if let Some(figcraft_doc::EffectKind::DropShadow(s)) = node.effects.first_mut().map(|e| &mut e.kind) {
+            s.radius = 12.0;
+        }
+    }
+    d
+}
+
+#[test]
+#[ignore = "timing: run in release with --ignored --nocapture"]
+fn shadow_timings() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    for (w, h) in [(904u32, 860u32), (2320, 1440)] {
+        let d = shadow_cards(30);
+        let p = d.first_page().unwrap();
+        let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+        let _ = render_view(&d, p, &view, &Options::default());
+        let cpu = frame_ms(|| render_view(&d, p, &view, &Options::default()).is_some(), 5);
+        let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+        let _ = canvas.render(&device, &queue, &scene::build(&d, p, &view).unwrap(), scene::background(&d, p));
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let frame = frame_ms(
+            || {
+                let s = scene::build(&d, p, &view).unwrap();
+                let ok = canvas.render(&device, &queue, &s, scene::background(&d, p)).is_some();
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                ok
+            },
+            8,
+        );
+        println!("30 shadowed cards, {w} × {h}: CPU {cpu:.2} ms | GPU frame {frame:.2} ms");
+    }
 }
 
 #[test]
