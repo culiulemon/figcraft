@@ -90,9 +90,7 @@ fn both(d: &Document, view: &View) -> Option<(Pixmap, Pixmap)> {
     let (device, queue) = device()?;
     let scene = scene::build(d, p, view).ok()?;
     let mut canvas = CanvasGpu::new(&device, view.width, view.height)?;
-    if !canvas.render(&device, &queue, &scene, scene::background(d, p)) {
-        return None;
-    }
+    canvas.render(&device, &queue, &scene, scene::background(d, p))?;
     let gpu = canvas.read(&device, &queue)?;
     Some((cpu, gpu))
 }
@@ -187,7 +185,7 @@ fn the_gpu_canvas_reads_back() {
     let scene = scene::build(&d, p, &view).unwrap();
     let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
     assert_eq!(canvas.size(), (w, h));
-    assert!(canvas.render(&device, &queue, &scene, scene::background(&d, p)));
+    assert!(canvas.render(&device, &queue, &scene, scene::background(&d, p)).is_some());
     let pix = canvas.read(&device, &queue).unwrap();
     assert_eq!((pix.width(), pix.height()), (w, h));
     // The page is opaque and its background is drawn: the corner pixel is the page colour.
@@ -265,7 +263,7 @@ fn canvas_frame_timings() {
             let frame = frame_ms(
                 || {
                     let s = scene::build(&d, p, &view).unwrap();
-                    let ok = canvas.render(&device, &queue, &s, bg);
+                    let ok = canvas.render(&device, &queue, &s, bg).is_some();
                     let _ = device.poll(wgpu::PollType::wait_indefinitely());
                     ok
                 },

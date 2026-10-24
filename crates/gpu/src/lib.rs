@@ -35,11 +35,13 @@ impl Gpu {
     }
 }
 
-/// Give the renderer the window's GPU for its effects (once; later calls do nothing). Returns
-/// whether effects run on the GPU afterwards.
+/// Give the renderer and the canvas the window's GPU (once; later calls do nothing). Returns
+/// whether the effects run on the GPU afterwards.
 pub fn install(device: Arc<Device>, queue: Arc<Queue>) -> bool {
     static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *INSTALLED.get_or_init(|| {
+        // The canvas and the effects are set up apart: either can run without the other.
+        canvas::install(device.clone(), queue.clone());
         let Some(gpu) = Gpu::new(device, queue) else {
             log::info!("effects stay on the CPU: the window's GPU can't run them");
             return false;

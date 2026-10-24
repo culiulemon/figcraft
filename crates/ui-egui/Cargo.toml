@@ -32,5 +32,11 @@ web-time = "1.1.0"
 serde_json = { workspace = true }
 toml = "1"
 
+# The canvas shows the GPU rasterizer's texture (desktop only: the browser keeps the CPU canvas).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+figcraft-gpu = { workspace = true }
+egui-wgpu = { version = "0.36", default-features = false }
+wgpu = { workspace = true }
+
 [dev-dependencies]
 wat = { workspace = true }

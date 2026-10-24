@@ -79,14 +79,18 @@ at 2320 × 1440 well under the CPU's fixed 3.6–4.8 ms.
 
 ### P2 — canvas integration
 
-- Render worker builds the `vello::Scene` off the UI thread; the UI thread (which owns
-  `egui_wgpu::RenderState`) renders it into the canvas texture and registers it with egui.
-- `Retained`'s damage tracking is replaced for the GPU path by whole-view redraws (they are
-  cheap); the CPU path keeps it.
-- The canvas switches per frame on `supported(doc, page)`, with a setting and
-  `FIGCRAFT_GPU_CANVAS=0|1` to force either path, and a status/log line naming the reason for a
-  fallback.
-- Screenshots (`ui.screenshot`) read the GPU texture back, so the control channel stays exact.
+- The render thread owns the `CanvasGpu` (the window's device and queue) and draws each job it can
+  into one of two textures; the UI thread registers that texture with `egui_wgpu` (once per buffer
+  and generation) and paints it in the canvas' rect, with the usual re-projection. No pixels cross
+  the bus, and the canvas never uploads an image for a GPU frame.
+- Double buffering: the thread draws into one buffer while the window samples the other, so a
+  frame on screen is never half-overwritten. A resize (a zoom) reallocates both and bumps a
+  generation; the UI frees the textures it registered for the old one.
+- The GPU path is chosen per frame: pages in the builder's feature set go to the GPU, everything
+  else to the CPU as before, so nothing that worked changes. Outline mode, outlines for the
+  selection, skipped layers, the focus view, soft proof and non-sRGB documents stay on the CPU.
+- `ui.inspect` reports the choice and the reason for a fallback (`canvas.rasterizer`,
+  `canvas.gpuRefusal`), so a scene that stays on the CPU can be explained without a debugger.
 
 Exit: dragging any page in the P1 feature set is GPU-rendered in the real app; screenshots match
 the CPU render within the parity tolerance; toggling the setting changes nothing visible.
@@ -174,5 +178,13 @@ stays on the fallback list.
     it stays off the canvas path.
   - `cargo xtask layers` passes; the crate is desktop-only (the web app doesn't build it), so the
     browser stays on the CPU renderer.
-- Next: P2 (canvas integration behind a setting) and P3 (effects as GPU passes), which is what
-  makes the shadow/glass/blur page — the one that still costs 12–15 ms — run on the GPU.
+- 2026-10-24: **P2 landed** — the canvas draws on the GPU for pages in the P1 feature set and
+  falls back to the CPU for everything else, in the real app:
+  - 60 plain rectangles at a 1200 × 900 canvas (the app's window): **1.1–1.7 ms a frame** on the
+    GPU (steady state, measured over 20 drag steps), **5.4–6.7 ms** on the CPU (one drop shadow
+    on one layer puts the page back on the CPU, as designed). Occasional 6–8 ms frames after an
+    idle gap are the GPU waking up, not scene cost.
+  - Zooming (new texture sizes, re-registration), selection overlays and `ui.screenshot` verified
+    in the running app; 645 UI tests, the GPU tests and clippy pass.
+- Next: P3 (effects as GPU passes), which is what makes the shadow/glass/blur page — the one that
+  still costs 12–15 ms — run on the GPU.

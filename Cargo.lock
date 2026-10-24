@@ -1772,12 +1772,14 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "egui",
+ "egui-wgpu",
  "egui_extras",
  "figcraft-color",
  "figcraft-doc",
  "figcraft-engine",
  "figcraft-format",
  "figcraft-geom",
+ "figcraft-gpu",
  "figcraft-layout",
  "figcraft-pathops",
  "figcraft-render",
@@ -1789,6 +1791,7 @@ dependencies = [
  "toml",
  "wat",
  "web-time",
+ "wgpu",
 ]
 
 [[package]]

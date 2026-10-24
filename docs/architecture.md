@@ -56,9 +56,14 @@ dialogs themselves; they request UI, and programmatic callers drop those request
 
 ## Rendering
 
-The CPU renderer is the single source of pixels for the canvas, exports and the browser. The
-desktop canvas renders on a worker thread at the device pixel ratio and keeps its last image,
-re-rendering only the region a pan uncovers or an edit touches; overlays (selection, handles,
+The desktop canvas draws on the GPU where the page is in the GPU rasterizer's feature set
+([`gpu-rasterizer.md`](gpu-rasterizer.md)): the render thread turns the page into a vello scene and
+draws it into one of two textures, and the window paints that texture, so no pixels cross the bus
+and nothing is uploaded per frame. Every other page — effects, images, masks, outline modes, soft
+proof — is drawn by the CPU renderer and uploaded as before; the choice is made per frame and
+reported by `ui.inspect`. The CPU renderer is the single source of pixels for exports and the
+browser. The desktop canvas renders on a worker thread at the device pixel ratio and keeps its last
+image, re-rendering only the region a pan uncovers or an edit touches; overlays (selection, handles,
 guides, labels) are drawn by egui on top. A seeded random walk checks the retained canvas against
 full renders. Within that region, isolated layers (opacity, blend modes, effects) are rasterised on
 the page's pixel grid and kept between frames (`figcraft_render::layers`), so dragging a few layers
@@ -66,14 +71,6 @@ across a page full of shadows, blurs and glass re-composites the rest instead of
 layers that read the backdrop (glass, background blur) or start from it (masks) are always drawn.
 SVG and PDF export walk the same scene and embed rasters where those formats can't
 express an effect.
-
-A GPU rasterizer is being built alongside it ([`gpu-rasterizer.md`](gpu-rasterizer.md)):
-`figcraft_gpu::scene` turns a page and a `View` into a vello scene from the renderer's own outlines,
-and `figcraft_gpu::canvas` draws it into a `wgpu` texture the window's egui samples, so a canvas
-frame no longer rasterises pixels on the CPU or uploads the whole image. It refuses — with a
-reason — anything it can't draw exactly yet (effects, images, some stroke and text shapes), and the
-canvas then draws that frame on the CPU; the CPU renderer stays the reference for exports, tests
-and the browser.
 
 ## File I/O
 

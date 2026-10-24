@@ -47,8 +47,12 @@ pub struct Job {
 }
 
 pub struct Done {
-    /// The image, ready for a texture (converted off the UI thread).
+    /// The image, ready for a texture (converted off the UI thread). Empty when
+    /// [`Self::gpu`] drew the frame.
     pub image: egui::ColorImage,
+    /// The GPU canvas's texture for this frame (desktop; `None` when the CPU renderer drew it).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub gpu: Option<figcraft_gpu::canvas::Frame>,
     /// The view the image shows (the requested one snapped outwards to whole device pixels).
     pub view: View,
     pub ms: f64,
@@ -105,7 +109,18 @@ fn run(job: &Job, view: &View, retained: &mut Retained, coarse: bool) -> Option<
         mark_outside_srgb(&mut image, pix, job.doc.color_profile);
     }
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
-    Some(Done { image, view, ms, work, uid: job.uid, page: job.page, coarse, at: job.at })
+    Some(Done {
+        image,
+        #[cfg(not(target_arch = "wasm32"))]
+        gpu: None,
+        view,
+        ms,
+        work,
+        uid: job.uid,
+        page: job.page,
+        coarse,
+        at: job.at,
+    })
 }
 
 /// `view` with [`PREVIEW_FACTOR`] times fewer pixels each way, showing at least the same area.
@@ -168,6 +183,46 @@ impl Renders {
         }
         done
     }
+
+    /// The frame drawn by the GPU canvas, when the page is in its feature set. `None` leaves the
+    /// frame to the CPU renderer (and to the previews it keeps for slow zoom changes).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn gpu(&mut self, job: &Job) -> Option<Done> {
+        let t0 = Instant::now();
+        let frame = gpu_frame(job)?;
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let d = Done {
+            image: egui::ColorImage::default(),
+            gpu: Some(frame),
+            view: job.view.clone(),
+            ms,
+            work: Work::Full,
+            uid: job.uid,
+            page: job.page,
+            coarse: false,
+            at: job.at,
+        };
+        self.last = Some((job.uid, job.page, job.view.scale));
+        self.full_ms = ms;
+        Some(d)
+    }
+}
+
+/// Whether the GPU canvas may draw this job: the editor's outline modes, skipped layers, the
+/// focus view, soft proof and Display P3 documents are the CPU renderer's.
+#[cfg(not(target_arch = "wasm32"))]
+fn gpu_job(job: &Job) -> bool {
+    !job.outline && job.outlined.is_empty() && job.skip.is_empty() && job.solo.is_none() && !job.proof && job.doc.color_profile.is_srgb()
+}
+
+/// The GPU canvas's frame for `job`, if it can draw the page and this job asks nothing of it that
+/// it doesn't do yet.
+#[cfg(not(target_arch = "wasm32"))]
+fn gpu_frame(job: &Job) -> Option<figcraft_gpu::canvas::Frame> {
+    if !gpu_job(job) {
+        return None;
+    }
+    figcraft_gpu::canvas::present(&job.doc, job.page, &job.view)
 }
 
 /// Run `f` on `retained`; after a panic, forget the image it may have left half drawn.
@@ -209,6 +264,16 @@ impl Worker {
                 // Skip to the newest queued job.
                 while let Ok(newer) = jobs.try_recv() {
                     (seq, job) = newer;
+                }
+                // A page the GPU canvas draws goes there (it is quick enough to skip previews).
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(d) = renders.gpu(&job) {
+                    if done_tx.send(d).is_err() {
+                        break;
+                    }
+                    ctx.request_repaint_of(viewport);
+                    done_with.store(seq, std::sync::atomic::Ordering::Release);
+                    continue;
                 }
                 if let Some(d) = renders.preview(&job) {
                     if done_tx.send(d).is_err() {
@@ -297,4 +362,50 @@ impl Inline {
 /// Render synchronously from scratch (tests, screenshots).
 pub fn render_now(job: &Job) -> Option<Done> {
     run(job, &job.view, &mut Retained::default(), false)
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod gpu_job_tests {
+    use super::*;
+
+    fn job(doc: Document, page: NodeId) -> Job {
+        Job {
+            doc: Arc::new(doc),
+            page,
+            view: View { origin: (0.0, 0.0), scale: 1.0, width: 400, height: 300 },
+            outline: false,
+            outline_extras: figcraft_render::Outline::default(),
+            outlined: Vec::new(),
+            skip: Vec::new(),
+            solo: None,
+            proof: false,
+            uid: 1,
+            zoom_preview: true,
+            at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn the_gpu_canvas_takes_plain_canvas_jobs() {
+        let d = Document::new("gpu job");
+        let p = d.first_page().unwrap();
+        let mut j = job(d, p);
+        assert!(gpu_job(&j));
+        j.outline = true;
+        assert!(!gpu_job(&j), "outline mode is the CPU renderer's");
+        j.outline = false;
+        j.outlined = vec![p];
+        assert!(!gpu_job(&j), "outlines for the selection are the CPU renderer's");
+        j.outlined.clear();
+        j.skip = vec![p];
+        assert!(!gpu_job(&j), "skipped layers are the CPU renderer's");
+        j.skip.clear();
+        j.solo = Some(p);
+        assert!(!gpu_job(&j), "the focus view is the CPU renderer's");
+        j.solo = None;
+        j.proof = true;
+        assert!(!gpu_job(&j), "soft proof is the CPU renderer's");
+        j.proof = false;
+        assert!(gpu_job(&j));
+    }
 }

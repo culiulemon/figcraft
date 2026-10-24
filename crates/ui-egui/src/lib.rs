@@ -815,6 +815,18 @@ pub struct FigApp {
 /// What to do with the result of a command run in the background.
 pub type Done = Box<dyn FnOnce(&mut FigApp, &egui::Context, Value)>;
 
+/// Why the GPU canvas left the last frame to the CPU (`ui.inspect`).
+#[cfg(not(target_arch = "wasm32"))]
+fn gpu_refusal() -> Option<&'static str> {
+    figcraft_gpu::canvas::last_refusal()
+}
+
+/// Why the GPU canvas left the last frame to the CPU (`ui.inspect`).
+#[cfg(target_arch = "wasm32")]
+fn gpu_refusal() -> Option<&'static str> {
+    None
+}
+
 impl FigApp {
     pub fn new(session: Session, services: Box<dyn Services>) -> Self {
         // The main window's panels open as wide as they were left.
@@ -1518,6 +1530,13 @@ impl FigApp {
         failed
     }
 
+    /// The window's wgpu state, for showing the GPU canvas's texture (desktop; the app sets it
+    /// each frame).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_render_state(&mut self, state: egui_wgpu::RenderState) {
+        self.canvas.render_state = Some(state);
+    }
+
     /// Draw the whole UI: the main window (the other windows draw themselves).
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         #[cfg(not(target_arch = "wasm32"))]
@@ -1812,6 +1831,8 @@ impl FigApp {
                     figcraft_render::Work::Full => json!({"kind": "full"}),
                 }),
                 "quality": if self.canvas.tex_coarse { "preview" } else { "refined" },
+                "rasterizer": self.canvas.rasterizer,
+                "gpuRefusal": gpu_refusal(),
                 "previewLatencyMs": self.canvas.preview_latency_ms,
                 "refineLatencyMs": self.canvas.refine_latency_ms,
             },

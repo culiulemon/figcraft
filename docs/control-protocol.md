@@ -145,7 +145,10 @@ an idle window draws none) with the most frequent repaint requests behind them (
 `[{at: "file:line", count}]`, every request made in the frame before each one, delayed ones such as
 the autosave deadline included; egui's `context.rs` begin-pass line means input events) and what the last canvas render had to do (`canvas.renderWork`: `full`, `partial` with
 the `pixels` re-rendered after a pan or an edit, or `reused`), whether the canvas shows a coarse
-zoom preview or the refined image (`canvas.quality`: `preview` or `refined`) and the time from
+zoom preview or the refined image (`canvas.quality`: `preview` or `refined`), which rasterizer drew
+it (`canvas.rasterizer`: `gpu`, `cpu`, or `none` before the first frame; `canvas.gpuRefusal` names
+why the GPU canvas left the last frame to the CPU — `an effect`, `a paint`, `a stroke`, `a mask or
+styled text`, `text`, `a structure`, `draw failed`, `not installed` — or is `null`) and the time from
 asking for a render to its preview and its refined image being handed to egui as the canvas
 texture (`canvas.previewLatencyMs`, `canvas.refineLatencyMs`, on a monotonic clock, rendering
 included in the browser too; the GPU upload and presenting the frame come after; `null` until
