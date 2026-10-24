@@ -188,11 +188,17 @@ from 11.6 to 3.2 ms a frame.
 
 ### P4 — default on, cleanup
 
-- GPU canvas by default on desktop; document the fallback and the wasm/CPU policy here and in
-  `docs/architecture.md`; refresh the numbers in `docs/hardware-parity.md`, `docs/gaps.md`,
-  `ROADMAP.md`.
-- Remove CPU-only machinery the GPU path no longer needs (keep what exports and the fallback
-  use).
+- **Landed.** The GPU canvas is the desktop default (it was from P2; P3's effects and the segmented
+  renderer only widen the feature set), `FIGCRAFT_GPU_CANVAS=0` turns it off, and the fallback,
+  wasm and export policy are written here and in `docs/architecture.md`; `docs/hardware-parity.md`,
+  `docs/gaps.md` and `ROADMAP.md` carry the numbers.
+- **Nothing CPU-only was removed, on purpose.** The CPU renderer is still the oracle for the parity
+  suite, the source of every export, the browser's canvas, the fallback for refused pages and the
+  retainer the GPU lacks (cross-frame retention). The single-scene backdrop route in
+  `scene::build_with` is kept as the parity reference for each effect, though the canvas always
+  segments a page that has a backdrop node.
+- What is left of the GPU path is listed in `docs/gaps.md` (gap 7): retention, images, masks, and
+  the effects still refused (inner shadows, grain, spread and translucent shadows).
 
 ## Test matrix
 
@@ -209,7 +215,7 @@ Run in `cargo xtask ci` unless marked *timing* (release, `--ignored --nocapture`
 | 4 | *timing* `canvas_frame_timings`, `segmented_timings` | CPU vs GPU frame at 2320 × 1440 (plain and heavy) and 2400 × 1600 (backdrop pages) |
 | 5 | *timing* `heavy_scene_timings` (existing) | the current effects comparison stays honest |
 | 6 | `cargo xtask wasm` | the browser build still compiles and stays CPU |
-| 7 | screenshot comparison | the real app looks the same with the GPU canvas on |
+| 7 | screenshot comparison | the real app looks the same with the GPU canvas on. Measured on the 34-layer page at 34.6%: mean 0.9/255, differences on shape and shadow edges only — the CPU path snaps the view outwards to whole device pixels while the GPU draws the requested view, so content can sit a pixel apart |
 
 Parity tolerance (what the suite enforces, measured 2026-10-24 on the owner's machine): mean
 absolute channel difference ≤ 0.5/255; at most 0.5% of pixels may differ by more than 8 in a
