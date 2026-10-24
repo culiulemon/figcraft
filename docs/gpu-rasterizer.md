@@ -221,8 +221,137 @@ from 11.6 to 3.2 ms a frame.
   retainer the GPU lacks (cross-frame retention). The single-scene backdrop route in
   `scene::build_with` is kept as the parity reference for each effect, though the canvas always
   segments a page that has a backdrop node.
-- What is left of the GPU path is listed in `docs/gaps.md` (gap 7): retention, images, masks, and
-  the effects still refused (inner shadows, grain, spread and translucent shadows).
+- What is left is the full-coverage program below (P5–P11), also listed in `docs/gaps.md` (gap 7).
+
+## Full GPU coverage (P5–P11)
+
+Everything the CPU canvas draws, the GPU canvas should draw too — exports, the parity suite, the
+browser and machines without an adapter keep the CPU renderer, but no *page* should fall back
+because of what it contains. In the order the work pays off:
+
+### P5 — paints: images, patterns, diamond gradients, per-paint blends
+
+Any file with a photo, a logo or a pattern currently re-renders the whole page on the CPU. The
+renderer already decodes, filters (brightness, contrast, saturation, exposure, blur) and caches
+every image pixmap; the GPU only has to draw it.
+
+- **Images**: `figcraft_render::images::get`/`frame_at` (already filtered, already cached) → a
+  texture registered with vello's atlas once per image and size, drawn with the CPU's own
+  `image_transform` (Fill/Fit/Crop/Tile, rotation, crop). `Extend::Repeat` for tiles, `Pad` with the
+  renderer's 1-px transparent border for Fit and Crop; bicubic where the CPU asks for it.
+- **Pattern fills**: `figcraft_render::pattern::prepare` returns the tile pixmap, extend mode,
+  quality and transform — upload it and draw it as the image brush.
+- **Diamond gradient**: the CPU paints a 256 × 256 pixmap through the handle frame; upload the same
+  pixmap (`Prepared::Pattern`) and draw it the same way.
+- **Per-paint blend modes** (a fill or stroke with its own blend): one vello layer per paint, as the
+  node's own blend already gets one.
+- Animated GIFs and WebP stay on the CPU (a frame changes under a document that did not).
+
+Tests: parity per scale mode, per filter, with rotation and crop; a pattern tile; a diamond
+gradient; a multiplied fill. Exit: a page of photos, logos and pattern fills draws on the GPU within
+the page tolerance.
+
+### P6 — any-outline shadows, inner shadows
+
+A shadow or an inner shadow cast by anything that is not one rounded rectangle still sends the page
+to the CPU: an ellipse, a star or vector, text, a card with per-corner radii, a group. The CPU draws
+these from the layer's pixels (or the paints' outline) with the box blur; on the GPU they need one
+offscreen layer per such node:
+
+- **Outline silhouette** (one outline: ellipse, vector, boolean, text, per-corner rect): draw the
+  outline into a layer with the shadow colour (plus a mitred stroke of twice the spread to dilate
+  it), blur it with the GPU's box passes, and draw it under the node clipped outside the paints'
+  cover — the same arithmetic as the rounded-rect fast path, one layer instead of one draw.
+- **Pixels silhouette** (a group, a frame whose children reach past it): the node's content into a
+  layer, dilated by the spread (`fx::morph`'s square kernel as a separable max filter), blurred,
+  tinted, drawn under it.
+- **Inner shadow**: the shape's coverage inverted at the shadow's offset (dilated/shrunk by the
+  spread), blurred, tinted and clipped to the shape; for a group, from its pixels' cover.
+- `Layers` grows one method (`shadow`/`inner_shadow`) returning the image; the builder draws it and
+  the node's own content over it, in the CPU's order (inner shadows over the fills, under children
+  and strokes; drop shadows under everything).
+
+Tests: parity for an ellipse, a star, a vector, text, a per-corner card, a group and a frame with
+overflowing children; each with and without spread; an inner shadow on a card and on a group.
+Timing: 30 such cards must stay under ~10 ms at 2400 × 1600 (they cost one layer each, like a layer
+blur). Exit: no shadow of any kind falls back.
+
+### P7 — effect combinations, grain, progressive blur
+
+The CPU applies a node's effects in list order: inner shadows, then the layer blur, grain and
+texture, then drop shadows, over the backdrop read. A node with two kinds currently falls back
+whole.
+
+- **Combinations**: the builder reads the effect list and drives the same pipeline on the GPU —
+  content → layer blur / grain / texture (in order) → drop shadows from that result → backdrop.
+  Each stage is a pass the canvas already has, chained through one layer.
+- **Grain and texture**: the renderer's noise is deterministic (`grain::noise`/`grains`/`texture`
+  take the node, transform and seed), so the CPU can compute the grain tile once and the canvas
+  uploads it (cached by node, seed and zoom) — the pixels are the CPU's own. A node-scale change
+  regenerates the tile.
+- **Progressive blur**: the CPU's radius ramps along an axis; draw it as several band passes of the
+  box blur at increasing radii, masked by the ramp, or as one blur with a ramp-weighted mix — the
+  second is cheaper and within the effect tolerance.
+
+Tests: parity for shadow + layer blur, two blurs, blur + grain, grain on text, a progressive blur
+card. Exit: any single node's effect list draws on the GPU.
+
+### P8 — masks and plus-darker
+
+- **Masks** (alpha, luminance, outline): the mask node's coverage into a texture; the masked
+  siblings drawn into a layer; one pass multiplies the layer by the mask (the `compose` pipeline
+  with a second input). Layers that a mask hides are not drawn.
+- **`PlusDarker`**: no vello blend mode; composite the node's (or paint's) layer with a small pass
+  of the CPU's formula.
+- The editor's **mask outlines** stay an egui overlay.
+
+Tests: parity for each mask type, a mask over a group, a text mask, and a plus-darker layer and
+paint. Exit: masked pages draw on the GPU.
+
+### P9 — the text tail
+
+Text in one style already matches byte for byte. What still falls back: runs with their own fills
+and colours, colour glyphs (emoji), text with a stroke, and text as a mask.
+
+- **Styled runs**: layout gives each run its glyphs; build one outline per run and fill it with that
+  run's paints, in order.
+- **Colour glyphs**: the layout's embedded colour bitmaps go through the P5 image path.
+- **Text strokes**: the renderer's stroke band for glyph outlines (`stroke_fill` for text), filled
+  as any other band.
+
+Tests: parity for a paragraph with per-run colours, an emoji, stroked text. Exit: no text falls back.
+
+### P10 — structure: nested backdrops, outline mode
+
+- **A backdrop node inside a layer** (a glass pane in a group or frame, a blurred card in a card) is
+  the last structural fallback: `scene::plan` refuses it as there is no segment boundary inside a
+  layer. Draw the ancestor into a layer (P7's machinery), segment inside it, and composite — or, when
+  the ancestor is a plain pass-through container with no opacity, blend or clip, flatten it into the
+  page's plan.
+- **Outline mode** (the editor's wireframe view): every outline stroked one device pixel, no fills —
+  the builder draws it from the same outlines.
+- **Soft proof and Display P3** stay on the CPU until the canvas is colour-managed (an sRGB surface
+  today, see [`hardware-parity.md`](hardware-parity.md)); they are editor modes, not content.
+
+Tests: parity for a pane inside a frame and a blurred card inside a card; an outline-mode parity
+test; the plan's flattening rules. Exit: the fallback predicate answers `Ok` for every page the
+canvas can be asked to draw with a device, apart from the colour-managed modes.
+
+### P11 — performance: cross-frame retention
+
+Coverage first, then speed. A segmented page is re-encoded whole every frame, so dragging one layer
+costs 12–19 ms against the CPU's retained 4–5 ms (its canvas latency is already lower). Keep the
+node's encoded scene and its effect pixels between frames, keyed on the document's subtrees, the
+view and the zoom, as `figcraft_render::layers` does; a drag then re-encodes only what moved, and
+the segments below it are reused.
+
+Tests: a drag benchmark that must beat the CPU's retained renderer on every page in the corpus
+(plain, layer blur, shadows, glass, blurs); a test that a kept segment is dropped when its content
+changes. Exit: the GPU is at or under the CPU's retained frame time everywhere, at full quality.
+
+Deliberate exceptions, documented rather than ported: exports (`svg`, `pdf`, `png`/`jpg`), the parity
+suite and the browser keep the CPU renderer; soft proof and Display P3 (above); a machine whose
+adapter cannot run vello (the canvas refuses and says why in `ui.inspect`).
 
 ## Test matrix
 
@@ -355,5 +484,9 @@ stays on the fallback list.
   - `the_gpu_draws_the_shadow_variations`: mean 0.558/255, worst 59, 1.5% of pixels off by more
     than 8 — the Gaussian/three-box difference on the soft edges, not a shape error.
   - 30 spread shadows: **0.69–0.91 ms** a frame against the CPU's 28–34 ms (`shadow_timings`).
-- Next: inner shadows, grain, and shadows cast by a group, an ellipse or text (the renderer's
-  layer-sized path); then P4's cleanup.
+- 2026-10-24: **the full-coverage program (P5–P11) is written down** in *Full GPU coverage*, in the
+  order the work pays off: paints (images, patterns, diamond gradients, per-paint blends), then any-outline and
+  inner shadows, effect combinations with grain and progressive blur, masks and plus-darker, the
+  text tail, nested backdrops and outline mode, and cross-frame retention. Each phase carries its
+  own tests and exit criterion; the deliberately non-ported set (exports, the browser, soft proof
+  and Display P3) is named at the end.

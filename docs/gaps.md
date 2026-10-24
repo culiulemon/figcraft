@@ -276,8 +276,11 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
   detail, single-layer edits at 10k layers ~0.2 ms; full 1440×900 renders 7–15 ms at 10k layers.
   Heavy effects (glass, background blur, noise) and 4K/5K canvases at 2x are where CPU time grows.
 - **Impact:** large files and effect-heavy designs; battery on laptops.
-- **Estimate:** 15–35 h left (vello, held to the CPU renderer as the oracle): cross-frame retention,
-  images, masks, the effects still on the CPU, and driver QA.
+- **Estimate:** 35–60 h left, in the order the work pays off ([`gpu-rasterizer.md`](gpu-rasterizer.md)
+  P5–P11): image/pattern/diamond paints and per-paint blends (5–9), shadows and inner shadows of any
+  outline incl. groups and text (6–10), effect combinations with grain and progressive blur (6–10),
+  masks and plus-darker (5–8), the text tail (3–6), nested backdrops and outline mode (5–9), and
+  cross-frame retention (5–8).
 
 ### 8. Platform QA: Linux and the browser left
 - **Missing:** regular runs on Linux and the browser; real screen readers; a repeat of the Windows
