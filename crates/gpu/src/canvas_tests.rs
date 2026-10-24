@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use figcraft_color::{BlendMode, Color, Gradient, GradientKind, Paint};
-use figcraft_doc::{Document, Effect, NodeKind, StrokeAlign, TextData};
+use figcraft_doc::{Document, Effect, EffectKind, Glass, NodeKind, StrokeAlign, TextData};
 use figcraft_render::{Options, Pixmap, View, render_view};
 use wgpu::{Device, Queue};
 
@@ -183,6 +183,14 @@ fn unsupported_pages_are_refused() {
     // A shadow and a blur together are the CPU renderer's (its order matters).
     d.get_mut(id).unwrap().effects = vec![Effect::drop_shadow(), Effect::layer_blur()];
     assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Effect));
+    // A background blur reads what lies under the node: drawn on the GPU from a backdrop render.
+    d.get_mut(id).unwrap().effects = vec![Effect::background_blur()];
+    assert_eq!(scene::supported(&d, p), Ok(()));
+    d.get_mut(id).unwrap().effects = vec![Effect::background_blur(), Effect::drop_shadow()];
+    assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Effect));
+    // Glass is a pane over the backdrop, drawn by the GPU's glass shader.
+    d.get_mut(id).unwrap().effects = vec![Effect { kind: EffectKind::Glass(Glass::default()), visible: true }];
+    assert_eq!(scene::supported(&d, p), Ok(()));
     d.get_mut(id).unwrap().effects.clear();
 
     // An image fill needs the renderer's texture atlas.
@@ -306,6 +314,94 @@ fn the_gpu_text_matches_the_cpu_render() {
     println!("text parity: worst {worst} at {at:?}, mean {mean:.3}, {over} pixels differ by more than 8");
     assert!(worst <= 160, "a channel differs by {worst} (mean {mean:.3})");
     assert!(mean <= 1.0, "the mean difference is {mean:.3}");
+}
+
+/// Coloured stripes with a rounded pane over them that blurs what it covers.
+fn backdrop_doc() -> Document {
+    let mut d = Document::new("gpu backdrop");
+    let p = d.first_page().unwrap();
+    let colours = ["E03030", "2040E0", "20C060", "F0C830", "A040E0", "20B0D0"];
+    for i in 0..8u32 {
+        let id = d.create(p, NodeKind::Rectangle, "stripe", 20.0 + f64::from(i) * 70.0, 60.0, 62.0, 200.0).unwrap();
+        d.get_mut(id).unwrap().fills = vec![Paint::solid(Color::from_hex(colours[i as usize % colours.len()]).unwrap_or(Color::WHITE))];
+    }
+    let pane = d.create(p, NodeKind::Rectangle, "pane", 150.0, 90.0, 240.0, 150.0).unwrap();
+    {
+        let n = d.get_mut(pane).unwrap();
+        n.corners.radii = [28.0; 4];
+        n.fills = vec![Paint::solid(Color { a: 0.15, ..Color::WHITE })];
+        n.effects = vec![Effect::background_blur()];
+    }
+    d
+}
+
+#[test]
+fn the_gpu_background_blur_matches_the_cpu_render() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let d = backdrop_doc();
+    let p = d.first_page().unwrap();
+    let (w, h) = PARITY;
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+    let cpu = render_view(&d, p, &view, &Options::default()).unwrap();
+    let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+    let built = {
+        let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+        scene::build_with(&d, p, &view, &mut layers)
+    }
+    .expect("the GPU draws a background blur");
+    assert!(canvas.render(&device, &queue, &built, scene::background(&d, p)).is_some());
+    let gpu = canvas.read(&device, &queue).unwrap();
+    let (worst, mean, at, over) = diff(&cpu, &gpu);
+    println!("background blur parity: worst {worst} at {at:?}, mean {mean:.3}, {over} pixels differ by more than 8");
+    assert!(worst <= 128, "a channel differs by {worst} (mean {mean:.3})");
+    assert!(mean <= 2.0, "the mean difference is {mean:.3}");
+}
+
+/// Coloured stripes with a glass pane over them.
+fn glass_doc() -> Document {
+    let mut d = Document::new("gpu glass");
+    let p = d.first_page().unwrap();
+    let colours = ["E03030", "2040E0", "20C060", "F0C830"];
+    for i in 0..12u32 {
+        let id = d.create(p, NodeKind::Rectangle, "stripe", f64::from(i) * 50.0, 0.0, 50.0, 300.0).unwrap();
+        d.get_mut(id).unwrap().fills = vec![Paint::solid(Color::from_hex(colours[i as usize % colours.len()]).unwrap_or(Color::WHITE))];
+    }
+    let pane = d.create(p, NodeKind::Rectangle, "glass", 120.0, 60.0, 300.0, 180.0).unwrap();
+    {
+        let n = d.get_mut(pane).unwrap();
+        n.corners.radii = [40.0; 4];
+        n.fills = vec![Paint::solid(Color { a: 0.1, ..Color::WHITE })];
+        n.effects = vec![Effect { kind: EffectKind::Glass(Glass::default()), visible: true }];
+    }
+    d
+}
+
+#[test]
+fn the_gpu_glass_matches_the_cpu_canvas() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let d = glass_doc();
+    let p = d.first_page().unwrap();
+    let (w, h) = PARITY;
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+    let cpu = render_view(&d, p, &view, &Options::default()).unwrap();
+    let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+    let built = {
+        let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+        scene::build_with(&d, p, &view, &mut layers)
+    }
+    .expect("the GPU draws glass");
+    assert!(canvas.render(&device, &queue, &built, scene::background(&d, p)).is_some());
+    let gpu = canvas.read(&device, &queue).unwrap();
+    let (worst, mean, at, over) = diff(&cpu, &gpu);
+    println!("glass parity: worst {worst} at {at:?}, mean {mean:.3}, {over} pixels differ by more than 8");
+    assert!(worst <= 128, "a channel differs by {worst} (mean {mean:.3})");
+    assert!(mean <= 2.0, "the mean difference is {mean:.3}");
 }
 
 #[test]
@@ -458,6 +554,95 @@ fn shadow_timings() {
             8,
         );
         println!("30 shadowed cards, {w} × {h}: CPU {cpu:.2} ms | GPU frame {frame:.2} ms");
+    }
+}
+
+/// The page the owner drags in: thirty shadowed cards, three glass panes, a background-blurred
+/// card and a layer-blurred one.
+fn heavy_effects_doc() -> Document {
+    let mut d = shadow_cards(30);
+    let p = d.first_page().unwrap();
+    for (x, y, w, h) in [(80.0, 80.0, 300.0, 220.0), (360.0, 260.0, 300.0, 220.0), (600.0, 480.0, 280.0, 200.0)] {
+        let id = d.create(p, NodeKind::Rectangle, "Glass Pane", x, y, w, h).unwrap();
+        let n = d.get_mut(id).unwrap();
+        n.corners.radii = [36.0; 4];
+        n.fills = vec![Paint::solid(Color { a: 0.08, ..Color::WHITE })];
+        n.effects = vec![Effect { kind: EffectKind::Glass(Glass::default()), visible: true }];
+    }
+    let card = d.create(p, NodeKind::Rectangle, "Blurred card", 200.0, 560.0, 260.0, 160.0).unwrap();
+    d.get_mut(card).unwrap().effects = vec![Effect::background_blur()];
+    let card2 = d.create(p, NodeKind::Rectangle, "Layer blur", 520.0, 640.0, 220.0, 140.0).unwrap();
+    d.get_mut(card2).unwrap().effects = vec![Effect::layer_blur()];
+    d
+}
+
+#[test]
+#[ignore = "timing: run in release with --ignored --nocapture"]
+fn heavy_scene_gpu_timings() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    for (name, d) in [("one glass pane", glass_doc()), ("one background blur", backdrop_doc())] {
+        let p = d.first_page().unwrap();
+        let view = View { origin: (0.0, 0.0), scale: 1.0, width: 904, height: 860 };
+        let _ = render_view(&d, p, &view, &Options::default());
+        let cpu = frame_ms(|| render_view(&d, p, &view, &Options::default()).is_some(), 5);
+        let mut canvas = CanvasGpu::new(&device, view.width, view.height).unwrap();
+        let frame = frame_ms(
+            || {
+                let built = {
+                    let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+                    scene::build_with(&d, p, &view, &mut layers)
+                };
+                let ok = built.is_ok_and(|s| canvas.render(&device, &queue, &s, scene::background(&d, p)).is_some());
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                ok
+            },
+            5,
+        );
+        println!("{name}, 904 × 860: CPU {cpu:.2} ms | GPU frame {frame:.2} ms");
+        // Pipelined, as the app draws: submit frame after frame, wait only for the last.
+        let t = std::time::Instant::now();
+        for _ in 0..8 {
+            let built = {
+                let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+                scene::build_with(&d, p, &view, &mut layers)
+            };
+            if let Ok(s) = built {
+                let _ = canvas.render(&device, &queue, &s, scene::background(&d, p));
+            }
+        }
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        println!("{name}: pipelined {:.2} ms a frame", t.elapsed().as_secs_f64() * 1000.0 / 8.0);
+    }
+    for (w, h) in [(904u32, 860u32), (2400, 1600)] {
+        let d = heavy_effects_doc();
+        let p = d.first_page().unwrap();
+        let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+        let _ = render_view(&d, p, &view, &Options::default());
+        let cpu = frame_ms(|| render_view(&d, p, &view, &Options::default()).is_some(), 5);
+        let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+        let build = frame_ms(
+            || {
+                let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+                scene::build_with(&d, p, &view, &mut layers).is_ok()
+            },
+            5,
+        );
+        let frame = frame_ms(
+            || {
+                let built = {
+                    let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+                    scene::build_with(&d, p, &view, &mut layers)
+                };
+                let ok = built.is_ok_and(|s| canvas.render(&device, &queue, &s, scene::background(&d, p)).is_some());
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                ok
+            },
+            5,
+        );
+        println!("heavy scene {w} × {h}: CPU {cpu:.2} ms | GPU build {build:.2} ms, frame {frame:.2} ms");
     }
 }
 

@@ -60,8 +60,11 @@ The desktop canvas draws on the GPU where the page is in the GPU rasterizer's fe
 ([`gpu-rasterizer.md`](gpu-rasterizer.md)): the render thread turns the page into a vello scene and
 draws it into one of two textures, and the window paints that texture, so no pixels cross the bus
 and nothing is uploaded per frame. A node with a single layer blur is drawn into an offscreen
-texture, blurred by the GPU's own box passes (the CPU blur's radii) and composited there too, and
-a rounded opaque card's drop shadow is vello's blurred rounded rect drawn under the card.
+texture, blurred by the GPU's own box passes (the CPU blur's radii) and composited there too; a
+rounded opaque card's drop shadow is vello's blurred rounded rect drawn under the card; and a
+background blur reads the page under its node from a texture rendered there. Glass is implemented
+the same way (the CPU's geometry, the GPU's shader) but kept on the CPU until the accumulated
+backdrop renderer makes it a win.
 Every other page — other effects, images, masks, outline modes, soft proof — is drawn by the CPU
 renderer and uploaded as before; the choice is made per frame and reported by `ui.inspect`. The
 CPU renderer is the single source of pixels for exports and the browser. The desktop canvas

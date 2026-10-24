@@ -4,14 +4,15 @@
 
 use std::sync::{Arc, Mutex};
 
+use figcraft_render::glass::GlassPane;
 use figcraft_render::{GlassPaint, Pixmap};
 use wgpu::{
     BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BlendState, BufferDescriptor,
     BufferUsages, ColorTargetState, ColorWrites, CommandEncoderDescriptor, Device, Extent3d, FragmentState, LoadOp, Operations,
     PipelineCompilationOptions, PipelineLayoutDescriptor, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline,
     RenderPipelineDescriptor, Sampler, SamplerDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, TexelCopyBufferInfo,
-    TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
-    VertexState,
+    TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
+    TextureViewDescriptor, VertexState,
 };
 
 /// A pane's geometry as the GPU keeps it: coverage alpha, distance to the outline, inward normals.
@@ -116,7 +117,7 @@ impl Glass {
         if w == 0 || h == 0 || p.cw == 0 || p.ch == 0 {
             return None;
         }
-        let geometry = self.geometry(device, queue, p)?;
+        let geometry = self.geometry(device, queue, p.geometry, p.alpha, p.dist, p.normals, p.cw, p.ch)?;
         let frosted = upload(
             device,
             queue,
@@ -137,19 +138,58 @@ impl Glass {
             usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
             view_formats: &[],
         });
+        let encoder = self.draw(device, queue, &geometry, &frosted.create_view(&TextureViewDescriptor::default()), values(p), &out, (w, h));
+        read_back(device, queue, encoder, &out, w, h)
+    }
+
+    /// Draw the pane into a texture from a backdrop texture (the GPU canvas's path: no upload and
+    /// no read-back).
+    pub(crate) fn paint_texture(&self, device: &Device, queue: &Queue, p: &GlassPane, frosted: &TextureView) -> Option<Texture> {
+        let (w, h) = (p.w, p.h);
+        if w == 0 || h == 0 || p.cw() == 0 || p.ch() == 0 {
+            return None;
+        }
+        let geometry = self.geometry(device, queue, p.geometry_id(), p.alpha(), p.dist(), p.normals(), p.cw(), p.ch())?;
+        let out = device.create_texture(&TextureDescriptor {
+            label: Some("figcraft glass layer"),
+            size: Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let encoder = self.draw(device, queue, &geometry, frosted, values_of_pane(p), &out, (w, h));
+        queue.submit([encoder.finish()]);
+        Some(out)
+    }
+
+    /// Draw the pane into `out` from `frosted`: the shader's one pass, ready to submit.
+    #[allow(clippy::too_many_arguments)]
+    fn draw(
+        &self,
+        device: &Device,
+        queue: &Queue,
+        geometry: &Geometry,
+        frosted: &TextureView,
+        params: [f32; 16],
+        out: &Texture,
+        (w, h): (u32, u32),
+    ) -> wgpu::CommandEncoder {
         let uniform = device.create_buffer(&BufferDescriptor {
             label: Some("figcraft glass params"),
             size: 64,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        queue.write_buffer(&uniform, 0, &params(p));
+        queue.write_buffer(&uniform, 0, &uniform_bytes(params));
         let view = |t: &Texture| t.create_view(&TextureViewDescriptor::default());
         let bind = device.create_bind_group(&BindGroupDescriptor {
             label: Some("figcraft glass"),
             layout: &self.layout,
             entries: &[
-                BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view(&frosted)) },
+                BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(frosted) },
                 BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                 BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&view(&geometry.alpha)) },
                 BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&view(&geometry.dist)) },
@@ -159,7 +199,7 @@ impl Glass {
         });
         let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("figcraft glass") });
         {
-            let target = view(&out);
+            let target = view(out);
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("figcraft glass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
@@ -177,39 +217,51 @@ impl Glass {
             pass.set_bind_group(0, &bind, &[]);
             pass.draw(0..3, 0..1);
         }
-        read_back(device, queue, encoder, &out, w, h)
+        let _ = (w, h);
+        encoder
     }
 
     /// This pane's geometry as textures, worked out (and uploaded) the first time it is asked for.
-    fn geometry(&self, device: &Device, queue: &Queue, p: &GlassPaint<'_>) -> Option<Arc<Geometry>> {
+    #[allow(clippy::too_many_arguments)]
+    fn geometry(
+        &self,
+        device: &Device,
+        queue: &Queue,
+        id: u64,
+        alpha: &[u8],
+        dist: &[f32],
+        normals: &[(f32, f32)],
+        cw: usize,
+        ch: usize,
+    ) -> Option<Arc<Geometry>> {
         let Ok(mut kept) = self.kept.lock() else { return None };
-        if let Some(i) = kept.iter().position(|(id, _)| *id == p.geometry) {
+        if let Some(i) = kept.iter().position(|(kept_id, _)| *kept_id == id) {
             let entry = kept.remove(i);
             let g = entry.1.clone();
             kept.push(entry);
             return Some(g);
         }
-        let (cw, ch) = (u32::try_from(p.cw).ok()?, u32::try_from(p.ch).ok()?);
-        let alpha = upload(device, queue, "figcraft glass coverage", cw, ch, TextureFormat::R8Unorm, p.alpha, p.cw)?;
-        let mut dist_bytes = Vec::with_capacity(p.dist.len() * 4);
-        for d in p.dist {
+        let (cwu, chu) = (u32::try_from(cw).ok()?, u32::try_from(ch).ok()?);
+        let alpha = upload(device, queue, "figcraft glass coverage", cwu, chu, TextureFormat::R8Unorm, alpha, cw)?;
+        let mut dist_bytes = Vec::with_capacity(dist.len() * 4);
+        for d in dist {
             dist_bytes.extend_from_slice(&d.to_le_bytes());
         }
-        let dist = upload(device, queue, "figcraft glass distance", cw, ch, TextureFormat::R32Float, &dist_bytes, p.cw * 4)?;
-        let mut normal_bytes = Vec::with_capacity(p.normals.len() * 8);
-        for (x, y) in p.normals {
+        let dist = upload(device, queue, "figcraft glass distance", cwu, chu, TextureFormat::R32Float, &dist_bytes, cw * 4)?;
+        let mut normal_bytes = Vec::with_capacity(normals.len() * 8);
+        for (x, y) in normals {
             normal_bytes.extend_from_slice(&x.to_le_bytes());
             normal_bytes.extend_from_slice(&y.to_le_bytes());
         }
-        let normals = upload(device, queue, "figcraft glass normals", cw, ch, TextureFormat::Rg32Float, &normal_bytes, p.cw * 8)?;
-        let bytes = p.cw * p.ch * 13;
+        let normals = upload(device, queue, "figcraft glass normals", cwu, chu, TextureFormat::Rg32Float, &normal_bytes, cw * 8)?;
+        let bytes = cw * ch * 13;
         let g = Arc::new(Geometry { alpha, dist, normals, bytes });
         if bytes <= KEPT_BUDGET {
             let mut total: usize = kept.iter().map(|(_, g)| g.bytes).sum();
             while total.saturating_add(bytes) > KEPT_BUDGET && !kept.is_empty() {
                 total = total.saturating_sub(kept.remove(0).1.bytes);
             }
-            kept.push((p.geometry, g.clone()));
+            kept.push((id, g.clone()));
         }
         Some(g)
     }
@@ -236,10 +288,9 @@ fn upload(device: &Device, queue: &Queue, label: &str, w: u32, h: u32, format: T
     Some(texture)
 }
 
-/// The pane's parameters as the shader's uniform (64 bytes of f32).
-fn params(p: &GlassPaint<'_>) -> [u8; 64] {
-    let mut out = [0u8; 64];
-    let values = [
+/// The shader's parameters, in its uniform's order.
+fn values(p: &GlassPaint<'_>) -> [f32; 16] {
+    [
         p.cw as f32,
         p.ch as f32,
         p.m as f32,
@@ -256,7 +307,34 @@ fn params(p: &GlassPaint<'_>) -> [u8; 64] {
         p.light.0,
         p.light.1,
         0.0,
-    ];
+    ]
+}
+
+/// The shader's parameters for a pane from the render crate.
+fn values_of_pane(p: &GlassPane) -> [f32; 16] {
+    [
+        p.cw() as f32,
+        p.ch() as f32,
+        p.m as f32,
+        p.pad as f32,
+        p.depth,
+        p.bend_max,
+        p.fringe,
+        p.power,
+        p.band,
+        p.reach,
+        p.floor,
+        p.fall,
+        p.intensity,
+        p.light.0,
+        p.light.1,
+        0.0,
+    ]
+}
+
+/// The pane's parameters as the shader's uniform (64 bytes of f32).
+fn uniform_bytes(values: [f32; 16]) -> [u8; 64] {
+    let mut out = [0u8; 64];
     for (i, v) in values.into_iter().enumerate() {
         if let Some(slot) = out.get_mut(i * 4..i * 4 + 4) {
             slot.copy_from_slice(&v.to_le_bytes());

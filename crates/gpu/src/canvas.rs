@@ -21,6 +21,8 @@ pub struct CanvasGpu {
     renderer: Renderer,
     /// The layer blur (the effects' own pipeline default).
     blur: Blur,
+    /// The glass shader (its geometry is kept here between frames).
+    glass: crate::glass::Glass,
     targets: [Target; 2],
     /// The target the next frame is drawn into.
     next: usize,
@@ -54,7 +56,8 @@ impl CanvasGpu {
         )
         .ok()?;
         let blur = Blur::new(device)?;
-        Some(Self { renderer, blur, targets: [target(device, width, height), target(device, width, height)], next: 0, last: 0, generation: 1 })
+        let glass = crate::glass::Glass::new(device)?;
+        Some(Self { renderer, blur, glass, targets: [target(device, width, height), target(device, width, height)], next: 0, last: 0, generation: 1 })
     }
 
     /// The size in device pixels.
@@ -165,6 +168,79 @@ impl crate::scene::Layers for GpuLayers<'_> {
         let blurred = crate::blur::blur_texture(self.device, self.queue, &self.canvas.blur, &view, (width, height), sigma)?;
         Some(self.canvas.register_layer(blurred))
     }
+
+    fn backdrop(&mut self, scene: &Scene, width: u32, height: u32, sigma: f64) -> Option<ImageData> {
+        self.blurred(scene, width, height, sigma)
+    }
+
+    fn glass(&mut self, scene: &Scene, (vw, vh): (u32, u32), pane: &figcraft_render::glass::GlassPane, at: (i32, i32)) -> Option<ImageData> {
+        let pad = pane.pad;
+        let back = self.canvas.render_layer(self.device, self.queue, scene, vw, vh)?;
+        let (cw, ch) = (pane.w.checked_add(pad.checked_mul(2)?)?, pane.h.checked_add(pad.checked_mul(2)?)?);
+        let cropped = crop(self.device, self.queue, &back, (at.0 - pad as i32, at.1 - pad as i32), (cw, ch))?;
+        let view = cropped.create_view(&wgpu::TextureViewDescriptor::default());
+        let frosted = crate::blur::blur_texture(self.device, self.queue, &self.canvas.blur, &view, (cw, ch), pane.frost_sigma)?;
+        let frosted_view = frosted.create_view(&wgpu::TextureViewDescriptor::default());
+        let glass = self.canvas.glass.paint_texture(self.device, self.queue, pane, &frosted_view)?;
+        Some(self.canvas.register_layer(glass))
+    }
+}
+
+/// A `(w, h)` copy of `src` starting at `(x, y)`, transparent where it lies outside `src`.
+fn crop(device: &Device, queue: &Queue, src: &Texture, (x, y): (i32, i32), (w, h): (u32, u32)) -> Option<Texture> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("figcraft backdrop crop"),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: FORMAT,
+        usage: TextureUsages::COPY_DST | TextureUsages::COPY_SRC | TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("figcraft backdrop crop") });
+    {
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("figcraft backdrop crop"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+    }
+    let (sx, sy) = (x.max(0), y.max(0));
+    let (dx, dy) = ((-x).max(0) as u32, (-y).max(0) as u32);
+    let copy_w = (i64::from(w) - i64::from(dx)).min(i64::from(src.width()) - i64::from(sx));
+    let copy_h = (i64::from(h) - i64::from(dy)).min(i64::from(src.height()) - i64::from(sy));
+    if copy_w > 0 && copy_h > 0 {
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: src,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: sx as u32, y: sy as u32, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: dx, y: dy, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d { width: copy_w as u32, height: copy_h as u32, depth_or_array_layers: 1 },
+        );
+    }
+    queue.submit([encoder.finish()]);
+    Some(texture)
 }
 
 fn target(device: &Device, width: u32, height: u32) -> Target {

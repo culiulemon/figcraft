@@ -374,10 +374,59 @@ fn light_reach(band: f64, intensity: f64) -> f64 {
 /// zoom would otherwise need a huge margin of coverage around every cut).
 const MAX_LIGHT_PX: f64 = 512.0;
 
-/// The glass of a `w` × `h` layer whose `shape` maps through `xf` (local → layer pixels), from
-/// `back`, its backdrop padded by `pad` pixels each way, at `scale` device pixels per unit.
-#[allow(clippy::too_many_arguments)]
-pub fn glass(g: &Glass, shape: &Outline, back: &Pixmap, pad: u32, w: u32, h: u32, xf: Affine, scale: f64) -> Option<Pixmap> {
+/// A pane's shape-only part — kept between frames by [`geometry`] — and the shader's parameters:
+/// everything but the frosted backdrop. The GPU canvas draws it from a backdrop texture; the CPU
+/// path blurs its backdrop and paints with it.
+pub struct GlassPane {
+    /// The pane's coverage with its margin (`m` each way), from which the geometry was worked out.
+    coverage: Pixmap,
+    geometry: Arc<Geometry>,
+    pub m: u32,
+    pub w: u32,
+    pub h: u32,
+    pub pad: u32,
+    pub depth: f32,
+    pub bend_max: f32,
+    pub fringe: f32,
+    pub power: f32,
+    pub band: f32,
+    pub reach: f32,
+    pub floor: f32,
+    pub fall: f32,
+    pub intensity: f32,
+    pub light: (f32, f32),
+    /// The deviation the backdrop is blurred by before the pane refracts it (pixels).
+    pub frost_sigma: f64,
+}
+
+impl GlassPane {
+    /// The coverage's alpha, `cw` × `ch`.
+    pub fn alpha(&self) -> &[u8] {
+        &self.geometry.alpha
+    }
+    /// The distance to the outline, inside it (pixels).
+    pub fn dist(&self) -> &[f32] {
+        &self.geometry.dist
+    }
+    /// The inward normals, smoothed from the distance field.
+    pub fn normals(&self) -> &[(f32, f32)] {
+        &self.geometry.normals
+    }
+    pub fn cw(&self) -> usize {
+        self.geometry.cw
+    }
+    pub fn ch(&self) -> usize {
+        self.geometry.ch
+    }
+    /// Which geometry this is (an accelerator keeps it as textures).
+    pub fn geometry_id(&self) -> u64 {
+        self.geometry.id
+    }
+}
+
+/// The shape-only part of a `w` × `h` layer's glass whose `shape` maps through `xf` (local → layer
+/// pixels), at `scale` device pixels per unit; `None` when nothing can be drawn.
+pub fn pane(g: &Glass, shape: &Outline, w: u32, h: u32, xf: Affine, scale: f64) -> Option<GlassPane> {
     let g = g.sanitized();
     let depth = (g.depth * scale).clamp(1.0, 1024.0);
     let band = (depth * (0.15 + 0.35 * g.splay)).max(1.0);
@@ -391,9 +440,6 @@ pub fn glass(g: &Glass, shape: &Outline, back: &Pixmap, pad: u32, w: u32, h: u32
     // The distance field and normals don't move with the pane: a drag finds the ones it worked out
     // the frame before (see [`geometry`]).
     let geom = geometry(shape, xf, m, r, &cov);
-    let cw = cov.width() as usize;
-    let mut frosted = back.clone();
-    fx::blur(&mut frosted, g.frost / 2.0 * scale);
     let ang = g.light_angle.to_radians();
     let light = (ang.sin() as f32, -ang.cos() as f32);
     let bend_max = (g.refraction * depth) as f32;
@@ -405,21 +451,14 @@ pub fn glass(g: &Glass, shape: &Outline, back: &Pixmap, pad: u32, w: u32, h: u32
     let floor = (-reach / band).exp();
     let fall = 1.0 - floor;
     let intensity = g.light_intensity as f32;
-    let depth = depth as f32;
-    // The pixels themselves: an accelerator draws them where it can (the geometry is its own
-    // textures, kept from frame to frame), and the CPU draws them otherwise.
-    let paint = fx::GlassPaint {
-        alpha: &geom.alpha,
-        dist: &geom.dist,
-        normals: &geom.normals,
-        cw: geom.cw,
-        ch: geom.ch,
+    Some(GlassPane {
+        coverage: cov,
+        geometry: geom,
         m,
-        frosted: &frosted,
         w,
         h,
-        pad,
-        depth,
+        pad: 0,
+        depth: depth as f32,
         bend_max,
         fringe,
         power,
@@ -429,7 +468,40 @@ pub fn glass(g: &Glass, shape: &Outline, back: &Pixmap, pad: u32, w: u32, h: u32
         fall,
         intensity,
         light,
-        geometry: geom.id,
+        frost_sigma: g.frost / 2.0 * scale,
+    })
+}
+
+/// The glass of a `w` × `h` layer whose `shape` maps through `xf` (local → layer pixels), from
+/// `back`, its backdrop padded by `pad` pixels each way, at `scale` device pixels per unit.
+#[allow(clippy::too_many_arguments)]
+pub fn glass(g: &Glass, shape: &Outline, back: &Pixmap, pad: u32, w: u32, h: u32, xf: Affine, scale: f64) -> Option<Pixmap> {
+    let mut pane = pane(g, shape, w, h, xf, scale)?;
+    pane.pad = pad;
+    let mut frosted = back.clone();
+    fx::blur(&mut frosted, pane.frost_sigma);
+    let paint = fx::GlassPaint {
+        alpha: pane.alpha(),
+        dist: pane.dist(),
+        normals: pane.normals(),
+        cw: pane.cw(),
+        ch: pane.ch(),
+        m: pane.m,
+        frosted: &frosted,
+        w,
+        h,
+        pad,
+        depth: pane.depth,
+        bend_max: pane.bend_max,
+        fringe: pane.fringe,
+        power: pane.power,
+        band: pane.band,
+        reach: pane.reach,
+        floor: pane.floor,
+        fall: pane.fall,
+        intensity: pane.intensity,
+        light: pane.light,
+        geometry: pane.geometry_id(),
     };
     if let Some(accelerator) = fx::accelerator()
         && let Some(out) = accelerator.glass(&paint)
@@ -438,24 +510,24 @@ pub fn glass(g: &Glass, shape: &Outline, back: &Pixmap, pad: u32, w: u32, h: u32
     }
     let mut out = Pixmap::new(w, h)?;
     let pane = Pane {
-        cov: cov.data(),
-        dist: &geom.dist,
-        normals: &geom.normals,
+        cov: pane.coverage.data(),
+        dist: pane.dist(),
+        normals: pane.normals(),
         frosted: &frosted,
         w: w as usize,
-        cw,
-        m: m as usize,
+        cw: pane.cw(),
+        m: pane.m as usize,
         pad: pad as usize,
-        depth,
-        bend_max,
-        fringe,
-        power,
-        band,
-        reach,
-        floor,
-        fall,
-        intensity,
-        light,
+        depth: paint.depth,
+        bend_max: paint.bend_max,
+        fringe: paint.fringe,
+        power: paint.power,
+        band: paint.band,
+        reach: paint.reach,
+        floor: paint.floor,
+        fall: paint.fall,
+        intensity: paint.intensity,
+        light: paint.light,
     };
     let row = w as usize * 4;
     #[cfg(not(target_arch = "wasm32"))]

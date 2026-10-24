@@ -208,6 +208,41 @@ impl Renders {
     }
 }
 
+/// The most background blurs a page may have and stay on the GPU: each renders the page under it,
+/// and that compounds. One costs 1.8–5 ms a frame against the CPU's 4.3–5 ms.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_BACKDROP_BLURS: usize = 1;
+
+/// Whether the GPU canvas draws glass. It is built and parity-tested (mean 0.061/255), but a pane
+/// still costs about what the CPU costs — the backdrop render, the blur and the shader are three
+/// submissions — until the accumulated-backdrop renderer lands, so pages with a pane stay on the
+/// CPU for now.
+#[cfg(not(target_arch = "wasm32"))]
+const GLASS_ON_GPU: bool = false;
+
+/// Whether the page has a visible glass pane.
+#[cfg(not(target_arch = "wasm32"))]
+fn has_glass(doc: &figcraft_doc::Document, page: figcraft_doc::NodeId) -> bool {
+    use figcraft_doc::EffectKind;
+    doc.subtree(page)
+        .iter()
+        .skip(1)
+        .filter_map(|id| doc.node(*id))
+        .any(|n| n.effects.iter().any(|e| e.visible && matches!(e.kind, EffectKind::Glass(_))))
+}
+
+/// How many layers of the page read their backdrop with a background blur.
+#[cfg(not(target_arch = "wasm32"))]
+fn backdrop_blurs(doc: &figcraft_doc::Document, page: figcraft_doc::NodeId) -> usize {
+    use figcraft_doc::EffectKind;
+    doc.subtree(page)
+        .iter()
+        .skip(1)
+        .filter_map(|id| doc.node(*id))
+        .filter(|n| n.effects.iter().any(|e| e.visible && matches!(e.kind, EffectKind::BackgroundBlur(_))))
+        .count()
+}
+
 /// Whether the GPU canvas may draw this job: the editor's outline modes, skipped layers, the
 /// focus view, soft proof and Display P3 documents are the CPU renderer's. `FIGCRAFT_GPU_CANVAS=0`
 /// turns the GPU canvas off (the CPU path is the reference and the fallback).
@@ -218,7 +253,15 @@ fn gpu_job(job: &Job) -> bool {
         Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "cpu"),
         Err(_) => true,
     });
-    enabled && !job.outline && job.outlined.is_empty() && job.skip.is_empty() && job.solo.is_none() && !job.proof && job.doc.color_profile.is_srgb()
+    enabled
+        && !job.outline
+        && job.outlined.is_empty()
+        && job.skip.is_empty()
+        && job.solo.is_none()
+        && !job.proof
+        && job.doc.color_profile.is_srgb()
+        && (GLASS_ON_GPU || !has_glass(&job.doc, job.page))
+        && backdrop_blurs(&job.doc, job.page) <= MAX_BACKDROP_BLURS
 }
 
 /// The GPU canvas's frame for `job`, if it can draw the page and this job asks nothing of it that

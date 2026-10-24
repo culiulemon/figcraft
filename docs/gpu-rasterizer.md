@@ -109,15 +109,45 @@ the CPU render within the parity tolerance; toggling the setting changes nothing
   almost nothing. Parity (`the_gpu_drop_shadow_matches_the_cpu_render`): mean 0.044/255, worst 31
   (vello's Gaussian against the CPU's three-box approximation). Spread, `showBehind`, a
   translucent card, a stroke, a non-uniform radius or a shadow alongside another effect fall back.
-- Next: drop shadows on anything else (spread, groups, translucent covers), inner shadows,
-  background blur, glass and grain as passes on the offscreen layer, reusing the existing compute
-  pipelines in `figcraft-gpu` and adding what vello lacks (vello has only a blurred rounded rect,
-  not a general filter). Each pass is compared to the CPU's before the effect leaves the fallback
-  list.
+- Landed: **background blur**: the page under the node is drawn into a view-sized texture (the
+  node and everything after it left out — the renderer's `backdrop::above`), blurred by the GPU's
+  box passes, shown clipped to the node's shape, and the node's content goes over it. Parity mean
+  0.049/255, worst 25.
+- Landed: **glass**, from the same backdrop: the padded region around the pane is cropped into a
+  texture, blurred by the pane's frost and handed to the existing glass shader (the CPU still
+  computes the cached distance field and normals — `figcraft_render::glass::pane`), into a texture
+  drawn under the pane's content. Parity mean 0.061/255, worst 6, no pixel differs by more than 8
+  (`the_gpu_glass_matches_the_cpu_canvas`).
+- **Policy in the canvas for now.** Glass is implemented and parity-tested but not switched on: a
+  pane costs about what the CPU costs (4–11 ms against 5–9 ms at 904 × 860 — the backdrop render,
+  the blur and the shader are three submissions), and pages with several panes compound it (three
+  panes 21–27 ms against the CPU's 12–15 ms with its kept layers). Background blur is a win
+  (1.8–5 ms against 4.3–5), so pages may have one and stay on the GPU; pages with a pane stay on
+  the CPU. `GLASS_ON_GPU` and `MAX_BACKDROP_BLURS` in `render_worker` hold the policy.
+- Next: the accumulated-backdrop renderer — draw the page once, flush it into a texture as each
+  backdrop node is reached and reuse that texture — which makes glass (and several panes) a win;
+  then inner shadows, grain, spread and translucent shadows, and drop shadows cast from blurred
+  layers.
 
 Exit: the 30-shadow + 3-glass + 2-blur page renders entirely on the GPU, and its drag frame at
 2400 × 1600 stays at or under the 10–13 ms the CPU path reaches with the layer cache, at
 full quality — the target is a single frame budget (≤ 8 ms p95) at that size.
+
+#### Next slice: the accumulated-backdrop renderer
+
+Backdrop effects currently build a fresh page scene under every node that reads it, so two such
+nodes cost more than one and the canvas limits pages to one. The fix is to draw the page once:
+
+1. Draw the page's layers in order into an accumulation texture; at each backdrop node, the
+   texture already holds everything under it.
+2. Make the effect from that texture (blur, or crop + blur + the glass shader), draw it and the
+   node's content over the texture, and carry on with the next layers.
+3. Cache the accumulation across frames the way `figcraft_render::layers` caches CPU layers (keyed
+   on the document subtree's shared `Arc`s, the transform and the zoom), so a drag re-draws only
+   what moved.
+
+Tests: the three-pane page gets a timing case and must beat its 12–15 ms cached CPU frame; the
+existing parity tests cover each effect.
 
 ### P4 — default on, cleanup
 
@@ -222,6 +252,18 @@ stays on the fallback list.
 - 2026-10-24: text proved pixel-identical between the two rasterizers (same glyph outlines from
   the renderer's layout: `the_gpu_text_matches_the_cpu_render`, 0 differing bytes at 1×), and
   `FIGCRAFT_GPU_CANVAS=0` turns the GPU canvas off for a run.
-- Next: P3's other effects (spread and non-card shadows, inner shadows, backdrop blurs, glass,
-  grain), which is what makes the shadow/glass/blur page — the one that still costs 12–15 ms — run
-  entirely on the GPU.
+- 2026-10-24: **P3 slice 3 landed** — backdrop effects. The page under a node is drawn into a
+  texture (`backdrop::above` lists what to leave out) and read there:
+  - **Background blur** on the GPU: blurred, shown through the node's shape, content over it.
+    Parity mean 0.049/255, worst 25; 1.84 ms pipelined against the CPU's 5.07 ms at 904 × 860.
+    Pages may have one and stay on the GPU.
+  - **Glass** on the GPU: the padded backdrop is cropped, blurred by the pane's frost and run
+    through the existing glass shader, from the CPU's cached distance field and normals
+    (`figcraft_render::glass::pane` split out of `glass()`). Parity mean 0.061/255, worst 6, no
+    pixel off by more than 8. In-app it measured 4–11 ms a frame against the CPU's 5–9 ms, and
+    three panes 21–27 ms against the CPU's 12–15 ms with its kept layers, so the canvas leaves
+    pages with a pane on the CPU (`GLASS_ON_GPU = false`) until the accumulated-backdrop renderer
+    lands.
+- Next: the accumulated-backdrop renderer (draw the page once, reuse its texture at every
+  backdrop node), which makes glass and several panes a win; then inner shadows, grain, spread and
+  translucent shadows, and drop shadows cast from blurred layers.
