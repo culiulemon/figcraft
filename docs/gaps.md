@@ -253,18 +253,23 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
   blend — parity mean 0.047/255 — at 3–4 ms a frame against 6.6 ms on the CPU. A rounded opaque
   card's drop shadow is vello's blurred rounded rect under the card — parity mean 0.044/255 — so
   a page of 30 shadowed cards draws in 0.7–0.8 ms a frame where a CPU frame takes 24 ms. A page's
-  **background blur** reads the page under its node from a texture drawn there: 1.84 ms a frame
-  against the CPU's 5.07 ms (parity 0.049/255), one per page for now. **Glass** is implemented and
-  parity-tested on the GPU too (mean 0.061/255, worst 6) but a pane costs about what the CPU costs
-  until the backdrop render is shared between panes, so pages with a pane stay on the CPU. Spread
-  and translucent shadows, inner shadows, grain, images, masks and some stroke/text shapes are
-  still refused and stay on the CPU: [`gpu-rasterizer.md`](gpu-rasterizer.md).
+  **background blur** reads the page under its node from a texture drawn there (parity 0.049/255).
+  **Backdrop effects are drawn in segments** — the layers before a glass pane or blurred layer are
+  accumulated in a texture that the effect then reads, so the page under two panes is drawn once:
+  glass parity mean 0.061/255 with no pixel off by more than 8, a background blur 0.049/255, and
+  the 30-shadowed-card + 3-pane + 2-blur page **6.2 ms a frame at 2400 × 1600** against the CPU's
+  53.6 ms. A segmented page is re-encoded whole each frame, so dragging one layer on it costs
+  12–19 ms against the CPU's 4.3–4.5 ms retained render (its canvas latency is still lower: 17.8
+  against 41 ms, as no pixels cross the bus); cross-frame retention for those pages is the next
+  slice. Spread and translucent shadows, inner shadows, grain, images, masks, a backdrop node
+  nested in a layer and some stroke/text shapes are still refused and stay on the CPU:
+  [`gpu-rasterizer.md`](gpu-rasterizer.md).
 - **Evidence (measured, `cargo xtask bench`):** a 50k-layer page ~8 ms zoomed out with levels of
   detail, single-layer edits at 10k layers ~0.2 ms; full 1440×900 renders 7–15 ms at 10k layers.
   Heavy effects (glass, background blur, noise) and 4K/5K canvases at 2x are where CPU time grows.
 - **Impact:** large files and effect-heavy designs; battery on laptops.
-- **Estimate:** 30–60 h for a GPU path (vello or wgpu shaders) held to the CPU renderer as the
-  oracle.
+- **Estimate:** 15–35 h left (vello, held to the CPU renderer as the oracle): cross-frame retention,
+  images, masks, the effects still on the CPU, and driver QA.
 
 ### 8. Platform QA: Linux and the browser left
 - **Missing:** regular runs on Linux and the browser; real screen readers; a repeat of the Windows
@@ -463,6 +468,7 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-24 | minor | Gap 7: the GPU canvas draws backdrop effects in segments from an accumulated page, so glass and background blur — any number of them — stay on the GPU (glass parity mean 0.061/255 with no pixel off by more than 8, background blur 0.049/255, the 30-card + 3-pane + 2-blur page mean 0.725/255 and 6.2 ms a frame at 2400 × 1600 against the CPU's 53.6 ms). Glass needed vello's straight-alpha output premultiplied before the accumulate, blurs and the glass shader read it. A segmented page is still re-encoded whole each frame, so dragging one layer on one is where the CPU's retained renderer still wins on render time (4–5 ms against 12–19 ms), with a lower canvas latency on the GPU; cross-frame retention is listed as the next slice. Estimate 30–60 h → 15–35 h for the GPU path; ranking unchanged |
 | 2026-10-17 | minor | The 2026-10-17 landings. Gap 1: a new Landed entry (community batches #727 and #728, then #745: instance identity and cached library components, overrides by key, text style precedence, grid track sizes, slot content, labels of connectors saved with their path, skip ink, paragraph options, list start numbers, vertical trim, per-point stroke joins, text on a path, image adjustments, images in the message, instance layers' size and resizing overrides, Hug where nothing is recorded; budgets from the file's size; the import report; a `.fig` copy from Save as; paste from another design app), its Missing list cut to what is still left, and the wrong "whether other apps open its files is unknown" replaced by what was checked; all on synthetic files, so the beta blocker and hours stand. Gap 2: server limits, log recovery and web join links in the evidence. Gap 4: menus, the Actions palette and the editor fixes (#733, #735, #736, #729), then Selection colors and smart-selection spacing (#753) landed, none compared side by side. Gap 5: catalog counts re-measured (2,272 entries; drafts at 95–99%; Indonesian, Czech, Turkish and Swedish listed). Gap 8: the Linux and BSD clipboard changes and Wayland window controls, not run there by the maintainers. Ranking and hours unchanged |
 | 2026-10-15 | minor | Gap 7: bounded canvas overscan for smoother panning. Estimates and ranking unchanged. |
 | 2026-10-14 | minor | Russian catalog (M9), reviewed and approved by VanTan: all 2,165 current entries, Русский in Preferences and regional ru tags. Russian integer plurals use one/few/many; contributor display name VanTan added. Existing estimates unchanged. |

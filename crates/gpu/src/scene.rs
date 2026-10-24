@@ -51,12 +51,178 @@ impl Unsupported {
 /// Deepest nesting drawn (the renderer's export cap).
 const MAX_DEPTH: usize = 64;
 
+/// What a node's backdrop effect is, by its id (the canvas makes its pixels from the accumulated
+/// page).
+pub fn backdrop_of_node(doc: &Document, id: NodeId) -> Option<Backdrop> {
+    backdrop_of(doc.node(id)?)
+}
+
+/// A background-blurred node's layer: the device rectangle of its backdrop (the layer grown by
+/// `pad` each way) — what the CPU blurs, and therefore the region the canvas crops and blurs.
+pub fn blur_rect(doc: &Document, id: NodeId, view: &View) -> Option<((f64, f64), (u32, u32))> {
+    let n = doc.node(id)?;
+    let (x0, y0, w, h) = layer_rect_impl(doc, n, view).ok()??;
+    let pad = f64::from(figcraft_render::backdrop::pad(n, view.scale));
+    let w = (f64::from(w) + 2.0 * pad).clamp(1.0, 16_384.0) as u32;
+    let h = (f64::from(h) + 2.0 * pad).clamp(1.0, 16_384.0) as u32;
+    Some(((x0 - pad, y0 - pad), (w, h)))
+}
+
+/// A glass node's pane geometry and its layer's device position, for the canvas's crop.
+pub fn glass_setup(doc: &Document, id: NodeId, view: &View) -> Option<(figcraft_render::glass::GlassPane, (i32, i32))> {
+    let n = doc.node(id)?;
+    let Backdrop::Glass(g) = backdrop_of(n)? else { return None };
+    let (x0, y0, w, h) = layer_rect_impl(doc, n, view).ok()??;
+    let parent = n.parent.map(|p| doc.world_transform(p)).unwrap_or(Affine::IDENTITY);
+    let xf = view.transform() * parent * n.transform;
+    let shape = figcraft_render::backdrop::outline(doc, n)?;
+    let layer_xf = Affine::translate((-x0, -y0)) * xf;
+    let mut pane = figcraft_render::glass::pane(&g, &shape, w, h, layer_xf, view.scale)?;
+    pane.pad = figcraft_render::backdrop::pad(n, view.scale);
+    Some((pane, (x0 as i32, y0 as i32)))
+}
+
+/// The device rectangle of `n`'s effect layer, in whole pixels (`None` past the layer cap).
+fn layer_rect_impl(doc: &Document, n: &Node, view: &View) -> Result<Option<(f64, f64, u32, u32)>, Unsupported> {
+    let Some(bounds) = figcraft_render::paint_bounds(doc, n.id) else { return Ok(None) };
+    let (x0f, y0f) = ((bounds.x0 - view.origin.0) * view.scale, (bounds.y0 - view.origin.1) * view.scale);
+    let (x1f, y1f) = ((bounds.x1 - view.origin.0) * view.scale, (bounds.y1 - view.origin.1) * view.scale);
+    if !(x0f.is_finite() && y0f.is_finite() && x1f.is_finite() && y1f.is_finite()) {
+        return Err(Unsupported::Structure);
+    }
+    let (x0, y0) = (x0f.floor(), y0f.floor());
+    let (w, h) = ((x1f.ceil() - x0).max(1.0), (y1f.ceil() - y0).max(1.0));
+    const MAX_LAYER: f64 = 8_192.0;
+    if w > MAX_LAYER || h > MAX_LAYER {
+        return Err(Unsupported::Effect);
+    }
+    Ok(Some((x0, y0, w as u32, h as u32)))
+}
+
 /// The page's background colour, drawn under the scene.
 pub fn background(doc: &Document, page: NodeId) -> Color {
     match doc.node(page).map(|p| &p.kind) {
         Some(NodeKind::Page { background, .. }) => *background,
         _ => Color::DEFAULT_PAGE,
     }
+}
+
+/// What a node's backdrop effect is (one glass pane, or one uniform background blur).
+pub enum Backdrop {
+    Blur(f64),
+    Glass(figcraft_doc::Glass),
+}
+
+fn backdrop_of(n: &Node) -> Option<Backdrop> {
+    let mut visible = n.effects.iter().filter(|e| e.visible);
+    let e = visible.next()?;
+    if visible.next().is_some() {
+        return None;
+    }
+    match &e.kind {
+        figcraft_doc::EffectKind::BackgroundBlur(b) if !b.is_progressive() && b.max_radius() > 0.0 => Some(Backdrop::Blur(b.sanitized().radius)),
+        figcraft_doc::EffectKind::Glass(g) => Some(Backdrop::Glass(g.clone())),
+        _ => None,
+    }
+}
+
+/// One step of a page drawn in segments: ordinary layers, or a node that reads the page under it.
+pub enum Step {
+    Nodes(Vec<NodeId>),
+    /// A glass pane or a background-blurred layer.
+    Backdrop(NodeId),
+}
+
+/// How to draw `page` in segments: its top-level children in order, with backdrop nodes as steps
+/// of their own (the page is accumulated up to each one). `Err` when a backdrop node is nested —
+/// there is no segment boundary inside a layer, so such a page stays on the CPU.
+pub fn plan(doc: &Document, page: NodeId) -> Result<Vec<Step>, Unsupported> {
+    let Some(p) = doc.node(page) else { return Ok(Vec::new()) };
+    let mut steps = Vec::new();
+    let mut run: Vec<NodeId> = Vec::new();
+    for c in &p.children {
+        let Some(n) = doc.node(*c) else { continue };
+        if !n.visible || n.opacity <= 0.0 {
+            continue;
+        }
+        if backdrop_of(n).is_some() {
+            if !run.is_empty() {
+                steps.push(Step::Nodes(std::mem::take(&mut run)));
+            }
+            steps.push(Step::Backdrop(*c));
+        } else {
+            if subtree_backdrop(doc, *c, 0) {
+                return Err(Unsupported::Effect);
+            }
+            run.push(*c);
+        }
+    }
+    if !run.is_empty() {
+        steps.push(Step::Nodes(run));
+    }
+    Ok(steps)
+}
+
+/// Whether `id` or anything in it reads its backdrop.
+fn subtree_backdrop(doc: &Document, id: NodeId, depth: usize) -> bool {
+    if depth > MAX_DEPTH {
+        return true;
+    }
+    let Some(n) = doc.node(id) else { return false };
+    if backdrop_of(n).is_some() {
+        return true;
+    }
+    n.children.iter().any(|c| subtree_backdrop(doc, *c, depth + 1))
+}
+
+/// Draw `ids` (children of `page`, in order) into `out`.
+pub fn draw_into(doc: &Document, page: NodeId, view: &View, layers: &mut dyn Layers, ids: &[NodeId], out: &mut Scene) -> Result<(), Unsupported> {
+    let mut b = Builder { doc, scene: Some(Scene::new()), layers, view: view.clone(), page, hidden: Vec::new(), no_strokes: Vec::new() };
+    for id in ids {
+        b.node(*id, view.transform(), 0)?;
+    }
+    if let Some(s) = b.scene.take() {
+        out.append(&s, None);
+    }
+    Ok(())
+}
+
+/// Draw a backdrop node over its effect pixels (`image`, made from the page drawn under it).
+pub fn draw_backdrop_into(
+    doc: &Document,
+    page: NodeId,
+    view: &View,
+    layers: &mut dyn Layers,
+    id: NodeId,
+    image: &ImageData,
+    out: &mut Scene,
+) -> Result<(), Unsupported> {
+    let Some(n) = doc.node(id) else { return Ok(()) };
+    if !n.visible || n.opacity <= 0.0 {
+        return Ok(());
+    }
+    if n.is_mask {
+        return Err(Unsupported::Mask);
+    }
+    let Some(effect) = backdrop_of(n) else { return Err(Unsupported::Effect) };
+    let mut b = Builder { doc, scene: Some(Scene::new()), layers, view: view.clone(), page, hidden: Vec::new(), no_strokes: Vec::new() };
+    // A blur's pixels are its padded layer (a rectangle, so the shape clips them); a pane's pixels
+    // are its layer, with the shape's own coverage in the alpha.
+    let place = match effect {
+        Backdrop::Blur(_) => {
+            let ((x, y), _) = blur_rect(doc, id, view).ok_or(Unsupported::Structure)?;
+            ((x, y), true)
+        }
+        Backdrop::Glass(_) => {
+            let (x0, y0, _, _) = b.layer_rect(n)?.ok_or(Unsupported::Structure)?;
+            ((x0, y0), false)
+        }
+    };
+    b.draw_backdrop_image(n, 0, image, place)?;
+    if let Some(s) = b.scene.take() {
+        out.append(&s, None);
+    }
+    Ok(())
 }
 
 /// Where a node's effect layer goes: the GPU renders it offscreen and blurs it without leaving the
@@ -69,6 +235,9 @@ pub trait Layers {
     /// A glass pane's pixels from `scene` (the page under the node); its layer's top-left is `at`
     /// in the `view`-sized scene, and `pane.pad` around it is the backdrop it reads.
     fn glass(&mut self, scene: &Scene, view: (u32, u32), pane: &figcraft_render::glass::GlassPane, at: (i32, i32)) -> Option<ImageData>;
+    /// A backdrop node's effect pixels from `back`, the accumulated page (`view`-sized): the whole
+    /// view blurred, or a glass pane's layer computed from a crop of it.
+    fn backdrop_effect(&mut self, doc: &Document, id: NodeId, view: &View, back: &wgpu::Texture) -> Option<ImageData>;
 }
 
 /// Accepts effect layers without drawing them (the feature check).
@@ -84,6 +253,9 @@ impl Layers for Probe {
     fn glass(&mut self, _scene: &Scene, _view: (u32, u32), pane: &figcraft_render::glass::GlassPane, _at: (i32, i32)) -> Option<ImageData> {
         Some(crate::canvas::blank_image(pane.w, pane.h))
     }
+    fn backdrop_effect(&mut self, _doc: &Document, _id: NodeId, view: &View, _back: &wgpu::Texture) -> Option<ImageData> {
+        Some(crate::canvas::blank_image(view.width, view.height))
+    }
 }
 
 /// Refuses effect layers: a build without a device.
@@ -97,6 +269,9 @@ impl Layers for NoLayers {
         None
     }
     fn glass(&mut self, _scene: &Scene, _view: (u32, u32), _pane: &figcraft_render::glass::GlassPane, _at: (i32, i32)) -> Option<ImageData> {
+        None
+    }
+    fn backdrop_effect(&mut self, _doc: &Document, _id: NodeId, _view: &View, _back: &wgpu::Texture) -> Option<ImageData> {
         None
     }
 }
@@ -190,18 +365,20 @@ fn simple_shadows(n: &Node) -> Option<Vec<figcraft_doc::Shadow>> {
 }
 
 fn effects_of(n: &Node) -> Effects {
+    if let Some(b) = backdrop_of(n) {
+        return match b {
+            Backdrop::Blur(radius) => Effects::BackgroundBlur(radius),
+            Backdrop::Glass(g) => Effects::Glass(g),
+        };
+    }
     let mut visible = n.effects.iter().filter(|e| e.visible);
     let Some(e) = visible.next() else { return Effects::None };
     let single = visible.next().is_none();
-    if single {
-        match &e.kind {
-            figcraft_doc::EffectKind::LayerBlur(b) if !b.is_progressive() => return Effects::LayerBlur(b.sanitized().radius),
-            figcraft_doc::EffectKind::BackgroundBlur(b) if !b.is_progressive() && b.max_radius() > 0.0 => {
-                return Effects::BackgroundBlur(b.sanitized().radius);
-            }
-            figcraft_doc::EffectKind::Glass(g) => return Effects::Glass(g.clone()),
-            _ => {}
-        }
+    if single
+        && let figcraft_doc::EffectKind::LayerBlur(b) = &e.kind
+        && !b.is_progressive()
+    {
+        return Effects::LayerBlur(b.sanitized().radius);
     }
     match simple_shadows(n) {
         Some(shadows) => Effects::Shadows(shadows),
@@ -313,25 +490,7 @@ impl Builder<'_> {
         let back = self.backdrop_of(n.id)?;
         let sigma = radius / 2.0 * view.scale;
         let Some(image) = self.layers.backdrop(&back, view.width, view.height, sigma) else { return Err(Unsupported::Effect) };
-        let parent = n.parent.map(|p| self.doc.world_transform(p)).unwrap_or(Affine::IDENTITY);
-        let xf = view.transform() * parent * n.transform;
-        let isolated = n.opacity < 1.0 || !matches!(n.blend, BlendMode::PassThrough | BlendMode::Normal);
-        if isolated {
-            self.push_layer(n);
-        }
-        if let Some((path, rule)) = node_outline(self.doc, n) {
-            let sampler = ImageSampler { x_extend: Extend::Pad, y_extend: Extend::Pad, quality: ImageQuality::Low, alpha: 1.0 };
-            if let Some(s) = &mut self.scene {
-                s.push_clip_layer(fill_rule(rule), k_affine(xf), &path);
-                s.draw_image(ImageBrush { image: &image, sampler }, KAffine::IDENTITY);
-                s.pop_layer();
-            }
-        }
-        self.content(n, xf, depth)?;
-        if isolated && let Some(s) = &mut self.scene {
-            s.pop_layer();
-        }
-        Ok(())
+        self.draw_backdrop_image(n, depth, &image, ((0.0, 0.0), true))
     }
 
     /// A node with one glass effect: its layer's pixels come from the page under it, refracted by
@@ -340,36 +499,48 @@ impl Builder<'_> {
         if n.blend == BlendMode::PlusDarker {
             return Err(Unsupported::Structure);
         }
-        let Some(bounds) = figcraft_render::paint_bounds(self.doc, n.id) else { return Ok(()) };
         let view = self.view.clone();
-        let (x0f, y0f) = ((bounds.x0 - view.origin.0) * view.scale, (bounds.y0 - view.origin.1) * view.scale);
-        let (x1f, y1f) = ((bounds.x1 - view.origin.0) * view.scale, (bounds.y1 - view.origin.1) * view.scale);
-        if !(x0f.is_finite() && y0f.is_finite() && x1f.is_finite() && y1f.is_finite()) {
-            return Err(Unsupported::Structure);
-        }
-        let (x0, y0) = (x0f.floor(), y0f.floor());
-        let (w, h) = ((x1f.ceil() - x0).max(1.0), (y1f.ceil() - y0).max(1.0));
-        const MAX_LAYER: f64 = 8_192.0;
-        if w > MAX_LAYER || h > MAX_LAYER {
-            return Err(Unsupported::Effect);
-        }
+        let Some((x0, y0, w, h)) = self.layer_rect(n)? else { return Ok(()) };
         let parent = n.parent.map(|p| self.doc.world_transform(p)).unwrap_or(Affine::IDENTITY);
         let xf = view.transform() * parent * n.transform;
         let Some(shape) = figcraft_render::backdrop::outline(self.doc, n) else { return Err(Unsupported::Structure) };
         let layer_xf = Affine::translate((-x0, -y0)) * xf;
-        let mut pane = figcraft_render::glass::pane(glass, &shape, w as u32, h as u32, layer_xf, view.scale).ok_or(Unsupported::Effect)?;
+        let mut pane = figcraft_render::glass::pane(glass, &shape, w, h, layer_xf, view.scale).ok_or(Unsupported::Effect)?;
         pane.pad = figcraft_render::backdrop::pad(n, view.scale);
         let back = self.backdrop_of(n.id)?;
         let Some(image) = self.layers.glass(&back, (view.width, view.height), &pane, (x0 as i32, y0 as i32)) else {
             return Err(Unsupported::Effect);
         };
+        self.draw_backdrop_image(n, depth, &image, ((x0, y0), false))
+    }
+
+    /// The device rectangle of `n`'s effect layer, in whole pixels (`None` past the layer cap).
+    fn layer_rect(&self, n: &Node) -> Result<Option<(f64, f64, u32, u32)>, Unsupported> {
+        layer_rect_impl(self.doc, n, &self.view)
+    }
+
+    /// `n`'s backdrop effect pixels: its layer texture with its top-left at `at`, clipped to the
+    /// node's shape when `clip` (a blurred layer is a rectangle; a pane carries its own coverage);
+    /// then the node's content over them.
+    fn draw_backdrop_image(&mut self, n: &Node, depth: usize, image: &ImageData, ((x, y), clip): ((f64, f64), bool)) -> Result<(), Unsupported> {
+        let view = self.view.clone();
+        let parent = n.parent.map(|p| self.doc.world_transform(p)).unwrap_or(Affine::IDENTITY);
+        let xf = view.transform() * parent * n.transform;
         let isolated = n.opacity < 1.0 || !matches!(n.blend, BlendMode::PassThrough | BlendMode::Normal);
         if isolated {
             self.push_layer(n);
         }
         let sampler = ImageSampler { x_extend: Extend::Pad, y_extend: Extend::Pad, quality: ImageQuality::Low, alpha: 1.0 };
-        if let Some(s) = &mut self.scene {
-            s.draw_image(ImageBrush { image: &image, sampler }, KAffine::translate((x0, y0)));
+        if clip {
+            if let Some((path, rule)) = node_outline(self.doc, n)
+                && let Some(s) = &mut self.scene
+            {
+                s.push_clip_layer(fill_rule(rule), k_affine(xf), &path);
+                s.draw_image(ImageBrush { image, sampler }, KAffine::translate((x, y)));
+                s.pop_layer();
+            }
+        } else if let Some(s) = &mut self.scene {
+            s.draw_image(ImageBrush { image, sampler }, KAffine::translate((x, y)));
         }
         self.content(n, xf, depth)?;
         if isolated && let Some(s) = &mut self.scene {

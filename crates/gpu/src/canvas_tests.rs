@@ -10,6 +10,7 @@ use wgpu::{Device, Queue};
 
 use crate::canvas::CanvasGpu;
 use crate::scene;
+use crate::scene::Layers as _;
 
 /// The machine's adapter (none in a headless CI container: the tests then skip).
 fn device() -> Option<(Arc<Device>, Arc<Queue>)> {
@@ -404,6 +405,106 @@ fn the_gpu_glass_matches_the_cpu_canvas() {
     assert!(mean <= 2.0, "the mean difference is {mean:.3}");
 }
 
+/// Draw `d` through the segmented path and compare with the CPU render; returns the statistics.
+fn segmented_parity(d: &Document, label: &str) -> Option<(u8, f64, usize)> {
+    let (device, queue) = device()?;
+    let p = d.first_page()?;
+    let (w, h) = PARITY;
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+    let cpu = render_view(d, p, &view, &Options::default())?;
+    let plan = scene::plan(d, p).ok()?;
+    let mut canvas = CanvasGpu::new(&device, w, h)?;
+    crate::canvas::segmented_frame(&device, &queue, &mut canvas, d, p, &view, &plan, scene::background(d, p))?;
+    let gpu = canvas.read(&device, &queue)?;
+    if std::env::var("FIGCRAFT_PARITY_PNG").is_ok() {
+        let dir = std::env::temp_dir();
+        let name = label.replace(' ', "-");
+        let _ = cpu.save_png(dir.join(format!("figcraft-seg-{name}-cpu.png")));
+        let _ = gpu.save_png(dir.join(format!("figcraft-seg-{name}-gpu.png")));
+    }
+    let (worst, mean, at, over) = diff(&cpu, &gpu);
+    let (mut lo, mut hi) = ((u32::MAX, u32::MAX), (0u32, 0u32));
+    let w0 = cpu.width().max(1) as usize;
+    let mut first = None;
+    for (i, (a, b)) in cpu.data().iter().zip(gpu.data()).enumerate() {
+        if a.abs_diff(*b) > 8 {
+            let (x, y) = ((i / 4 % w0) as u32, (i / 4 / w0) as u32);
+            lo = (lo.0.min(x), lo.1.min(y));
+            hi = (hi.0.max(x), hi.1.max(y));
+            if first.is_none() {
+                first = Some((x, y));
+            }
+        }
+    }
+    println!("{label} (segmented): worst {worst} at {at:?}, mean {mean:.3}, {over} differ >8, span {lo:?}..{hi:?}, first {first:?}");
+    let px = |p: &Pixmap, (x, y): (u32, u32)| {
+        let i = ((y as usize * p.width() as usize) + x as usize) * 4;
+        p.data().get(i..i + 4).map(<[u8]>::to_vec)
+    };
+    println!("  at {at:?}: CPU {:?}, GPU {:?}", px(&cpu, at), px(&gpu, at));
+    Some((worst, mean, over))
+}
+
+#[test]
+fn the_segmented_page_matches_the_cpu_with_one_glass_pane() {
+    if device().is_none() {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    }
+    let d = glass_doc();
+    let (worst, mean, _) = segmented_parity(&d, "one glass pane").expect("drawn");
+    assert!(worst <= 128, "a channel differs by {worst} (mean {mean:.3})");
+    assert!(mean <= 2.0, "the mean difference is {mean:.3}");
+}
+
+#[test]
+fn the_segmented_page_matches_the_cpu_with_one_background_blur() {
+    if device().is_none() {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    }
+    let d = backdrop_doc();
+    let (worst, mean, _) = segmented_parity(&d, "one background blur").expect("drawn");
+    assert!(worst <= 128, "a channel differs by {worst} (mean {mean:.3})");
+    assert!(mean <= 2.0, "the mean difference is {mean:.3}");
+}
+
+#[test]
+fn the_gpu_page_matches_with_several_backdrop_layers() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let d = heavy_effects_doc();
+    let p = d.first_page().unwrap();
+    let (w, h) = PARITY;
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+    let cpu = render_view(&d, p, &view, &Options::default()).unwrap();
+    let plan = scene::plan(&d, p).expect("the page is drawn in segments");
+    assert!(plan.iter().filter(|s| matches!(s, scene::Step::Backdrop(_))).count() >= 2, "several backdrop layers");
+    let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+    let drawn = crate::canvas::segmented_frame(&device, &queue, &mut canvas, &d, p, &view, &plan, scene::background(&d, p));
+    assert!(drawn.is_some(), "the segmented page drew");
+    let gpu = canvas.read(&device, &queue).unwrap();
+    if std::env::var("FIGCRAFT_PARITY_PNG").is_ok() {
+        let dir = std::env::temp_dir();
+        let _ = cpu.save_png(dir.join("figcraft-seg-cpu.png"));
+        let _ = gpu.save_png(dir.join("figcraft-seg-gpu.png"));
+    }
+    let (worst, mean, at, over) = diff(&cpu, &gpu);
+    let px = |p: &Pixmap, (x, y): (u32, u32)| {
+        let i = ((y as usize * p.width() as usize) + x as usize) * 4;
+        p.data().get(i..i + 4).map(<[u8]>::to_vec)
+    };
+    println!(
+        "segmented page parity: worst {worst} at {at:?} (CPU {:?}, GPU {:?}), mean {mean:.3}, {over} pixels differ by more than 8",
+        px(&cpu, at),
+        px(&gpu, at)
+    );
+    assert!(worst <= 160, "a channel differs by {worst} (mean {mean:.3})");
+    assert!(mean <= 2.0, "the mean difference is {mean:.3}");
+}
+
 #[test]
 fn the_gpu_canvas_reads_back() {
     let Some((device, queue)) = device() else {
@@ -644,6 +745,127 @@ fn heavy_scene_gpu_timings() {
         );
         println!("heavy scene {w} × {h}: CPU {cpu:.2} ms | GPU build {build:.2} ms, frame {frame:.2} ms");
     }
+}
+
+/// The segmented renderer (pages with backdrop effects) against the CPU, pipelined as the app
+/// draws: frames submitted back to back, waiting only for the last.
+#[test]
+#[ignore = "timing: run in release with --ignored --nocapture"]
+fn segmented_timings() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let docs = [("one glass pane", glass_doc()), ("one background blur", backdrop_doc()), ("heavy", heavy_effects_doc())];
+    for (name, d) in docs {
+        // The second view is the app's canvas after View ▸ Zoom to fit on the heavy page: a
+        // 904 × 860 canvas at 34.6%, the whole page in view.
+        for (w, h, scale, origin) in
+            [(904u32, 860u32, 1.0, (0.0, 0.0)), (2400, 1600, 1.0, (0.0, 0.0)), (904, 860, 0.3464285714285714, (-164.6, -841.2))]
+        {
+            let p = d.first_page().unwrap();
+            let view = View { origin, scale, width: w, height: h };
+            let Ok(plan) = scene::plan(&d, p) else { continue };
+            let _ = render_view(&d, p, &view, &Options::default());
+            let cpu = frame_ms(|| render_view(&d, p, &view, &Options::default()).is_some(), 3);
+            let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+            let background = scene::background(&d, p);
+            // Warm-up: the pipelines, the glass geometry.
+            for _ in 0..2 {
+                let _ = crate::canvas::segmented_frame(&device, &queue, &mut canvas, &d, p, &view, &plan, background);
+            }
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let t = std::time::Instant::now();
+            for _ in 0..6 {
+                assert!(crate::canvas::segmented_frame(&device, &queue, &mut canvas, &d, p, &view, &plan, background).is_some());
+            }
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let frame = t.elapsed().as_secs_f64() * 1000.0 / 6.0;
+            println!("segmented {name} {w} × {h} at {:.0}%: CPU {cpu:.2} ms | GPU {frame:.2} ms a frame (pipelined)", scale * 100.0);
+        }
+    }
+}
+
+/// Where a segmented frame's time goes: encoding each segment (vello's CPU side), the composes,
+/// the effects, and the present.
+#[test]
+#[ignore = "timing: run in release with --ignored --nocapture"]
+fn segmented_breakdown() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let d = heavy_effects_doc();
+    let p = d.first_page().unwrap();
+    let view = View { origin: (-164.6, -841.2), scale: 0.3464285714285714, width: 904, height: 860 };
+    let plan = scene::plan(&d, p).unwrap();
+    let mut canvas = CanvasGpu::new(&device, view.width, view.height).unwrap();
+    let background = scene::background(&d, p);
+    let mut t_draw = 0.0f64;
+    let mut t_effect = 0.0f64;
+    let mut frames = 0u32;
+    let mut segments = 0u32;
+    let mut t_all = 0.0f64;
+    // The same steps as `canvas::segmented_frame`, with a clock around each part.
+    for _ in 0..6 {
+        let frame_start = std::time::Instant::now();
+        let (acc, acc_view) = canvas.page_layer(&device).unwrap();
+        canvas.fill_layer(&device, &queue, &acc_view, background);
+        let mut pending = vello::Scene::new();
+        let mut dirty = false;
+        let mut over = |canvas: &mut CanvasGpu, pending: &vello::Scene| {
+            let segment_view = canvas.segment_layer(&device).unwrap();
+            assert!(canvas.draw_into(&device, &queue, pending, &segment_view));
+            canvas.compose_over(&device, &queue, &acc_view, &segment_view);
+            segments += 1;
+        };
+        for step in &plan {
+            match step {
+                scene::Step::Nodes(ids) => {
+                    let t = std::time::Instant::now();
+                    {
+                        let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+                        scene::draw_into(&d, p, &view, &mut layers, ids, &mut pending).unwrap();
+                    }
+                    t_draw += t.elapsed().as_secs_f64() * 1000.0;
+                    dirty = true;
+                }
+                scene::Step::Backdrop(id) => {
+                    if dirty {
+                        over(&mut canvas, &pending);
+                        pending = vello::Scene::new();
+                    }
+                    let t = std::time::Instant::now();
+                    let image = {
+                        let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+                        layers.backdrop_effect(&d, *id, &view, &acc)
+                    };
+                    t_effect += t.elapsed().as_secs_f64() * 1000.0;
+                    let image = image.unwrap();
+                    {
+                        let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+                        scene::draw_backdrop_into(&d, p, &view, &mut layers, *id, &image, &mut pending).unwrap();
+                    }
+                    dirty = true;
+                }
+            }
+        }
+        if dirty {
+            over(&mut canvas, &pending);
+        }
+        canvas.present_layer(&device, &queue, &acc);
+        t_all += frame_start.elapsed().as_secs_f64() * 1000.0;
+        frames += 1;
+    }
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    println!(
+        "segmented breakdown, {} segments a frame: {:.2} ms (encoding {:.2}, effects {:.2}, segments and composes {:.2})",
+        segments / frames,
+        t_all / f64::from(frames),
+        t_draw / f64::from(frames),
+        t_effect / f64::from(frames),
+        (t_all - t_draw - t_effect) / f64::from(frames)
+    );
 }
 
 #[test]

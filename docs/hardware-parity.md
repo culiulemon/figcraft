@@ -12,8 +12,8 @@ since 2025). FigCraft renders the canvas on the CPU and presents it through wgpu
 
 | Feature | Figma | FigCraft (macOS / Windows / Linux / web) | Hours |
 |---|---|---|---|
-| Canvas rendering | GPU | CPU (tiny-skia), banded across cores, retained (re-renders only what an edit or pan touches), levels of detail below 50% zoom; shown through wgpu (WebGPU or WebGL2 in the browser) | 30–60 for a GPU path |
-| Effects (blurs, glass, noise) | GPU | CPU | in the above |
+| Canvas rendering | GPU | desktop: a GPU rasterizer (vello on the window's wgpu device) draws the page straight into a texture egui samples, with no per-frame pixel copy; pages with a feature it doesn't draw yet fall back whole to the CPU renderer (tiny-skia, banded across cores, retained, levels of detail below 50% zoom). In the browser the canvas stays on the CPU (`docs/gpu-rasterizer.md`) | 15–35 left: cross-frame retention, images, masks |
+| Effects (blurs, glass, noise) | GPU | GPU for layer blur, drop shadows, background blur and glass (the last two read the page in segments); inner shadows, grain, spread and translucent shadows still on the CPU | in the above |
 | HiDPI / Retina | yes | yes (all); a canvas image rendered at the screen's density is placed on whole device pixels, so fractional pans, zooms and display scales don't blur it (#359; geometry tests, the snapping not judged by eye) | — |
 | Wide-gamut display (Display P3) | yes, on capable displays | colours stored and exported in P3; the screen shows sRGB: eframe/egui-wgpu 0.36 configure an 8-bit sRGB surface with no colour space option, although wgpu 30 can present Display P3 or extended sRGB on Metal, DX12, Vulkan and WebGPU (see gaps #18). The colour picker warns about colours outside sRGB and View ▸ Soft-proof sRGB stripes them on the canvas | 2–5 |
 | Trackpad pinch zoom and two-finger pan | yes | yes (egui zoom delta, smooth scroll) | — |
@@ -34,11 +34,14 @@ since 2025). FigCraft renders the canvas on the CPU and presents it through wgpu
 | Idle window | 0 frames, ~0% CPU | — |
 
 One case on the owner's Windows PC (Intel Arc A750, release build, canvas 904 × 860): dragging a
-glass pane across a page of 30 shadowed cards, 3 glass panes and 2 blurred cards took ~95 ms a
-frame; with isolated layers kept between frames (`figcraft_render::layers`) and the blur and glass
-on the GPU it's 12–15 ms (`cargo test -p figcraft-gpu --release heavy_scene_timings -- --ignored`).
-The same scene with the glass cut off each frame is ~1 ms. Glass and background blur are still
-drawn again wherever the damage reaches, as they read the backdrop.
+page of 30 shadowed cards, 3 glass panes and 2 blurred cards took ~95 ms a frame on the CPU before
+its layer cache; the CPU's retained renderer brings a one-layer drag to 4–5 ms and a whole-page
+drag to 30–34 ms. The GPU canvas (which now draws that page, glass included, in one accumulated
+pass per segment) reports 12–19 ms a frame in the app for both, with a lower canvas latency (17.8 ms
+against the CPU's 41 ms in the same session) as no pixels cross the bus; in isolation the same page
+is 6.2 ms at 2400 × 1600 (`cargo test -p figcraft-gpu --release segmented_timings -- --ignored`).
+The GPU re-encodes the page each frame — retention like the CPU's is the next slice — so a
+single-layer drag on such a page is where the CPU still wins on render time.
 
 Nothing has been timed against Figma on the same document (needs `.fig` import). 
 

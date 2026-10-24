@@ -11,6 +11,7 @@ use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene}
 use wgpu::{Device, Queue, Texture, TextureFormat, TextureUsages, TextureView};
 
 use crate::blur::Blur;
+use crate::scene::Layers;
 
 /// vello draws into `Rgba8Unorm` (premultiplied, sRGB-encoded bytes) — what tiny-skia's pixmap
 /// holds, and what egui can show without a conversion.
@@ -23,6 +24,8 @@ pub struct CanvasGpu {
     blur: Blur,
     /// The glass shader (its geometry is kept here between frames).
     glass: crate::glass::Glass,
+    /// Lays a page segment over the accumulation.
+    compose: crate::compose::Compose,
     targets: [Target; 2],
     /// The target the next frame is drawn into.
     next: usize,
@@ -31,9 +34,21 @@ pub struct CanvasGpu {
     /// Bumped when the targets are reallocated: the window registers new textures for a new
     /// generation and frees the old ones.
     generation: u64,
+    /// The page being accumulated (kept between frames: a canvas-sized allocation a frame is not
+    /// free, and neither is the clear it would need).
+    page: Option<Layer>,
+    /// One segment on its way onto the page.
+    segment: Option<Layer>,
 }
 
 struct Target {
+    texture: Texture,
+    view: TextureView,
+    size: (u32, u32),
+}
+
+/// A canvas-sized layer kept between frames.
+struct Layer {
     texture: Texture,
     view: TextureView,
     size: (u32, u32),
@@ -57,7 +72,19 @@ impl CanvasGpu {
         .ok()?;
         let blur = Blur::new(device)?;
         let glass = crate::glass::Glass::new(device)?;
-        Some(Self { renderer, blur, glass, targets: [target(device, width, height), target(device, width, height)], next: 0, last: 0, generation: 1 })
+        let compose = crate::compose::Compose::new(device)?;
+        Some(Self {
+            renderer,
+            blur,
+            glass,
+            compose,
+            targets: [target(device, width, height), target(device, width, height)],
+            next: 0,
+            last: 0,
+            generation: 1,
+            page: None,
+            segment: None,
+        })
     }
 
     /// The size in device pixels.
@@ -119,22 +146,71 @@ impl CanvasGpu {
         read(device, queue, &target.texture, target.size)
     }
 
-    /// Draw `scene` into a new, transparent `width` × `height` texture (an effect layer).
+    /// The accumulation texture (kept between frames). Its pixels are all written each frame — the
+    /// background fill, then every segment vello draws — so it needs no clear of its own.
+    pub(crate) fn page_layer(&mut self, device: &Device) -> Option<(Texture, TextureView)> {
+        let (w, h) = self.size();
+        keep(&mut self.page, device, (w, h), "figcraft page")
+    }
+
+    /// The segment texture (kept between frames): one segment is drawn into it and laid over the
+    /// page before the next one. It is sampled by the compose pass and written after it, and the
+    /// queue runs the two in order, so one is enough.
+    pub(crate) fn segment_layer(&mut self, device: &Device) -> Option<TextureView> {
+        let (w, h) = self.size();
+        keep(&mut self.segment, device, (w, h), "figcraft segment").map(|(_, view)| view)
+    }
+
+    /// Fill a layer with `color` (the page background under the accumulation).
+    pub(crate) fn fill_layer(&self, device: &Device, queue: &Queue, view: &TextureView, color: figcraft_color::Color) {
+        let c = color.sanitized();
+        crate::compose::clear(device, queue, view, wgpu::Color { r: f64::from(c.r), g: f64::from(c.g), b: f64::from(c.b), a: f64::from(c.a) });
+    }
+
+    /// Draw `scene` into `view` over a transparent ground (a page segment).
+    pub(crate) fn draw_into(&mut self, device: &Device, queue: &Queue, scene: &Scene, view: &TextureView) -> bool {
+        let (width, height) = self.size();
+        let params = RenderParams { base_color: vello::peniko::Color::new([0.0; 4]), width, height, antialiasing_method: AaConfig::Area };
+        self.renderer.render_to_texture(device, queue, scene, view, &params).is_ok()
+    }
+
+    /// Lay `src` over `dst` (both canvas-sized).
+    pub(crate) fn compose_over(&self, device: &Device, queue: &Queue, dst: &TextureView, src: &TextureView) {
+        self.compose.over(device, queue, dst, src);
+    }
+
+    /// Put the accumulated page on screen (into the next buffer).
+    pub(crate) fn present_layer(&mut self, device: &Device, queue: &Queue, src: &Texture) -> Option<TextureView> {
+        let index = self.next;
+        let target = self.targets.get(index)?;
+        if src.width() != target.size.0 || src.height() != target.size.1 {
+            return None;
+        }
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("figcraft present") });
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo { texture: src, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: &target.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::Extent3d { width: target.size.0, height: target.size.1, depth_or_array_layers: 1 },
+        );
+        queue.submit([encoder.finish()]);
+        let view = target.view.clone();
+        self.last = index;
+        self.next = (index + 1) % self.targets.len();
+        Some(view)
+    }
+
+    /// Draw `scene` into a new, transparent `width` × `height` layer (an effect layer). The pixels
+    /// come out premultiplied, as the blurs, the glass shader and vello's own image brush read them
+    /// (vello's targets hold straight alpha, so the render is premultiplied before it is handed on).
     pub(crate) fn render_layer(&mut self, device: &Device, queue: &Queue, scene: &Scene, width: u32, height: u32) -> Option<Texture> {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("figcraft layer"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: FORMAT,
-            usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_SRC | TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+        let texture = layer_texture(device, "figcraft layer", width, height);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let params = RenderParams { base_color: vello::peniko::Color::new([0.0; 4]), width, height, antialiasing_method: AaConfig::Area };
         self.renderer.render_to_texture(device, queue, scene, &view, &params).ok()?;
-        Some(texture)
+        let out = layer_texture(device, "figcraft layer", width, height);
+        let out_view = out.create_view(&wgpu::TextureViewDescriptor::default());
+        self.compose.premultiply(device, queue, &view, &out_view);
+        Some(out)
     }
 
     /// Hand `texture` to vello as an image (copied into its atlas before the next render).
@@ -174,10 +250,36 @@ impl crate::scene::Layers for GpuLayers<'_> {
     }
 
     fn glass(&mut self, scene: &Scene, (vw, vh): (u32, u32), pane: &figcraft_render::glass::GlassPane, at: (i32, i32)) -> Option<ImageData> {
-        let pad = pane.pad;
         let back = self.canvas.render_layer(self.device, self.queue, scene, vw, vh)?;
+        self.glass_from(&back, pane, at)
+    }
+
+    fn backdrop_effect(&mut self, doc: &Document, id: NodeId, view: &View, back: &Texture) -> Option<ImageData> {
+        match crate::scene::backdrop_of_node(doc, id)? {
+            crate::scene::Backdrop::Blur(radius) => {
+                // The blur reads the node's padded layer, as the CPU's does — not the whole view.
+                let ((x, y), (w, h)) = crate::scene::blur_rect(doc, id, view)?;
+                let cropped = crop(self.device, self.queue, back, (x as i32, y as i32), (w, h))?;
+                let src = cropped.create_view(&wgpu::TextureViewDescriptor::default());
+                let sigma = radius / 2.0 * view.scale;
+                let blurred = crate::blur::blur_texture(self.device, self.queue, &self.canvas.blur, &src, (w, h), sigma)?;
+                Some(self.canvas.register_layer(blurred))
+            }
+            crate::scene::Backdrop::Glass(_) => {
+                let (pane, at) = crate::scene::glass_setup(doc, id, view)?;
+                self.glass_from(back, &pane, at)
+            }
+        }
+    }
+}
+
+impl GpuLayers<'_> {
+    /// A pane's pixels from `back` (the page under it): its padded region cropped, frosted and
+    /// run through the glass shader.
+    fn glass_from(&mut self, back: &Texture, pane: &figcraft_render::glass::GlassPane, at: (i32, i32)) -> Option<ImageData> {
+        let pad = pane.pad;
         let (cw, ch) = (pane.w.checked_add(pad.checked_mul(2)?)?, pane.h.checked_add(pad.checked_mul(2)?)?);
-        let cropped = crop(self.device, self.queue, &back, (at.0 - pad as i32, at.1 - pad as i32), (cw, ch))?;
+        let cropped = crop(self.device, self.queue, back, (at.0 - pad as i32, at.1 - pad as i32), (cw, ch))?;
         let view = cropped.create_view(&wgpu::TextureViewDescriptor::default());
         let frosted = crate::blur::blur_texture(self.device, self.queue, &self.canvas.blur, &view, (cw, ch), pane.frost_sigma)?;
         let frosted_view = frosted.create_view(&wgpu::TextureViewDescriptor::default());
@@ -243,6 +345,38 @@ fn crop(device: &Device, queue: &Queue, src: &Texture, (x, y): (i32, i32), (w, h
     Some(texture)
 }
 
+/// The kept layer in `slot`, allocated (or reallocated) for `size`.
+fn keep(slot: &mut Option<Layer>, device: &Device, (w, h): (u32, u32), label: &str) -> Option<(Texture, TextureView)> {
+    let stale = match slot.as_ref() {
+        Some(l) => l.size != (w, h),
+        None => true,
+    };
+    if stale {
+        let texture = layer_texture(device, label, w, h);
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        *slot = Some(Layer { texture, view, size: (w, h) });
+    }
+    slot.as_ref().map(|l| (l.texture.clone(), l.view.clone()))
+}
+
+/// A `width` × `height` layer vello draws into, or that holds a copy of one.
+fn layer_texture(device: &Device, label: &str, width: u32, height: u32) -> Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: FORMAT,
+        usage: TextureUsages::STORAGE_BINDING
+            | TextureUsages::TEXTURE_BINDING
+            | TextureUsages::COPY_SRC
+            | TextureUsages::COPY_DST
+            | TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    })
+}
+
 fn target(device: &Device, width: u32, height: u32) -> Target {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("figcraft canvas"),
@@ -251,8 +385,13 @@ fn target(device: &Device, width: u32, height: u32) -> Target {
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: FORMAT,
-        // vello writes through storage textures; egui samples the result, and screenshots copy it.
-        usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_SRC,
+        // vello writes through storage textures; egui samples the result, screenshots copy it, and
+        // the segmented renderer's accumulation is copied in.
+        usage: TextureUsages::STORAGE_BINDING
+            | TextureUsages::TEXTURE_BINDING
+            | TextureUsages::COPY_SRC
+            | TextureUsages::COPY_DST
+            | TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -373,22 +512,97 @@ pub fn present(doc: &Document, page: NodeId, view: &View) -> Option<Frame> {
     }
     let Some(canvas) = slot.as_mut() else { return refusal("the GPU can't run the rasterizer") };
     canvas.resize(&backend.device, view.width, view.height);
-    // Effect layers are drawn and blurred on the device while the scene is built.
-    let scene = {
-        let mut layers = GpuLayers { canvas, device: &backend.device, queue: &backend.queue };
-        match crate::scene::build_with(doc, page, view, &mut layers) {
-            Ok(scene) => scene,
-            Err(e) => return refusal(e.reason()),
-        }
+    let plan = match crate::scene::plan(doc, page) {
+        Ok(plan) => plan,
+        Err(e) => return refusal(e.reason()),
     };
-    let Some(texture) = canvas.render(&backend.device, &backend.queue, &scene, background) else {
-        return refusal("draw failed");
+    let segmented = plan.iter().any(|s| matches!(s, crate::scene::Step::Backdrop(_)));
+    let texture = if segmented {
+        match segmented_frame(&backend.device, &backend.queue, canvas, doc, page, view, &plan, background) {
+            Some(texture) => texture,
+            None => return refusal("draw failed"),
+        }
+    } else {
+        // Effect layers are drawn and blurred on the device while the scene is built.
+        let scene = {
+            let mut layers = GpuLayers { canvas, device: &backend.device, queue: &backend.queue };
+            match crate::scene::build_with(doc, page, view, &mut layers) {
+                Ok(scene) => scene,
+                Err(e) => return refusal(e.reason()),
+            }
+        };
+        let Some(texture) = canvas.render(&backend.device, &backend.queue, &scene, background) else {
+            return refusal("draw failed");
+        };
+        texture
     };
     let frame = Frame { view: view.clone(), texture, slot: canvas.slot(), generation: canvas.generation() };
     if let Ok(mut r) = refusal_slot().lock() {
         *r = None;
     }
     Some(frame)
+}
+
+/// A page with backdrop effects, drawn in segments: the layers before each such node accumulate
+/// into one texture, the node makes its effect from that texture, and its content goes on top.
+pub(crate) fn segmented_frame(
+    device: &Device,
+    queue: &Queue,
+    canvas: &mut CanvasGpu,
+    doc: &Document,
+    page: NodeId,
+    view: &View,
+    plan: &[crate::scene::Step],
+    background: figcraft_color::Color,
+) -> Option<TextureView> {
+    let (acc, acc_view) = canvas.page_layer(device)?;
+    canvas.fill_layer(device, queue, &acc_view, background);
+    let mut pending = Scene::new();
+    // Whether `pending` holds layers: nothing is drawn or composed for an empty one (and backdrop
+    // nodes often follow each other, with no layers between them).
+    let mut dirty = false;
+    for step in plan {
+        match step {
+            crate::scene::Step::Nodes(ids) => {
+                let drawn = {
+                    let mut layers = GpuLayers { canvas, device, queue };
+                    crate::scene::draw_into(doc, page, view, &mut layers, ids, &mut pending)
+                };
+                drawn.ok()?;
+                dirty = true;
+            }
+            crate::scene::Step::Backdrop(id) => {
+                // Everything before the node goes into the accumulation first.
+                if dirty {
+                    lay_over(device, queue, canvas, &acc_view, &pending)?;
+                    pending = Scene::new();
+                }
+                // The effect reads what lies under the node, then the node goes over it.
+                let image = {
+                    let mut layers = GpuLayers { canvas, device, queue };
+                    layers.backdrop_effect(doc, *id, view, &acc)?
+                };
+                let drawn = {
+                    let mut layers = GpuLayers { canvas, device, queue };
+                    crate::scene::draw_backdrop_into(doc, page, view, &mut layers, *id, &image, &mut pending)
+                };
+                drawn.ok()?;
+                dirty = true;
+            }
+        }
+    }
+    if dirty {
+        lay_over(device, queue, canvas, &acc_view, &pending)?;
+    }
+    canvas.present_layer(device, queue, &acc)
+}
+
+/// Draw `segment` into the kept segment texture and lay it over the page.
+fn lay_over(device: &Device, queue: &Queue, canvas: &mut CanvasGpu, page: &TextureView, segment: &Scene) -> Option<()> {
+    let view = canvas.segment_layer(device)?;
+    canvas.draw_into(device, queue, segment, &view).then_some(())?;
+    canvas.compose_over(device, queue, page, &view);
+    Some(())
 }
 
 /// Whether the GPU canvas is installed (a window with a device built it).

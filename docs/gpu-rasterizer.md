@@ -37,7 +37,8 @@ pixels crossing the bus.
 - **All-or-nothing fallback.** For a page with something the GPU path cannot draw *identically*
   (a feature still in a later phase), the canvas renders that frame on the CPU as today. A
   half-GPU frame is never shown. The predicate is one function over the page subtree
-  (`gpu_canvas::supported`), extended phase by phase with a test either way.
+  (`figcraft_gpu::scene::supported`) plus `scene::plan` for backdrop effects, extended phase by
+  phase with a test either way.
 - Determinism: the GPU texture is read back only for screenshots, exports and tests. The parity
   suite compares GPU and CPU pixel by pixel with a stated tolerance.
 
@@ -69,9 +70,10 @@ and the app builds and runs unchanged (the CPU canvas is still the default in th
 - Covered in P1: rectangles (per-corner radii, corner smoothing), ellipses/arcs, polygons, stars,
   lines, vectors and booleans (via `node_outline`), text in one style (glyph outlines), solid and
   linear/radial/angular gradients, node opacity, node blend modes, clipping frames, hidden layers.
-- Not covered (the page falls back to the CPU): effects, image and pattern fills, diamond
-  gradients, per-paint blend modes, `PlusDarker`, masks, inside/outside strokes, dashes, width
-  profiles, brush strokes, arrow/circle caps, text with styled runs or colour glyphs, and the
+- Not covered (the page falls back to the CPU): effects that are not a layer blur, a drop shadow or
+  a backdrop effect (inner shadows, grain, a node with several effects), image and pattern fills,
+  diamond gradients, per-paint blend modes, `PlusDarker`, masks, inside/outside strokes, dashes,
+  width profiles, brush strokes, arrow/circle caps, text with styled runs or colour glyphs, and the
   editor's own options (outline mode, `skip`, `solo`) which come with the canvas integration.
 
 Exit: parity tests (below) pass for the P1 feature list; a drag benchmark shows the frame cost
@@ -118,44 +120,71 @@ the CPU render within the parity tolerance; toggling the setting changes nothing
   computes the cached distance field and normals — `figcraft_render::glass::pane`), into a texture
   drawn under the pane's content. Parity mean 0.061/255, worst 6, no pixel differs by more than 8
   (`the_gpu_glass_matches_the_cpu_canvas`).
-- **Policy in the canvas for now.** Glass is implemented and parity-tested but not switched on: a
-  pane costs about what the CPU costs (4–11 ms against 5–9 ms at 904 × 860 — the backdrop render,
-  the blur and the shader are three submissions), and pages with several panes compound it (three
-  panes 21–27 ms against the CPU's 12–15 ms with its kept layers). Background blur is a win
-  (1.8–5 ms against 4.3–5), so pages may have one and stay on the GPU; pages with a pane stay on
-  the CPU. `GLASS_ON_GPU` and `MAX_BACKDROP_BLURS` in `render_worker` hold the policy.
-- Next: the accumulated-backdrop renderer — draw the page once, flush it into a texture as each
-  backdrop node is reached and reuse that texture — which makes glass (and several panes) a win;
-  then inner shadows, grain, spread and translucent shadows, and drop shadows cast from blurred
+- The single-scene route for a backdrop node (draw the page under it, blur, draw the node over it)
+  came first and is still the builder's own path and the parity reference
+  (`the_gpu_glass_matches_the_cpu_canvas`, `the_gpu_background_blur_matches_the_cpu_render`); the
+  canvas takes the segmented route for every page that has a backdrop node.
+- Landed: **the accumulated-backdrop renderer.** A page with a backdrop node is drawn in segments:
+  the layers before such a node go into a segment texture, the segment is laid over an
+  accumulation texture, the effect is made from the accumulation (a blur of the node's padded
+  layer, or a crop + blur + the glass shader) and the node's content goes over it. The page under
+  two panes is drawn once, so panes no longer compound.
+- **Everything that reads its backdrop now stays on the GPU**, as many panes and blurs as the page
+  has. `scene::plan` refuses only a backdrop node nested inside another layer — there is no
+  segment boundary inside a layer — and that page stays on the CPU.
+- Parity: glass mean 0.061/255, worst 6, no pixel differs by more than 8
+  (`the_segmented_page_matches_the_cpu_with_one_glass_pane` — the same numbers as the single-scene
+  path); background blur mean 0.049/255, worst 25
+  (`the_segmented_page_matches_the_cpu_with_one_background_blur`). The heavy page (30 shadowed
+  cards, 3 panes, a background blur and a layer blur) matching to mean 0.725/255, worst 40, all of
+  them on antialiased card edges (`the_gpu_page_matches_with_several_backdrop_layers`).
+- *Timing* (`segmented_timings`, release, pipelined as the app draws): one pane 904 × 860 CPU
+  8.3 ms / GPU 5.7 ms, 2400 × 1600 CPU 14.3 / GPU 3.3; one background blur 4.3 / 3.8 and 11.9 /
+  3.2; the heavy page 48.6 / 8.8 and 53.6 / 6.2 — under the 8 ms budget at 2400 × 1600.
+- In the app (release, control channel, canvas 904 × 860, the same page): the GPU holds
+  `canvas.rasterizer = gpu` and drags it in 12–19 ms a frame where the CPU's *full* render takes
+  30–34 ms; a single-layer drag is 4.3–4.5 ms on the CPU's retained layers against 12–19 ms on the
+  GPU, which re-encodes the page every frame (see "Next slice" below).
+- Next: **cross-frame retention for segmented pages** — while one layer moves, the segments and
+  effect pixels under it have not changed, and the CPU path re-draws only what moved
+  (`figcraft_render::layers`); the GPU path needs the same (a key on the document's subtrees, the
+  view and the zoom) before a single-layer drag on a backdrop page beats the CPU's retained
+  renderer on render time. Its canvas *latency* is already lower in the app (17.8 ms against the
+  CPU's 41 ms in the same session), because no pixels cross the bus.
+- Then: inner shadows, grain, spread and translucent shadows, and drop shadows cast from blurred
   layers.
 
 Exit: the 30-shadow + 3-glass + 2-blur page renders entirely on the GPU, and its drag frame at
 2400 × 1600 stays at or under the 10–13 ms the CPU path reaches with the layer cache, at
-full quality — the target is a single frame budget (≤ 8 ms p95) at that size.
+full quality — the target is a single frame budget (≤ 8 ms p95) at that size. **Met** in isolation:
+6.2 ms at 2400 × 1600 (`segmented_timings`; the machine's GPU throughput moves 2–3× with what else
+is running, so compare runs made together, not across sessions).
 
-#### Next slice: the accumulated-backdrop renderer
+#### Straight vs premultiplied alpha (what broke the first attempt)
 
-Backdrop effects currently build a fresh page scene under every node that reads it, so two such
-nodes cost more than one and the canvas limits pages to one. The fix is to draw the page once:
-
-1. Draw the page's layers in order into an accumulation texture; at each backdrop node, the
-   texture already holds everything under it.
-2. Make the effect from that texture (blur, or crop + blur + the glass shader), draw it and the
-   node's content over the texture, and carry on with the next layers.
-3. Cache the accumulation across frames the way `figcraft_render::layers` caches CPU layers (keyed
-   on the document subtree's shared `Arc`s, the transform and the zoom), so a drag re-draws only
-   what moved.
-
-Tests: the three-pane page gets a timing case and must beat its 12–15 ms cached CPU frame; the
-existing parity tests cover each effect.
-
-**Attempted, not enabled.** A first implementation (segments rendered into their own textures and
-laid over an accumulation with a premultiplied-over blit) matched the CPU inside the effects
-(mean 0.06–0.11/255) but failed at their borders: a pane's rim showed the page background, and a
+A first implementation matched the CPU inside every effect (mean 0.06–0.11/255) but failed at
+their borders: a pane's rim showed the page background instead of the stripe under it, and a
 background blur's edge showed blur where the CPU shows none (worst 123–223 on 250–1600 pixels).
-It is not in the tree. The suspects, in order: the compose pass (`LoadOp::Load` with
-premultiplied-over), whether vello clears a target it renders an empty scene into (the
-accumulation's first fill), and the effect image's placement relative to the layer's origin.
+
+The cause was neither the compose pass nor the image's placement: **vello's targets hold straight
+(separated) alpha** — its fine pass stores `rgb / alpha` (`vello_shaders`' `fine.wgsl`, and
+`Renderer::register_texture` says its textures are read as unpremultiplied) — while the
+accumulation, the box blurs, the glass shader (its `min(rgb, alpha)` clamp) and egui all work on
+premultiplied pixels, as tiny-skia's pixmaps do. A segment's antialiased rim therefore held
+`(255, 255, 255, 0)`, and a premultiplied-over blit added all of that white to the page.
+
+The canvas now premultiplies once, where vello's output meets the premultiplied side: the compose
+pass premultiplies each segment as it lays it over the accumulation, and `render_layer`
+premultiplies an effect layer before a blur, the glass shader, or vello's own image brush reads it.
+The same conversion removed the differences the layer-blur parity test used to have on its
+antialiased edges (mean 0.047 → 0.011/255, worst 33 → 7).
+
+#### Why the segments read only the node's padded layer
+
+The CPU blurs `back`, the node's layer grown by `pad` each way — not the whole view. Cropping to
+that rectangle first and blurring the crop is what the segmented canvas does now (`blur_rect`),
+which is both the same arithmetic and much cheaper: the background-blur page at 2400 × 1600 went
+from 11.6 to 3.2 ms a frame.
 
 ### P4 — default on, cleanup
 
@@ -173,10 +202,11 @@ Run in `cargo xtask ci` unless marked *timing* (release, `--ignored --nocapture`
 |---|---|---|
 | 1 | `the_gpu_canvas_matches_the_cpu_render` | pixel parity per feature: shapes, radii, gradients, text, opacity, blend, strokes |
 | 1b | `the_gpu_text_matches_the_cpu_render` | text is pixel-identical (measured: 0 differing bytes) |
-| 1c | `the_gpu_layer_blur_matches_the_cpu_render`, `the_gpu_drop_shadow_matches_the_cpu_render` | effects: mean 0.047 and 0.044/255 |
+| 1c | `the_gpu_layer_blur_matches_the_cpu_render`, `the_gpu_drop_shadow_matches_the_cpu_render` | effects: mean 0.011 and 0.044/255 |
+| 1d | `the_segmented_page_matches_the_cpu_with_one_glass_pane`, `..._one_background_blur`, `the_gpu_page_matches_with_several_backdrop_layers` | backdrop effects in the accumulated renderer: mean 0.061, 0.049 and 0.725/255 |
 | 2 | `unsupported_pages_fall_back` | the predicate rejects exactly the features not yet ported |
 | 3 | `the_gpu_canvas_reads_back` | screenshot/export path: texture → `Pixmap`, premultiplied, same size |
-| 4 | *timing* `canvas_frame_timings` | CPU vs GPU frame at 2320 × 1440, plain and heavy, p50/p95 |
+| 4 | *timing* `canvas_frame_timings`, `segmented_timings` | CPU vs GPU frame at 2320 × 1440 (plain and heavy) and 2400 × 1600 (backdrop pages) |
 | 5 | *timing* `heavy_scene_timings` (existing) | the current effects comparison stays honest |
 | 6 | `cargo xtask wasm` | the browser build still compiles and stays CPU |
 | 7 | screenshot comparison | the real app looks the same with the GPU canvas on |
@@ -268,10 +298,20 @@ stays on the fallback list.
   - **Glass** on the GPU: the padded backdrop is cropped, blurred by the pane's frost and run
     through the existing glass shader, from the CPU's cached distance field and normals
     (`figcraft_render::glass::pane` split out of `glass()`). Parity mean 0.061/255, worst 6, no
-    pixel off by more than 8. In-app it measured 4–11 ms a frame against the CPU's 5–9 ms, and
-    three panes 21–27 ms against the CPU's 12–15 ms with its kept layers, so the canvas leaves
-    pages with a pane on the CPU (`GLASS_ON_GPU = false`) until the accumulated-backdrop renderer
-    lands.
-- Next: the accumulated-backdrop renderer (draw the page once, reuse its texture at every
-  backdrop node), which makes glass and several panes a win; then inner shadows, grain, spread and
-  translucent shadows, and drop shadows cast from blurred layers.
+    pixel off by more than 8. Alone, a pane cost about what the CPU cost (4–11 ms against 5–9 ms),
+    so pages with a pane stayed on the CPU until the accumulated renderer landed.
+- 2026-10-24: **P3 slice 4 landed — the accumulated-backdrop renderer**, and with it glass and every
+  backdrop effect stay on the GPU, however many the page has:
+  - A page with a backdrop node is drawn in segments: the layers before it into a segment texture,
+    laid over an accumulation, the effect made from the accumulation, its content over it. The page
+    under two panes is drawn once.
+  - Parity (release tests): glass mean 0.061/255 worst 6 with no pixel off by more than 8;
+    background blur mean 0.049/255 worst 25; the heavy 30-card + 3-pane + background-blur +
+    layer-blur page mean 0.725/255 worst 40, all on card edges.
+  - Release, pipelined: heavy page 8.8 ms at 904 × 860 and **6.2 ms at 2400 × 1600** against the
+    CPU's 48.6 and 53.6 (`segmented_timings`); one pane 5.7 / 3.3 ms, one background blur 3.8 /
+    3.2 ms.
+  - The first attempt failed at effect borders because vello's targets hold straight alpha; see
+    "Straight vs premultiplied alpha" above.
+- Next: inner shadows, grain, spread and translucent shadows, and drop shadows cast from blurred
+  layers; then P4 (default-on policy write-up and cleanup).
