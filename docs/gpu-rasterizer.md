@@ -213,7 +213,7 @@ Run in `cargo xtask ci` unless marked *timing* (release, `--ignored --nocapture`
 | 2 | `unsupported_pages_fall_back` | the predicate rejects exactly the features not yet ported |
 | 3 | `the_gpu_canvas_reads_back` | screenshot/export path: texture → `Pixmap`, premultiplied, same size |
 | 4 | *timing* `canvas_frame_timings`, `segmented_timings` | CPU vs GPU frame at 2320 × 1440 (plain and heavy) and 2400 × 1600 (backdrop pages) |
-| 5 | *timing* `heavy_scene_timings` (existing) | the current effects comparison stays honest |
+| 5 | *timing* `heavy_scene_timings` (one effect group at a time, GPU against CPU), `heavy_scene_gpu_timings`, `layer_blur_timings`, `shadow_timings`, `segmented_breakdown` | each effect's own cost stays honest |
 | 6 | `cargo xtask wasm` | the browser build still compiles and stays CPU |
 | 7 | screenshot comparison | the real app looks the same with the GPU canvas on. Measured on the 34-layer page at 34.6%: mean 0.9/255, differences on shape and shadow edges only — the CPU path snaps the view outwards to whole device pixels while the GPU draws the requested view, so content can sit a pixel apart |
 
