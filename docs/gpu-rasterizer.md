@@ -72,8 +72,8 @@ and the app builds and runs unchanged (the CPU canvas is still the default in th
   linear/radial/angular gradients, node opacity, node blend modes, clipping frames, hidden layers.
 - Not covered (the page falls back to the CPU): effects that are not a layer blur, a drop shadow or
   a backdrop effect (inner shadows, grain, a node with several effects), a shadow cast by anything
-  that isn't one opaque rounded rectangle (a group, an ellipse, a translucent card, a non-uniform
-  radius), image and pattern fills, diamond and skewed linear gradients, per-paint blend modes,
+  that isn't one rounded rectangle (a group, an ellipse, a non-uniform radius), image and pattern
+  fills, diamond and skewed linear gradients, per-paint blend modes,
   `PlusDarker`, masks, text with a stroke, arrow/circle caps, text with styled runs or colour
   glyphs, and the editor's own options (outline mode, `skip`, `solo`) which come with the canvas
   integration.
@@ -118,11 +118,14 @@ the CPU render within the parity tolerance; toggling the setting changes nothing
   as a layer; the card may have any number of shadows, a gradient fill (its stops opaque), an
   opaque stroke (which grows the silhouette by its outer half — inside, centred or outside), rotated
   corners, and children in a clipping frame. `the_gpu_draws_the_shadow_variations` covers all of
-  them: mean 0.512/255, worst 59 on the softest shadow edge, 1.3% of pixels off by more than 8 —
-  the Gaussian-against-three-boxes difference, largest where two large shadows overlap. Still on the
-  CPU: a translucent card (its paints must hide the shadow where they cover), a non-uniform radius,
-  an ellipse, a group or text with a shadow, and a shadow alongside another effect (the CPU's order
-  matters).
+  them: mean 0.558/255, worst 59 on the softest shadow edge, 1.5% of pixels off by more than 8 —
+  the Gaussian-against-three-boxes difference, largest where two large shadows overlap. A
+  **translucent card** (one fill alpha, so one shadow strength) casts a shadow as faint as it paints
+  and clipped away where the card covers, as the CPU's cover mask hides it — except when the shadow
+  spreads, which the CPU casts from the paints' outline, opaque, so the shadow is full strength.
+  Still on the CPU: a non-uniform radius, an ellipse, a group or text with a shadow, a translucent
+  fill beside a stroke or fading across the shape, and a shadow alongside another effect (the CPU's
+  order matters).
 - Landed: **inside, outside and per-side strokes, dashes, width profiles and brush strokes**, as
   the renderer's own band (`figcraft_render::stroke_fill`) filled — vello's native stroke draws the
   centred, plain case. Text with a stroke still falls back.
@@ -342,14 +345,15 @@ stays on the fallback list.
     "Straight vs premultiplied alpha" above.
 - 2026-10-24: **P3 slice 5 landed — wider drop shadows, and the strokes that cast them.** A card's
   shadow is its own rounded rect whatever the card is painted with: spread, any number of shadows,
-  `showBehind`, a shadow blend of its own, a gradient fill with opaque stops, an opaque stroke
-  (inside, centred or outside — the silhouette grows by its outer half), rotation, and children in
-  a clipping frame. Strokes themselves are no longer limited to plain centred ones: inside, outside,
+  `showBehind`, a shadow blend of its own, a gradient fill with opaque stops, a translucent fill
+  (one alpha: the shadow is as faint as it paints and clipped away where the card covers), an
+  opaque stroke (inside, centred or outside — the silhouette grows by its outer half), rotation,
+  and children in a clipping frame. Strokes themselves are no longer limited to plain centred ones: inside, outside,
   per-side, dashed, profiled and brush bands are filled from the renderer's own outline. A linear
   gradient whose width handle isn't square to its axis (only imported files skew one) now stays on
   the CPU, where vello's projection and the CPU's handle frame agree.
-  - `the_gpu_draws_the_shadow_variations`: mean 0.512/255, worst 59, 1.3% of pixels off by more
+  - `the_gpu_draws_the_shadow_variations`: mean 0.558/255, worst 59, 1.5% of pixels off by more
     than 8 — the Gaussian/three-box difference on the soft edges, not a shape error.
   - 30 spread shadows: **0.69–0.91 ms** a frame against the CPU's 28–34 ms (`shadow_timings`).
-- Next: inner shadows, grain, and shadows cast by a translucent card, a group or an ellipse (the
-  renderer's layer-sized path); then P4's cleanup.
+- Next: inner shadows, grain, and shadows cast by a group, an ellipse or text (the renderer's
+  layer-sized path); then P4's cleanup.

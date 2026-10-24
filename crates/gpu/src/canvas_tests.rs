@@ -166,9 +166,28 @@ fn unsupported_pages_are_refused() {
     let id = d.node(p).and_then(|n| n.children.first().copied()).unwrap();
     d.get_mut(id).unwrap().effects = vec![Effect::drop_shadow()];
     assert_eq!(scene::supported(&d, p), Ok(()));
-    // A translucent card can't hide its shadow where it covers it: the CPU masks it per pixel.
+    // A translucent card casts a shadow as faint as it paints, hidden where it covers: the card's
+    // silhouette, clipped outside its own outline.
     let opaque = d.node(id).and_then(|n| n.fills.first().cloned()).unwrap();
     d.get_mut(id).unwrap().fills[0].opacity = 0.5;
+    assert_eq!(scene::supported(&d, p), Ok(()));
+    // Not beside a stroke: the opaque band casts a stronger shadow than the fill does.
+    d.get_mut(id).unwrap().strokes = vec![Paint::solid(Color::WHITE)];
+    d.get_mut(id).unwrap().stroke.weight = 4.0;
+    assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Effect));
+    d.get_mut(id).unwrap().strokes.clear();
+    d.get_mut(id).unwrap().stroke.weight = 0.0;
+    // Nor when the fill fades: its alpha isn't one value, so the shadow's strength isn't either.
+    d.get_mut(id).unwrap().fills = vec![Paint::gradient(Gradient {
+        kind: GradientKind::Linear,
+        stops: vec![
+            figcraft_color::ColorStop { position: 0.0, color: Color::WHITE },
+            figcraft_color::ColorStop { position: 1.0, color: Color { a: 0.0, ..Color::WHITE } },
+        ],
+        from: (0.0, 0.5),
+        to: (1.0, 0.5),
+        width: (0.0, 1.0),
+    })];
     assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Effect));
     d.get_mut(id).unwrap().fills[0] = opaque;
     // A shadow that spreads grows the card's own silhouette; one that shows behind is hidden by an
@@ -622,6 +641,16 @@ fn shadow_breadth_doc() -> Document {
         n.corners.radii = [20.0; 4];
         n.fills = vec![Paint::solid(hex("F0C830"))];
         n.effects = vec![shadow(9.0, 1.0, (0.0, 6.0), true, BlendMode::Normal)];
+    }
+
+    // A translucent card: its shadow is as faint as it paints and hidden where it covers.
+    let faint = d.create(p, NodeKind::Rectangle, "faint card", 455.0, 240.0, 125.0, 50.0).unwrap();
+    {
+        let n = d.get_mut(faint).unwrap();
+        n.corners.radii = [12.0; 4];
+        n.fills = vec![Paint::solid(Color { a: 0.35, ..hex("20B0D0") })];
+        // One shadow cast from the layer's pixels (as faint as the card) and one from its outline.
+        n.effects = vec![shadow(10.0, 0.0, (3.0, 6.0), false, BlendMode::Normal), shadow(6.0, 3.0, (0.0, 2.0), false, BlendMode::Normal)];
     }
     d
 }

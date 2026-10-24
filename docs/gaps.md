@@ -254,10 +254,11 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
   card's drop shadow is vello's blurred rounded rect under the card — parity mean 0.044/255 — so
   a page of 30 shadowed cards draws in 0.7–0.9 ms a frame where a CPU frame takes 21–29 ms — with
   a spread of 6 still 0.69–0.91 ms. A shadow may spread, show behind, carry its own blend mode,
-  come several to a card, and be cast by a card with a gradient fill, an opaque stroke (inside,
+  come several to a card, and be cast by a card with a gradient fill, a translucent fill (the
+  shadow is as faint as it paints and clipped away where the card covers), an opaque stroke (inside,
   centred or outside), rotated corners or children in a clipping frame; inside/outside, per-side,
-  dashed, profiled and brush strokes are drawn from the renderer's band. A shadow cast by a
-  translucent card, a group or an ellipse, an inner shadow, grain and a shadow next to another
+  dashed, profiled and brush strokes are drawn from the renderer's band. A shadow cast by a group or
+  an ellipse, an inner shadow, grain and a shadow next to another
   effect still put the page on the CPU, as does a linear gradient whose width handle is skewed
   (imported files only). A page's
   **background blur** reads the page under its node from a texture drawn there (parity 0.049/255).

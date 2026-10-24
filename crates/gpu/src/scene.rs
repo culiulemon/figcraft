@@ -7,7 +7,7 @@
 
 use figcraft_color::{BlendMode, Color, Gradient, GradientKind, Paint, PaintKind};
 use figcraft_doc::{Document, Node, NodeId, NodeKind};
-use figcraft_geom::Affine;
+use figcraft_geom::{Affine, Shape as _};
 use figcraft_render::{FillRule, View, node_outline};
 use vello::Scene;
 use vello::kurbo::{Affine as KAffine, Point, Rect as KRect, Stroke};
@@ -339,6 +339,8 @@ struct ShadowShape {
     /// How far its paints reach past the outline: a centred stroke's outer half, all of an outside
     /// one — the silhouette's own growth, in the node's units.
     grow: f64,
+    /// See [`fill_alpha`]: what the shadow is seen through, and so what it is made of.
+    alpha: f64,
     shadows: Vec<figcraft_doc::Shadow>,
 }
 
@@ -354,6 +356,34 @@ fn is_rect_kind(k: &NodeKind) -> bool {
             | NodeKind::Instance { .. }
             | NodeKind::Section { .. }
     )
+}
+
+/// The alpha the node's own fills paint the whole shape with, when it is one value (a shadow is
+/// cast by the layer's pixels, so a translucent card casts one just as faint); `None` when the
+/// fills vary across it or composite in a way one alpha can't say.
+fn fill_alpha(n: &Node) -> Option<f64> {
+    let mut clear = 1.0f64;
+    let mut any = false;
+    for p in n.fills.iter().filter(|p| p.visible && p.opacity > 0.0) {
+        if p.blend != BlendMode::Normal {
+            return None;
+        }
+        let op = f64::from(p.opacity.clamp(0.0, 1.0));
+        let alpha = match &p.kind {
+            PaintKind::Solid { color } => f64::from(color.a) * op,
+            PaintKind::Gradient(g) => {
+                let first = f64::from(g.stops.first()?.color.a) * op;
+                if g.stops.iter().any(|s| (f64::from(s.color.a) * op - first).abs() > 1e-6) {
+                    return None;
+                }
+                first
+            }
+            PaintKind::Image(_) | PaintKind::Pattern(_) => return None,
+        };
+        clear *= 1.0 - alpha.clamp(0.0, 1.0);
+        any = true;
+    }
+    any.then_some(1.0 - clear)
 }
 
 /// Whether `p` paints opaque coverage (its blend mode aside: what it covers hides a shadow under
@@ -374,11 +404,11 @@ fn paint_opaque(p: &Paint) -> bool {
 ///
 /// The CPU casts a shadow from the layer's pixels (or, when it spreads, from the paints' outline)
 /// and hides it behind the paints' *cover*: a fill or stroke hides it whether or not it is
-/// translucent. Drawing the shadow under the node hides it exactly where the node's pixels are
-/// opaque, so the node's own paints must be opaque over the silhouette (an opaque fill covering
-/// the shape, and an opaque stroke if there is one), its opacity 1 and its blend normal. Children
-/// may paint over the shadow wherever they are; they are allowed only in a clipping frame, where
-/// they cannot reach past the shape the shadow is cast from.
+/// translucent. A shadow drawn under an opaque node is hidden exactly there; a translucent one
+/// hides it with a clip outside its own outline, and casts it just as faint as it paints. So the
+/// fills must paint the shape with one alpha (an opaque stroke may surround them), the node's
+/// opacity is 1 and its blend normal. Children may paint over the shadow wherever they are; they
+/// are allowed only in a clipping frame, where they cannot reach past the shape.
 fn shadow_shape(doc: &Document, n: &Node) -> Option<ShadowShape> {
     if !is_rect_kind(&n.kind) || n.corners.smoothing != 0.0 {
         return None;
@@ -387,10 +417,13 @@ fn shadow_shape(doc: &Document, n: &Node) -> Option<ShadowShape> {
         return None;
     }
     let radius = n.corners.uniform()?.max(0.0);
-    if !n.fills.iter().any(paint_opaque) {
+    let alpha = fill_alpha(n)?;
+    let stroked = n.has_visible_stroke();
+    // A translucent fill beside a stroke casts two different shadows (the band is opaque).
+    if stroked && alpha < 1.0 {
         return None;
     }
-    let grow = if n.has_visible_stroke() {
+    let grow = if stroked {
         let stroke = &n.stroke;
         let weight = if stroke.weight.is_finite() { stroke.weight.max(0.0) } else { 0.0 };
         // A band that isn't the plain outline (dashes, a width profile, per-side widths, a brush)
@@ -424,7 +457,7 @@ fn shadow_shape(doc: &Document, n: &Node) -> Option<ShadowShape> {
         }
         shadows.push(s.clone());
     }
-    (!shadows.is_empty()).then_some(ShadowShape { radius, grow, shadows })
+    (!shadows.is_empty()).then_some(ShadowShape { radius, grow, alpha, shadows })
 }
 
 fn effects_of(doc: &Document, n: &Node) -> Effects {
@@ -507,6 +540,16 @@ impl Builder<'_> {
         let Some(scene) = &mut self.scene else { return };
         let rect = KRect::new(0.0, 0.0, n.width, n.height);
         let scale = xf.determinant().abs().sqrt();
+        // A translucent card hides its shadow where its paints cover it (the CPU's cover mask) but
+        // lets it through elsewhere: the shadow is clipped to the outside of the card's outline.
+        let outside = if shape.alpha < 1.0 {
+            let mut hole = KRect::new(-1e5, -1e5, 1e5, 1e5).to_path(0.0);
+            let inner = figcraft_geom::rounded_rect(n.width, n.height, n.corners.radii, 0.0);
+            hole.extend(inner.elements().iter().copied());
+            Some(hole)
+        } else {
+            None
+        };
         for s in &shape.shadows {
             // A shadow that spreads is cast from the outline at its exact offset; one that does
             // not is cast from the layer's pixels, which the CPU moves by whole device pixels.
@@ -518,6 +561,12 @@ impl Builder<'_> {
             }
             let radius = (shape.radius + grow).max(0.0);
             let c = s.color.sanitized();
+            // A spreading shadow is cast from the paints' outline, which is opaque coverage: the CPU
+            // reads the fills' alpha only when the shadow comes from the layer's pixels.
+            let alpha = f64::from(c.a) * if s.spread != 0.0 { 1.0 } else { shape.alpha };
+            if !(alpha > 0.0) {
+                continue;
+            }
             let at = KAffine::translate((snap(s.offset.0), snap(s.offset.1))) * k_affine(xf);
             // A shadow with a blend mode of its own composites as a layer; the usual one is drawn
             // straight into the scene.
@@ -526,9 +575,17 @@ impl Builder<'_> {
                 let target = KRect::new(0.0, 0.0, 32_768.0, 32_768.0);
                 scene.push_layer(Fill::NonZero, blend(s.blend), 1.0, KAffine::IDENTITY, &target);
             }
+            // A shadow that shows behind the layer is not hidden by the paints at all.
+            let clipped = outside.is_some() && !s.show_behind;
+            if let Some(hole) = outside.as_ref().filter(|_| clipped) {
+                scene.push_clip_layer(Fill::EvenOdd, k_affine(xf), hole);
+            }
             // The radius and the deviation are in the shape's own units (the transform scales
             // them, and the blur with them).
-            scene.draw_blurred_rounded_rect(at, rect, PColor::new([c.r, c.g, c.b, c.a]), radius, (s.radius / 2.0).max(0.0));
+            scene.draw_blurred_rounded_rect(at, rect, PColor::new([c.r, c.g, c.b, alpha as f32]), radius, (s.radius / 2.0).max(0.0));
+            if clipped {
+                scene.pop_layer();
+            }
             if blended {
                 scene.pop_layer();
             }
