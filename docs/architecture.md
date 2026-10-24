@@ -26,7 +26,7 @@ replaced.
 | L3 | `figcraft-format` | ~5.2k | Native `.figcraft` (zip of `document.json` + images; streamed JSON), local library files, versions, REST API file JSON import (`rest/`) |
 | L4 | `figcraft-svg` | ~3.7k | SVG export and import (usvg) |
 | L4 | `figcraft-pdf` | ~2.3k | PDF export (krilla) with print options |
-| L4 | `figcraft-gpu` | ~0.9k | The window's GPU: effects (the same box-blur the CPU renderer uses, glass) through wgpu, plugged into `figcraft-render`'s accelerator, and the GPU canvas — document → vello scene → texture ([`gpu-rasterizer.md`](gpu-rasterizer.md)); exports, tests and machines without a device keep the CPU |
+| L4 | `figcraft-gpu` | ~1.2k | The window's GPU: effects (the same box-blur the CPU renderer uses, glass) through wgpu, plugged into `figcraft-render`'s accelerator, and the GPU canvas — document → vello scene → texture, with layer-blur effect layers drawn and blurred on the device ([`gpu-rasterizer.md`](gpu-rasterizer.md)); exports, tests and machines without a device keep the CPU |
 | L5 | `figcraft-engine` | ~39.3k | Sessions, undo history (`Arc` snapshots), the command registry (`cmd/*`, `spec!`), pointer tools and vector edit mode, snapping and measuring, components sync, libraries, prototype runtime, Dev Mode code generation, the menu catalog (`catalog.rs`) and the keymap (`keymap.rs`), a panic guard |
 | L6 | `figcraft-ui-egui` | ~31.9k | The UI3-style frontend: canvas (render worker), toolbar, layers, Design/Prototype/Inspect panels, colour picker, menus, dialogs, presenter, comments, accessibility (AccessKit), the control channel server |
 | L6 | `figcraft-mcp` | ~2.4k | MCP server (JSON-RPC over stdio), headless or bridged to a running app |
@@ -59,18 +59,19 @@ dialogs themselves; they request UI, and programmatic callers drop those request
 The desktop canvas draws on the GPU where the page is in the GPU rasterizer's feature set
 ([`gpu-rasterizer.md`](gpu-rasterizer.md)): the render thread turns the page into a vello scene and
 draws it into one of two textures, and the window paints that texture, so no pixels cross the bus
-and nothing is uploaded per frame. Every other page — effects, images, masks, outline modes, soft
-proof — is drawn by the CPU renderer and uploaded as before; the choice is made per frame and
-reported by `ui.inspect`. The CPU renderer is the single source of pixels for exports and the
-browser. The desktop canvas renders on a worker thread at the device pixel ratio and keeps its last
-image, re-rendering only the region a pan uncovers or an edit touches; overlays (selection, handles,
-guides, labels) are drawn by egui on top. A seeded random walk checks the retained canvas against
-full renders. Within that region, isolated layers (opacity, blend modes, effects) are rasterised on
-the page's pixel grid and kept between frames (`figcraft_render::layers`), so dragging a few layers
-across a page full of shadows, blurs and glass re-composites the rest instead of drawing it again;
-layers that read the backdrop (glass, background blur) or start from it (masks) are always drawn.
-SVG and PDF export walk the same scene and embed rasters where those formats can't
-express an effect.
+and nothing is uploaded per frame. A node with a single layer blur is drawn into an offscreen
+texture, blurred by the GPU's own box passes (the CPU blur's radii) and composited there too.
+Every other page — other effects, images, masks, outline modes, soft proof — is drawn by the CPU
+renderer and uploaded as before; the choice is made per frame and reported by `ui.inspect`. The
+CPU renderer is the single source of pixels for exports and the browser. The desktop canvas
+renders on a worker thread at the device pixel ratio and keeps its last image, re-rendering only
+the region a pan uncovers or an edit touches; overlays (selection, handles, guides, labels) are
+drawn by egui on top. A seeded random walk checks the retained canvas against full renders.
+Within that region, isolated layers (opacity, blend modes, effects) are rasterised on the page's
+pixel grid and kept between frames (`figcraft_render::layers`), so dragging a few layers across a
+page full of shadows, blurs and glass re-composites the rest instead of drawing it again; layers
+that read the backdrop (glass, background blur) or start from it (masks) are always drawn. SVG and
+PDF export walk the same scene and embed rasters where those formats can't express an effect.
 
 ## File I/O
 

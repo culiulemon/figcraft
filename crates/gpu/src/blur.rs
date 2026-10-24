@@ -7,7 +7,8 @@ use wgpu::{
     BufferUsages, ColorTargetState, ColorWrites, CommandEncoderDescriptor, Device, Extent3d, FragmentState, LoadOp, Operations,
     PipelineCompilationOptions, PipelineLayoutDescriptor, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline,
     RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, TexelCopyBufferInfo, TexelCopyBufferLayout,
-    TexelCopyTextureInfo, Texture, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor, VertexState,
+    TexelCopyTextureInfo, Texture, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
+    VertexState,
 };
 
 /// Blurs smaller than this many bytes stay on the CPU (a read-back costs more than they save).
@@ -77,6 +78,77 @@ impl Blur {
         });
         Some(Self { pipeline, layout })
     }
+}
+
+/// Blur the pixels of `src` into a new texture, the same three box passes as [`blur`] (`None`
+/// when the device can't): the result never leaves the GPU.
+pub(crate) fn blur_texture(device: &Device, queue: &Queue, blur: &Blur, src: &TextureView, (w, h): (u32, u32), sigma: f64) -> Option<Texture> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let size = Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+    let make = |label: &str| {
+        device.create_texture(&TextureDescriptor {
+            label: Some(label),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_DST | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
+    };
+    let mut current = make("figcraft layer blur a");
+    let mut other = make("figcraft layer blur b");
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("figcraft layer blur") });
+    let mut first = true;
+    for r in figcraft_render::fx::box_radii(sigma) {
+        for vertical in [false, true] {
+            let mut params = [0u8; 16];
+            params[0..4].copy_from_slice(&(r as u32).to_le_bytes());
+            params[4..8].copy_from_slice(&u32::from(vertical).to_le_bytes());
+            let uniform = device.create_buffer(&BufferDescriptor {
+                label: Some("figcraft blur params"),
+                size: 16,
+                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&uniform, 0, &params);
+            let read = if first { src.clone() } else { current.create_view(&TextureViewDescriptor::default()) };
+            let bind = device.create_bind_group(&BindGroupDescriptor {
+                label: Some("figcraft layer blur"),
+                layout: &blur.layout,
+                entries: &[
+                    BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&read) },
+                    BindGroupEntry { binding: 1, resource: uniform.as_entire_binding() },
+                ],
+            });
+            let target = other.create_view(&TextureViewDescriptor::default());
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("figcraft layer blur"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &target,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Clear(wgpu::Color::TRANSPARENT), store: StoreOp::Store },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&blur.pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.draw(0..3, 0..1);
+            drop(pass);
+            std::mem::swap(&mut current, &mut other);
+            first = false;
+        }
+    }
+    queue.submit([encoder.finish()]);
+    // After the last pass the freshly written texture is `current`.
+    Some(current)
 }
 
 /// Blur `p` in place on the GPU; false when the device can't (the CPU blurs it instead).

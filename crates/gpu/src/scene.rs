@@ -12,7 +12,10 @@ use figcraft_render::{FillRule, View, node_outline};
 use vello::Scene;
 use vello::kurbo::{Affine as KAffine, Point, Rect as KRect, Stroke};
 use vello::peniko::color::DynamicColor;
-use vello::peniko::{BlendMode as PBlend, Brush, Color as PColor, ColorStop, ColorStops, Compose, Extend, Fill, Gradient as PGradient, Mix};
+use vello::peniko::{
+    BlendMode as PBlend, Brush, Color as PColor, ColorStop, ColorStops, Compose, Extend, Fill, Gradient as PGradient, ImageBrush, ImageData,
+    ImageQuality, ImageSampler, Mix,
+};
 
 /// Why a page can't be drawn on the GPU yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,16 +59,49 @@ pub fn background(doc: &Document, page: NodeId) -> Color {
     }
 }
 
+/// Where a node's effect layer goes: the GPU renders it offscreen and blurs it without leaving the
+/// device (see `crate::canvas::GpuLayers`). [`supported`] accepts such layers without drawing them.
+pub trait Layers {
+    /// A blurred `width` × `height` layer of `scene` (device pixels, transparent ground).
+    fn blurred(&mut self, scene: &Scene, width: u32, height: u32, sigma: f64) -> Option<ImageData>;
+}
+
+/// Accepts effect layers without drawing them (the feature check).
+struct Probe;
+
+impl Layers for Probe {
+    fn blurred(&mut self, _scene: &Scene, width: u32, height: u32, _sigma: f64) -> Option<ImageData> {
+        Some(crate::canvas::blank_image(width, height))
+    }
+}
+
+/// Refuses effect layers: a build without a device.
+pub struct NoLayers;
+
+impl Layers for NoLayers {
+    fn blurred(&mut self, _scene: &Scene, _width: u32, _height: u32, _sigma: f64) -> Option<ImageData> {
+        None
+    }
+}
+
 /// Whether `page` can be drawn on the GPU at all: `Ok` when every visible layer is in the
 /// builder's feature set, else the first reason it isn't.
 pub fn supported(doc: &Document, page: NodeId) -> Result<(), Unsupported> {
-    let mut b = Builder { doc, scene: None };
+    let mut probe = Probe;
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: 1, height: 1 };
+    let mut b = Builder { doc, scene: None, layers: &mut probe, view };
     b.children(page, Affine::IDENTITY, 0)
 }
 
-/// Draw page `page` of `doc` as seen through `view` into a vello scene.
+/// Draw page `page` of `doc` as seen through `view` into a vello scene (no effect layers).
 pub fn build(doc: &Document, page: NodeId, view: &View) -> Result<Scene, Unsupported> {
-    let mut b = Builder { doc, scene: Some(Scene::new()) };
+    build_with(doc, page, view, &mut NoLayers)
+}
+
+/// Draw page `page` of `doc` as seen through `view` into a vello scene, drawing effect layers
+/// through `layers` (the GPU canvas).
+pub fn build_with(doc: &Document, page: NodeId, view: &View, layers: &mut dyn Layers) -> Result<Scene, Unsupported> {
+    let mut b = Builder { doc, scene: Some(Scene::new()), layers, view: view.clone() };
     let xf = view.transform();
     let Some(p) = doc.node(page) else { return Ok(Scene::new()) };
     for c in &p.children {
@@ -78,6 +114,29 @@ struct Builder<'a> {
     doc: &'a Document,
     /// `None` while only checking whether the page is supported.
     scene: Option<Scene>,
+    layers: &'a mut dyn Layers,
+    view: View,
+}
+
+/// What a node's visible effects need of the GPU, if anything.
+enum Effects {
+    None,
+    /// One layer blur: its radius in document units.
+    LayerBlur(f64),
+    /// Anything else (shadows, backdrop blurs, glass, grain, several effects).
+    Other,
+}
+
+fn effects_of(n: &Node) -> Effects {
+    let mut visible = n.effects.iter().filter(|e| e.visible);
+    let Some(e) = visible.next() else { return Effects::None };
+    if visible.next().is_some() {
+        return Effects::Other;
+    }
+    match &e.kind {
+        figcraft_doc::EffectKind::LayerBlur(b) if !b.is_progressive() => Effects::LayerBlur(b.sanitized().radius),
+        _ => Effects::Other,
+    }
 }
 
 impl Builder<'_> {
@@ -100,8 +159,10 @@ impl Builder<'_> {
         if n.is_mask {
             return Err(Unsupported::Mask);
         }
-        if n.effects.iter().any(|e| e.visible) {
-            return Err(Unsupported::Effect);
+        match effects_of(n) {
+            Effects::None => {}
+            Effects::LayerBlur(radius) => return self.blurred_layer(n, parent_xf, depth, radius),
+            Effects::Other => return Err(Unsupported::Effect),
         }
         // vello has no plus-darker composition: the CPU draws it.
         if n.blend == BlendMode::PlusDarker {
@@ -113,6 +174,51 @@ impl Builder<'_> {
             self.push_layer(n);
         }
         self.content(n, xf, depth)?;
+        if isolated && let Some(s) = &mut self.scene {
+            s.pop_layer();
+        }
+        Ok(())
+    }
+
+    /// A node with one layer blur: its content is drawn into a layer of its own, blurred on the
+    /// GPU, and composited with its opacity and blend mode (as the CPU renderer isolates it).
+    fn blurred_layer(&mut self, n: &Node, _parent_xf: Affine, depth: usize, radius: f64) -> Result<(), Unsupported> {
+        if n.blend == BlendMode::PlusDarker {
+            return Err(Unsupported::Structure);
+        }
+        let Some(bounds) = figcraft_render::paint_bounds(self.doc, n.id) else { return Ok(()) };
+        let view = self.view.clone();
+        let scale = view.scale.max(1e-9);
+        let (x0f, y0f) = ((bounds.x0 - view.origin.0) * view.scale, (bounds.y0 - view.origin.1) * view.scale);
+        let (x1f, y1f) = ((bounds.x1 - view.origin.0) * view.scale, (bounds.y1 - view.origin.1) * view.scale);
+        if !(x0f.is_finite() && y0f.is_finite() && x1f.is_finite() && y1f.is_finite()) {
+            return Err(Unsupported::Structure);
+        }
+        let (x0, y0) = (x0f.floor(), y0f.floor());
+        let (w, h) = ((x1f.ceil() - x0).max(1.0), (y1f.ceil() - y0).max(1.0));
+        // A layer this big is cheaper (and exact) on the CPU.
+        const MAX_LAYER: f64 = 8_192.0;
+        if w > MAX_LAYER || h > MAX_LAYER {
+            return Err(Unsupported::Effect);
+        }
+        let (w, h) = (w as u32, h as u32);
+        let layer = View { origin: (view.origin.0 + x0 / scale, view.origin.1 + y0 / scale), scale: view.scale, width: w, height: h };
+        let parent = n.parent.map(|p| self.doc.world_transform(p)).unwrap_or(Affine::IDENTITY);
+        let mut sub = Builder { doc: self.doc, scene: Some(Scene::new()), layers: &mut *self.layers, view: layer.clone() };
+        // The content only: its opacity and blend mode apply to the blurred result, not inside it.
+        sub.content(n, layer.transform() * parent * n.transform, depth)?;
+        let sub_scene = sub.scene.take().ok_or(Unsupported::Structure)?;
+        drop(sub);
+        let sigma = radius / 2.0 * view.scale;
+        let Some(image) = self.layers.blurred(&sub_scene, w, h, sigma) else { return Err(Unsupported::Effect) };
+        let isolated = n.opacity < 1.0 || !matches!(n.blend, BlendMode::PassThrough | BlendMode::Normal);
+        if isolated {
+            self.push_layer(n);
+        }
+        let sampler = ImageSampler { x_extend: Extend::Pad, y_extend: Extend::Pad, quality: ImageQuality::Low, alpha: 1.0 };
+        if let Some(s) = &mut self.scene {
+            s.draw_image(ImageBrush { image: &image, sampler }, KAffine::translate((x0, y0)));
+        }
         if isolated && let Some(s) = &mut self.scene {
             s.pop_layer();
         }

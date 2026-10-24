@@ -6,8 +6,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use figcraft_doc::{Document, NodeId};
 use figcraft_render::{Pixmap, View};
+use vello::peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
 use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene};
 use wgpu::{Device, Queue, Texture, TextureFormat, TextureUsages, TextureView};
+
+use crate::blur::Blur;
 
 /// vello draws into `Rgba8Unorm` (premultiplied, sRGB-encoded bytes) — what tiny-skia's pixmap
 /// holds, and what egui can show without a conversion.
@@ -16,6 +19,8 @@ pub const FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;
 /// A canvas-sized vello target on the window's device.
 pub struct CanvasGpu {
     renderer: Renderer,
+    /// The layer blur (the effects' own pipeline default).
+    blur: Blur,
     targets: [Target; 2],
     /// The target the next frame is drawn into.
     next: usize,
@@ -48,7 +53,8 @@ impl CanvasGpu {
             },
         )
         .ok()?;
-        Some(Self { renderer, targets: [target(device, width, height), target(device, width, height)], next: 0, last: 0, generation: 1 })
+        let blur = Blur::new(device)?;
+        Some(Self { renderer, blur, targets: [target(device, width, height), target(device, width, height)], next: 0, last: 0, generation: 1 })
     }
 
     /// The size in device pixels.
@@ -108,6 +114,56 @@ impl CanvasGpu {
     pub fn read(&self, device: &Device, queue: &Queue) -> Option<Pixmap> {
         let target = self.targets.get(self.last)?;
         read(device, queue, &target.texture, target.size)
+    }
+
+    /// Draw `scene` into a new, transparent `width` × `height` texture (an effect layer).
+    pub(crate) fn render_layer(&mut self, device: &Device, queue: &Queue, scene: &Scene, width: u32, height: u32) -> Option<Texture> {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("figcraft layer"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: FORMAT,
+            usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_SRC | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let params = RenderParams { base_color: vello::peniko::Color::new([0.0; 4]), width, height, antialiasing_method: AaConfig::Area };
+        self.renderer.render_to_texture(device, queue, scene, &view, &params).ok()?;
+        Some(texture)
+    }
+
+    /// Hand `texture` to vello as an image (copied into its atlas before the next render).
+    pub(crate) fn register_layer(&mut self, texture: Texture) -> ImageData {
+        let data = blank_image(texture.width(), texture.height());
+        let _ = self.renderer.override_image(
+            &data,
+            Some(wgpu::TexelCopyTextureInfoBase { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All }),
+        );
+        data
+    }
+}
+
+/// An image with no bytes of its own: vello reads a registered texture instead.
+pub(crate) fn blank_image(width: u32, height: u32) -> ImageData {
+    ImageData { data: Blob::new(std::sync::Arc::new(&[])), format: ImageFormat::Rgba8, alpha_type: ImageAlphaType::AlphaPremultiplied, width, height }
+}
+
+/// The GPU's effect layers: a node's content rendered offscreen and blurred without leaving the
+/// device (see [`crate::scene::Layers`]).
+pub(crate) struct GpuLayers<'a> {
+    pub canvas: &'a mut CanvasGpu,
+    pub device: &'a Device,
+    pub queue: &'a Queue,
+}
+
+impl crate::scene::Layers for GpuLayers<'_> {
+    fn blurred(&mut self, scene: &Scene, width: u32, height: u32, sigma: f64) -> Option<ImageData> {
+        let texture = self.canvas.render_layer(self.device, self.queue, scene, width, height)?;
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let blurred = crate::blur::blur_texture(self.device, self.queue, &self.canvas.blur, &view, (width, height), sigma)?;
+        Some(self.canvas.register_layer(blurred))
     }
 }
 
@@ -231,10 +287,6 @@ fn refusal(reason: &'static str) -> Option<Frame> {
 /// feature set (see [`crate::scene::supported`]); `None` leaves the frame to the CPU renderer.
 pub fn present(doc: &Document, page: NodeId, view: &View) -> Option<Frame> {
     let Some(backend) = backend() else { return refusal("not installed") };
-    let scene = match crate::scene::build(doc, page, view) {
-        Ok(s) => s,
-        Err(e) => return refusal(e.reason()),
-    };
     let background = crate::scene::background(doc, page);
     let Ok(mut slot) = backend.canvas.lock() else { return refusal("canvas is busy") };
     if slot.is_none() {
@@ -245,6 +297,14 @@ pub fn present(doc: &Document, page: NodeId, view: &View) -> Option<Frame> {
     }
     let Some(canvas) = slot.as_mut() else { return refusal("the GPU can't run the rasterizer") };
     canvas.resize(&backend.device, view.width, view.height);
+    // Effect layers are drawn and blurred on the device while the scene is built.
+    let scene = {
+        let mut layers = GpuLayers { canvas, device: &backend.device, queue: &backend.queue };
+        match crate::scene::build_with(doc, page, view, &mut layers) {
+            Ok(scene) => scene,
+            Err(e) => return refusal(e.reason()),
+        }
+    };
     let Some(texture) = canvas.render(&backend.device, &backend.queue, &scene, background) else {
         return refusal("draw failed");
     };

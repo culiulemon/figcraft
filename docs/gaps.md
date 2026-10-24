@@ -20,7 +20,7 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
 | 4 | Interaction fidelity not compared tool by tool | UI/UX | 40–60 | [ui-parity](ui-parity.md) |
 | 5 | Localization: English, reviewed Russian, plus unreviewed Spanish (and Latin American Spanish), French, German, Brazilian Portuguese, Japanese, Korean, Simplified Chinese, Indonesian and Czech drafts; Turkish and Swedish catalogs | Localization | 29–51 | [localization-parity](localization-parity.md) |
 | 6 | Plugins: widgets take clicks only, a self-hosted directory but no public catalogue; Figma's plugins don't run | Ecosystem | 8–26 | [target-app-parity](target-app-parity.md) |
-| 7 | CPU canvas where Figma uses the GPU: blurs and glass run on the window's GPU, isolated layers are kept between frames, and the canvas now draws pages of shapes, text and gradients with vello straight into an egui texture (2026-10-24: 1.1–1.7 ms a frame where the CPU takes 5.4–6.7 ms); effects, images and masks still fall back to tiny-skia, so a drag across a page of effects is 12–15 ms a frame where Figma keeps its layers on the GPU | Hardware/performance | 25–50 | [hardware-parity](hardware-parity.md), [gpu-rasterizer](gpu-rasterizer.md) |
+| 7 | CPU canvas where Figma uses the GPU: blurs and glass run on the window's GPU, isolated layers are kept between frames, and the canvas draws pages of shapes, text and gradients with vello straight into an egui texture — a single layer blur included, drawn and blurred on the device (2026-10-24: plain pages 1.1–1.7 ms a frame where the CPU takes 5.4–6.7 ms; a blurred card 3–4 ms where the CPU takes 6.6 ms); shadows, backdrop blurs, glass and masks still fall back to tiny-skia, so a drag across a page of effects is 12–15 ms a frame where Figma keeps its layers on the GPU | Hardware/performance | 25–50 | [hardware-parity](hardware-parity.md), [gpu-rasterizer](gpu-rasterizer.md) |
 | 8 | Platform QA: Linux and the browser left (Windows pass done 2026-10-11) | Stability/platforms | 10–20 | [hardware-parity](hardware-parity.md) |
 | 9 | Figma Draw: pen pressure on macOS/Linux tablets (multi-edit, brushes, pressure, text on a path and pattern fills landed) | Feature | 1–3 | [target-app-parity](target-app-parity.md) |
 | 10 | Team libraries: no team-wide lists or accounts; analytics are counts | Feature | 4–8 | [components-parity](components-parity.md) |
@@ -248,8 +248,11 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
   edges. The canvas now draws those pages on the GPU and everything else on the CPU, per frame
   (`canvas.rasterizer` and `canvas.gpuRefusal` in `ui.inspect` say which and why): 60 plain
   rectangles at a 1200 × 900 canvas cost 1.1–1.7 ms a frame on the GPU against 5.4–6.7 ms on the
-  CPU. Effects, images, masks and some stroke/text shapes are still refused and stay on the CPU:
-  [`gpu-rasterizer.md`](gpu-rasterizer.md).
+  CPU. A single layer blur now stays there too: the node is drawn into an offscreen texture, the
+  GPU's box passes blur it (the CPU blur's radii) and it is composited with the node's opacity and
+  blend — parity mean 0.047/255 — at 3–4 ms a frame against 6.6 ms on the CPU. Shadows, backdrop
+  blurs, glass, inner shadows, grain, images, masks and some stroke/text shapes are still refused
+  and stay on the CPU: [`gpu-rasterizer.md`](gpu-rasterizer.md).
 - **Evidence (measured, `cargo xtask bench`):** a 50k-layer page ~8 ms zoomed out with levels of
   detail, single-layer edits at 10k layers ~0.2 ms; full 1440×900 renders 7–15 ms at 10k layers.
   Heavy effects (glass, background blur, noise) and 4K/5K canvases at 2x are where CPU time grows.

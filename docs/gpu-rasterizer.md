@@ -97,11 +97,15 @@ the CPU render within the parity tolerance; toggling the setting changes nothing
 
 ### P3 — effects on the GPU
 
-- Drop shadows, layer blur, background blur, glass and grain as GPU passes on the offscreen
+- Landed: **layer blur**. A node with one non-progressive layer blur is drawn into its own
+  offscreen texture, blurred by the same three box passes as the CPU renderer (on the GPU), and
+  composited with the node's opacity and blend mode; the pixels never leave the device. Parity
+  (`the_gpu_layer_blur_matches_the_cpu_render`): mean channel difference 0.047/255, worst 33 on a
+  blurred antialiased edge.
+- Next: drop and inner shadows, background blur, glass and grain as passes on the offscreen
   layer, reusing the existing compute pipelines in `figcraft-gpu` and adding what vello lacks
-  (vello has only a blurred rounded rect, not a general filter).
-- The CPU effect code stays the reference: each pass is compared to it in a test before the
-  effect is removed from the fallback list.
+  (vello has only a blurred rounded rect, not a general filter). Each pass is compared to the
+  CPU's before the effect leaves the fallback list.
 
 Exit: the 30-shadow + 3-glass + 2-blur page renders entirely on the GPU, and its drag frame at
 2400 × 1600 stays at or under the 10–13 ms the CPU path reaches with the layer cache, at
@@ -186,5 +190,16 @@ stays on the fallback list.
     idle gap are the GPU waking up, not scene cost.
   - Zooming (new texture sizes, re-registration), selection overlays and `ui.screenshot` verified
     in the running app; 645 UI tests, the GPU tests and clippy pass.
-- Next: P3 (effects as GPU passes), which is what makes the shadow/glass/blur page — the one that
-  still costs 12–15 ms — run on the GPU.
+- 2026-10-24: **P3 slice 1 landed** — layer blur on the GPU. A page whose only effect is one layer
+  blur now stays on the GPU: its layer is drawn into an offscreen texture, blurred by the same
+  box passes as the CPU, and composited, all on the device.
+  - In the app, a 36-rectangle page with one blurred card (radius 20) holds 2.5–4.9 ms a frame
+    over 20 drag steps (median ~3.5 ms, occasional GPU wake-ups) where the same page with the
+    blur plus a shadow — which still falls back — takes 6.6 ms on the CPU.
+  - In isolation (release, 1200 × 900): 1.31 ms a frame against the CPU's 3.33 ms
+    (`layer_blur_timings`). The gap to the in-app number is the window's own rendering and the
+    control-channel round trips between steps.
+  - Shadows, background blur, glass, inner shadows and grain still put the page on the CPU, and a
+    node with a blur *and* another effect does too (the CPU applies them in order).
+- Next: P3's other effects (shadows, backdrop blurs, glass, grain), which is what makes the
+  shadow/glass/blur page — the one that still costs 12–15 ms — run entirely on the GPU.

@@ -165,11 +165,58 @@ fn unsupported_pages_are_refused() {
     let id = d.node(p).and_then(|n| n.children.first().copied()).unwrap();
     d.get_mut(id).unwrap().effects = vec![Effect::drop_shadow()];
     assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Effect));
+    // One layer blur is drawn on the GPU (its own layer, blurred there).
+    d.get_mut(id).unwrap().effects = vec![Effect::layer_blur()];
+    assert_eq!(scene::supported(&d, p), Ok(()));
+    // A shadow and a blur together are the CPU renderer's (its order matters).
+    d.get_mut(id).unwrap().effects = vec![Effect::drop_shadow(), Effect::layer_blur()];
+    assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Effect));
     d.get_mut(id).unwrap().effects.clear();
 
     // An image fill needs the renderer's texture atlas.
     d.get_mut(id).unwrap().fills = vec![Paint::image("hash", figcraft_color::ImageScaleMode::Fill)];
     assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Paint));
+}
+
+/// Two cards, the upper one rounded and blurred as a layer.
+fn blurred_doc() -> Document {
+    let mut d = Document::new("gpu layer blur");
+    let p = d.first_page().unwrap();
+    let under = d.create(p, NodeKind::Rectangle, "under", 120.0, 60.0, 220.0, 160.0).unwrap();
+    d.get_mut(under).unwrap().fills = vec![Paint::solid(Color::from_hex("2040E0").unwrap_or(Color::WHITE))];
+    let card = d.create(p, NodeKind::Rectangle, "blurred", 300.0, 80.0, 200.0, 140.0).unwrap();
+    {
+        let n = d.get_mut(card).unwrap();
+        n.corners.radii = [24.0; 4];
+        n.fills = vec![Paint::solid(Color::from_hex("E03030").unwrap_or(Color::WHITE))];
+        n.effects = vec![Effect::layer_blur()];
+    }
+    d
+}
+
+#[test]
+fn the_gpu_layer_blur_matches_the_cpu_render() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let d = blurred_doc();
+    let p = d.first_page().unwrap();
+    let (w, h) = PARITY;
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+    let cpu = render_view(&d, p, &view, &Options::default()).unwrap();
+    let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+    let built = {
+        let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+        scene::build_with(&d, p, &view, &mut layers)
+    };
+    let built = built.expect("the GPU draws a layer blur");
+    assert!(canvas.render(&device, &queue, &built, scene::background(&d, p)).is_some());
+    let gpu = canvas.read(&device, &queue).unwrap();
+    let (worst, mean, at, over) = diff(&cpu, &gpu);
+    println!("layer blur parity: worst {worst} at {at:?}, mean {mean:.3}, {over} pixels differ by more than 8");
+    assert!(worst <= 128, "a channel differs by {worst} (mean {mean:.3})");
+    assert!(mean <= 2.0, "the mean difference is {mean:.3}");
 }
 
 #[test]
@@ -229,6 +276,52 @@ fn frame_ms(mut f: impl FnMut() -> bool, n: u32) -> f64 {
         assert!(f());
     }
     t.elapsed().as_secs_f64() * 1000.0 / f64::from(n)
+}
+
+#[test]
+#[ignore = "timing: run in release with --ignored --nocapture"]
+fn layer_blur_timings() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let d = blurred_doc();
+    let p = d.first_page().unwrap();
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: 1200, height: 900 };
+    let mut canvas = CanvasGpu::new(&device, view.width, view.height).unwrap();
+    let _ = render_view(&d, p, &view, &Options::default());
+    let cpu = frame_ms(|| render_view(&d, p, &view, &Options::default()).is_some(), 5);
+    // Warm-up: pipelines, atlas.
+    for _ in 0..2 {
+        let built = {
+            let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+            scene::build_with(&d, p, &view, &mut layers)
+        }
+        .unwrap();
+        let _ = canvas.render(&device, &queue, &built, scene::background(&d, p));
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    }
+    let build = frame_ms(
+        || {
+            let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+            scene::build_with(&d, p, &view, &mut layers).is_ok()
+        },
+        5,
+    );
+    let frame = frame_ms(
+        || {
+            let built = {
+                let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+                scene::build_with(&d, p, &view, &mut layers)
+            }
+            .unwrap();
+            let ok = canvas.render(&device, &queue, &built, scene::background(&d, p)).is_some();
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            ok
+        },
+        5,
+    );
+    println!("layer blur, 1200 × 900: CPU {cpu:.2} ms | GPU build {build:.2} ms, frame {frame:.2} ms");
 }
 
 #[test]
