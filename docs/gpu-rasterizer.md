@@ -267,28 +267,59 @@ and pattern fills draws on the GPU within the page tolerance. **Met.**
 
 ### P6 — any-outline shadows, inner shadows
 
-A shadow or an inner shadow cast by anything that is not one rounded rectangle still sends the page
+A shadow or an inner shadow cast by anything that is not one rounded rectangle still sent the page
 to the CPU: an ellipse, a star or vector, text, a card with per-corner radii, a group. The CPU draws
 these from the layer's pixels (or the paints' outline) with the box blur; on the GPU they need one
 offscreen layer per such node:
 
-- **Outline silhouette** (one outline: ellipse, vector, boolean, text, per-corner rect): draw the
-  outline into a layer with the shadow colour (plus a mitred stroke of twice the spread to dilate
-  it), blur it with the GPU's box passes, and draw it under the node clipped outside the paints'
-  cover — the same arithmetic as the rounded-rect fast path, one layer instead of one draw.
-- **Pixels silhouette** (a group, a frame whose children reach past it): the node's content into a
-  layer, dilated by the spread (`fx::morph`'s square kernel as a separable max filter), blurred,
-  tinted, drawn under it.
-- **Inner shadow**: the shape's coverage inverted at the shadow's offset (dilated/shrunk by the
-  spread), blurred, tinted and clipped to the shape; for a group, from its pixels' cover.
-- `Layers` grows one method (`shadow`/`inner_shadow`) returning the image; the builder draws it and
-  the node's own content over it, in the CPU's order (inner shadows over the fills, under children
-  and strokes; drop shadows under everything).
+**Landed.** The builder classifies a node's effects: drop shadows it can draw straight into the
+scene stay the fast path (P3); every other drop shadow — and every inner shadow — is one layer the
+GPU renders, blurs with the same three box passes as the CPU, and tints (`shadow.wgsl`, in
+`crates/gpu/src/shadow.rs`):
 
-Tests: parity for an ellipse, a star, a vector, text, a per-corner card, a group and a frame with
-overflowing children; each with and without spread; an inner shadow on a card and on a group.
-Timing: 30 such cards must stay under ~10 ms at 2400 × 1600 (they cost one layer each, like a layer
-blur). Exit: no shadow of any kind falls back.
+- **Silhouette** (spread, and the node's paints are one outline: ellipse, star, polygon, vector,
+  boolean, text, per-corner rect): the outline in white, grown by the spread (a mitred band of twice
+  the spread, as the renderer's `spread_alpha`) or shrunk (the band cut out with a `DestOut` layer),
+  offset by the shadow's device offset; blurred, tinted, drawn under the node and clipped outside the
+  paints' cover — the CPU's `mask_by(cover, inverted)`.
+- **Pixels** (a group, a frame whose children reach past it, a spreading shadow with no single
+  outline, a translucent fill beside a stroke, a fill whose alpha varies): the node's own content
+  into a layer, its alpha grown or shrunk by `whole_px(spread)` with a square kernel (`fx::morph`,
+  as two passes of a max/min filter), offset by whole pixels, blurred and tinted. The shadow is
+  drawn under the content, which hides it exactly where the content does — the CPU masks it by the
+  layer's alpha, and `content over shadow·(1−a)` is the same arithmetic.
+- **Inner shadow**: the shape at the shadow's offset in a buffer padded by its reach, shrunk by the
+  spread (a `DestOut` cut plus the band painted back), inverted (white outside the shape), blurred,
+  tinted, and drawn clipped to the shape — over the fills, under the children and strokes, where the
+  CPU puts it.
+- A shadow keeps its own blend mode (a layer), its `showBehind` (no cover clip) and the node's
+  opacity (baked into the tint's colour alpha), and is cut to the node's paint bounds, as the CPU
+  crops it to the layer. The layer rectangle is the renderer's own (`figcraft_render::layer_bounds`:
+  the paint bounds *without* the effects' margin), because that crop is visible: a frame whose child
+  reaches past it casts a shadow that stops at the child, exactly as the CPU's does.
+- **Kept between frames.** A shadow is a function of the node, its subtree, the view and the zoom —
+  and a node is a shared `Arc`, so an edit is a new address — so the canvas keys its pixels on
+  exactly that (`(u64, u64)`, the renderer's `layers::subtree` idea, plus the document's page ids and
+  node count so another file can't match) and keeps up to 64 MB of them. A drag then rebuilds one
+  shadow and draws the rest as they are: the second frame of `the_gpu_draws_shadows_of_any_shape`
+  is pixel-identical to the first with 10 of its 10 shadows kept, and editing one node adds exactly
+  one new shadow.
+
+Still on the CPU: a group's inner shadow (cast from its pixels, not one outline — it needs the
+pixel-masked pass P7's combination work brings), and a node with a shadow *and* another effect (the
+CPU's order).
+
+Tests: parity for an ellipse, a star, a polygon, a per-corner card, text, a group and a frame with
+overflowing children; each with and without spread; an inner shadow on a card, on a per-corner card
+and on an ellipse (`the_gpu_draws_shadows_of_any_shape`): mean 0.066/255, worst 50 on antialiased
+shape edges, 0.28% of pixels off by more than 8.
+Timing (`shadow_layer_timings`, release, 30 cards): from 1.2 ms to 2.4 ms a frame at 904 × 860 and
+2400 × 1600 once the shadows are kept, against the CPU's 17–43 ms. The *first* frame makes all
+thirty — one vello layer, a blur and a tint each — and costs 90–170 ms, which is the one-off the
+cache pays for; fusing those passes into one submission is P11 work.
+Exit: no shadow of any kind falls back — **met for every drop shadow and every inner shadow on a
+shape**; a group's inner shadow is the remaining one.
+
 
 ### P7 — effect combinations, grain, progressive blur
 
@@ -378,6 +409,7 @@ Run in `cargo xtask ci` unless marked *timing* (release, `--ignored --nocapture`
 | 1c | `the_gpu_layer_blur_matches_the_cpu_render`, `the_gpu_drop_shadow_matches_the_cpu_render`, `the_gpu_draws_the_shadow_variations` | effects: mean 0.011, 0.044 and 0.512/255 (the last with spread, two shadows, a stroke, a gradient card, a clipped frame and a rotation) |
 | 1d | `the_segmented_page_matches_the_cpu_with_one_glass_pane`, `..._one_background_blur`, `the_gpu_page_matches_with_several_backdrop_layers` | backdrop effects in the accumulated renderer: mean 0.061, 0.049 and 0.725/255 |
 | 1e | `the_gpu_draws_the_paint_variations` | paints: a photo 1:1, fitted, cropped, tiled, rotated, filtered and translucent, a pattern fill, a diamond gradient, multiplied and screened paints (mean 0.066/255, worst 10) |
+| 1f | `the_gpu_draws_shadows_of_any_shape` | shadows of any shape: an ellipse, a star, a polygon, a per-corner card, text, a group, a frame with an overflowing child, inner shadows — with and without spread, and kept between frames (mean 0.066/255, worst 50) |
 | 2 | `unsupported_pages_fall_back` | the predicate rejects exactly the features not yet ported |
 | 3 | `the_gpu_canvas_reads_back` | screenshot/export path: texture → `Pixmap`, premultiplied, same size |
 | 4 | *timing* `canvas_frame_timings`, `segmented_timings` | CPU vs GPU frame at 2320 × 1440 (plain and heavy) and 2400 × 1600 (backdrop pages) |
@@ -513,4 +545,19 @@ stays on the fallback list.
     than 8 — the bilinear (vello) against bicubic (tiny-skia) difference on a 2× downscaled photo.
   - Animated GIF pages stay on the CPU (the canvas refuses them in `present`, before any work).
   - `PlusDarker` paints and skewed linear gradients still fall back, with a test each.
+- 2026-10-25: **P6 landed — shadows of any shape, and inner shadows.** A drop shadow the rounded-rect
+  fast path can't draw is now a layer the GPU renders, blurs (the CPU's own three box passes) and
+  tints: a node's silhouette grown or shrunk by the spread, or its own pixels grown by `fx::morph`.
+  Inner shadows are the shape's outside at the offset in a padded buffer, cut out with a `DestOut`
+  layer, blurred and clipped to the shape, between the fills and the children.
+  - `the_gpu_draws_shadows_of_any_shape`: an ellipse, a star, a polygon, a per-corner card, text, a
+    group, a frame with an overflowing child, and inner shadows on a card, a per-corner card and an
+    ellipse — mean 0.066/255, worst 50 on antialiased edges, 0.28% of pixels off by more than 8.
+  - The layer rectangle is `figcraft_render::layer_bounds` (the renderer's own, without the effects'
+    margin): the crop is visible on a frame whose child reaches past it, and the GPU now stops the
+    shadow where the CPU does.
+  - **Kept between frames**: keyed on the node's `Arc` subtree, the view and the zoom (plus the
+    document's ids), so a drag rebuilds one shadow and redraws the rest. 30 shadow-layer cards:
+    **1.2–2.4 ms** a frame where the CPU takes 17–43; the first frame (all thirty, and the new
+    pipelines compiled) 90–170 ms.
 

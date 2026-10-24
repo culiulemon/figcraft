@@ -171,13 +171,13 @@ fn unsupported_pages_are_refused() {
     let opaque = d.node(id).and_then(|n| n.fills.first().cloned()).unwrap();
     d.get_mut(id).unwrap().fills[0].opacity = 0.5;
     assert_eq!(scene::supported(&d, p), Ok(()));
-    // Not beside a stroke: the opaque band casts a stronger shadow than the fill does.
+    // Beside a stroke of its own the card's shadow is cast from its pixels, one layer.
     d.get_mut(id).unwrap().strokes = vec![Paint::solid(Color::WHITE)];
     d.get_mut(id).unwrap().stroke.weight = 4.0;
-    assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Effect));
+    assert_eq!(scene::supported(&d, p), Ok(()));
     d.get_mut(id).unwrap().strokes.clear();
     d.get_mut(id).unwrap().stroke.weight = 0.0;
-    // Nor when the fill fades: its alpha isn't one value, so the shadow's strength isn't either.
+    // Nor when the fill fades: the shadow is cast from the card's own pixels.
     d.get_mut(id).unwrap().fills = vec![Paint::gradient(Gradient {
         kind: GradientKind::Linear,
         stops: vec![
@@ -188,7 +188,7 @@ fn unsupported_pages_are_refused() {
         to: (1.0, 0.5),
         width: (0.0, 1.0),
     })];
-    assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Effect));
+    assert_eq!(scene::supported(&d, p), Ok(()));
     d.get_mut(id).unwrap().fills[0] = opaque;
     // A shadow that spreads grows the card's own silhouette; one that shows behind is hidden by an
     // opaque card either way; one with a blend mode composites as a layer. None needs a layer.
@@ -225,20 +225,20 @@ fn unsupported_pages_are_refused() {
     d.get_mut(id).unwrap().fills = vec![Paint::gradient(g)];
     assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Paint));
     d.get_mut(id).unwrap().fills = vec![solid];
-    // An opaque stroke grows the silhouette; a translucent one would let the shadow through it.
+    // An opaque stroke grows the silhouette; a translucent one is cast from the card's pixels.
     d.get_mut(id).unwrap().strokes = vec![Paint::solid(Color::WHITE)];
     d.get_mut(id).unwrap().stroke.weight = 4.0;
     d.get_mut(id).unwrap().stroke.align = StrokeAlign::Outside;
     assert_eq!(scene::supported(&d, p), Ok(()), "an outside stroke is the renderer's band");
     d.get_mut(id).unwrap().strokes[0].opacity = 0.5;
-    assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Effect));
+    assert_eq!(scene::supported(&d, p), Ok(()), "a translucent band casts from the pixels");
     d.get_mut(id).unwrap().strokes.clear();
     d.get_mut(id).unwrap().stroke.weight = 0.0;
     d.get_mut(id).unwrap().effects = vec![Effect::drop_shadow()];
     // One layer blur is drawn on the GPU (its own layer, blurred there).
     d.get_mut(id).unwrap().effects = vec![Effect::layer_blur()];
     assert_eq!(scene::supported(&d, p), Ok(()));
-    // A shadow and a blur together are the CPU renderer's (its order matters).
+    // One kind of effect at a time: a shadow alongside a blur is the CPU's order for now.
     d.get_mut(id).unwrap().effects = vec![Effect::drop_shadow(), Effect::layer_blur()];
     assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Effect));
     // A background blur reads what lies under the node: drawn on the GPU from a backdrop render.
@@ -261,6 +261,15 @@ fn unsupported_pages_are_refused() {
     assert_eq!(scene::supported(&d, p), Ok(()));
     d.get_mut(id).unwrap().fills[0].blend = BlendMode::PlusDarker;
     assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Paint));
+    // An inner shadow of a shape is one blurred buffer clipped to it; a group's is the CPU's (it
+    // is cast from the group's pixels).
+    let mut inner = figcraft_doc::Shadow::default();
+    inner.radius = 10.0;
+    d.get_mut(id).unwrap().fills = vec![Paint::solid(Color::WHITE)];
+    d.get_mut(id).unwrap().effects = vec![Effect { kind: EffectKind::InnerShadow(inner), visible: true }];
+    assert_eq!(scene::supported(&d, p), Ok(()));
+    d.get_mut(id).unwrap().kind = NodeKind::Group;
+    assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Effect));
 }
 
 /// Two cards, the upper one rounded and blurred as a layer.
@@ -828,6 +837,358 @@ fn the_gpu_draws_the_paint_variations() {
     );
     assert!(worst <= 128, "a channel differs by {worst} (mean {mean:.3})");
     assert!(mean <= 1.5, "the mean difference is {mean:.3}");
+}
+
+/// Drop shadows of shapes that aren't one rounded rect (an ellipse, a star, a polygon, per-corner
+/// radii, text, a group, a frame whose children reach past it) and inner shadows on shapes.
+fn shadow_shape_doc() -> Document {
+    let mut d = Document::new("gpu shadow shapes");
+    let p = d.first_page().unwrap();
+    let hex = |s: &str| Color::from_hex(s).unwrap_or(Color::WHITE);
+    let shadow = |radius: f64, spread: f64, offset: (f64, f64)| {
+        let mut e = Effect::drop_shadow();
+        if let EffectKind::DropShadow(s) = &mut e.kind {
+            s.radius = radius;
+            s.spread = spread;
+            s.offset = offset;
+        }
+        e
+    };
+    let inner = |radius: f64, spread: f64, offset: (f64, f64)| Effect {
+        kind: EffectKind::InnerShadow(figcraft_doc::Shadow { radius, spread, offset, ..figcraft_doc::Shadow::default() }),
+        visible: true,
+    };
+    let add = |d: &mut Document, kind: NodeKind, name: &str, at: (f64, f64), size: (f64, f64), fill: &str| {
+        let id = d.create(p, kind, name, at.0, at.1, size.0, size.1).unwrap();
+        d.get_mut(id).unwrap().fills = vec![Paint::solid(hex(fill))];
+        id
+    };
+
+    let ellipse = add(&mut d, NodeKind::Ellipse { start: 0.0, sweep: std::f64::consts::TAU, inner: 0.0 }, "ellipse", (20.0, 16.0), (160.0, 120.0), "E03030");
+    d.get_mut(ellipse).unwrap().effects = vec![shadow(12.0, 0.0, (0.0, 6.0))];
+
+    let star = add(&mut d, NodeKind::Star { count: 6, inner_ratio: 0.45 }, "star", (210.0, 16.0), (140.0, 120.0), "2040E0");
+    d.get_mut(star).unwrap().effects = vec![shadow(10.0, 4.0, (4.0, 6.0))];
+
+    let polygon = add(&mut d, NodeKind::Polygon { count: 7 }, "polygon", (380.0, 16.0), (130.0, 120.0), "20C060");
+    d.get_mut(polygon).unwrap().effects = vec![shadow(9.0, -3.0, (3.0, 4.0))];
+
+    let corners = add(&mut d, NodeKind::Rectangle, "per-corner card", (540.0, 16.0), (150.0, 120.0), "F0C830");
+    {
+        let n = d.get_mut(corners).unwrap();
+        n.corners.radii = [0.0, 40.0, 8.0, 30.0];
+        n.effects = vec![shadow(10.0, 0.0, (3.0, 5.0))];
+    }
+
+    let mut td = TextData::new("Shadowed");
+    td.style.font_size = 34.0;
+    let text = d.create(p, NodeKind::Text(td), "text", 20.0, 210.0, 200.0, 60.0).unwrap();
+    d.get_mut(text).unwrap().fills = vec![Paint::solid(hex("303030"))];
+    d.get_mut(text).unwrap().effects = vec![shadow(8.0, 2.0, (2.0, 3.0))];
+
+    // A group: its shadow is cast from its pixels, not one outline.
+    let group = d.create(p, NodeKind::Group, "group", 240.0, 190.0, 150.0, 120.0).unwrap();
+    d.get_mut(group).unwrap().effects = vec![shadow(11.0, 0.0, (2.0, 8.0))];
+    for (name, at, size, colour) in [("a", (0.0, 0.0), (80.0, 70.0), "A040E0"), ("b", (60.0, 45.0), (80.0, 70.0), "20B0D0")] {
+        let c = d.create(group, NodeKind::Rectangle, name, at.0, at.1, size.0, size.1).unwrap();
+        d.get_mut(c).unwrap().fills = vec![Paint::solid(hex(colour))];
+    }
+
+    // A frame whose child reaches past it: also cast from the pixels.
+    let frame = d.create(p, NodeKind::Frame, "overflowing frame", 450.0, 190.0, 160.0, 120.0).unwrap();
+    {
+        let n = d.get_mut(frame).unwrap();
+        n.fills = vec![Paint::solid(hex("FFFFFF"))];
+        n.corners.radii = [18.0; 4];
+        n.clip = false;
+        n.effects = vec![shadow(10.0, 3.0, (2.0, 6.0))];
+    }
+    let reach = d.create(frame, NodeKind::Rectangle, "reaching child", 100.0, 40.0, 120.0, 100.0).unwrap();
+    d.get_mut(reach).unwrap().fills = vec![Paint::solid(hex("F06030"))];
+
+    // Inner shadows: a card, one with a spread, and an ellipse.
+    let inner_card = add(&mut d, NodeKind::Rectangle, "inner card", (20.0, 380.0), (150.0, 120.0), "F0F0F0");
+    {
+        let n = d.get_mut(inner_card).unwrap();
+        n.corners.radii = [24.0; 4];
+        n.effects = vec![inner(14.0, 0.0, (0.0, 4.0))];
+    }
+    let inner_spread = add(&mut d, NodeKind::Rectangle, "inner spread", (200.0, 380.0), (150.0, 120.0), "E8E8F8");
+    {
+        let n = d.get_mut(inner_spread).unwrap();
+        n.corners.radii = [16.0; 4];
+        n.effects = vec![inner(10.0, 6.0, (4.0, 4.0))];
+    }
+    let inner_ellipse = add(&mut d, NodeKind::Ellipse { start: 0.0, sweep: std::f64::consts::TAU, inner: 0.0 }, "inner ellipse", (380.0, 380.0), (150.0, 120.0), "D0E8F0");
+    d.get_mut(inner_ellipse).unwrap().effects = vec![inner(8.0, 0.0, (2.0, 2.0))];
+    d
+}
+
+#[test]
+fn the_gpu_draws_shadows_of_any_shape() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let d = shadow_shape_doc();
+    let p = d.first_page().unwrap();
+    assert_eq!(scene::supported(&d, p), Ok(()), "shadows of every shape stay on the GPU");
+    let (w, h) = (900u32, 520u32);
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+    let cpu = render_view(&d, p, &view, &Options::default()).unwrap();
+    let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+    let built = {
+        let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+        scene::build_with(&d, p, &view, &mut layers)
+    }
+    .expect("the GPU draws the shadows");
+    assert!(canvas.render(&device, &queue, &built, scene::background(&d, p)).is_some());
+    let gpu = canvas.read(&device, &queue).unwrap();
+    if std::env::var("FIGCRAFT_PARITY_PNG").is_ok() {
+        let dir = std::env::temp_dir();
+        let _ = cpu.save_png(dir.join("figcraft-shadow-shapes-cpu.png"));
+        let _ = gpu.save_png(dir.join("figcraft-shadow-shapes-gpu.png"));
+    }
+    let (worst, mean, at, over) = diff(&cpu, &gpu);
+    let px = |p: &Pixmap, (x, y): (u32, u32)| {
+        let i = ((y as usize * p.width() as usize) + x as usize) * 4;
+        p.data().get(i..i + 4).map(<[u8]>::to_vec)
+    };
+    println!(
+        "shadow shapes parity: worst {worst} at {at:?} (CPU {:?}, GPU {:?}), mean {mean:.3}, {over} pixels differ by more than 8",
+        px(&cpu, at),
+        px(&gpu, at)
+    );
+    if std::env::var("FIGCRAFT_REGIONS").is_ok() {
+        for (name, (rx, ry, rw, rh)) in [
+            ("ellipse", (20u32, 16u32, 160u32, 120u32)),
+            ("star", (210, 16, 140, 120)),
+            ("polygon", (380, 16, 130, 120)),
+            ("corners", (540, 16, 150, 120)),
+            ("text", (20, 210, 200, 60)),
+            ("group", (240, 190, 150, 120)),
+            ("frame", (450, 190, 160, 120)),
+            ("reaching child", (540, 220, 150, 130)),
+            ("inner card", (20, 380, 150, 120)),
+            ("inner spread", (200, 380, 150, 120)),
+            ("inner ellipse", (380, 380, 150, 120)),
+        ] {
+            let (mut sum, mut n, mut w) = (0f64, 0usize, 0u8);
+            let mut wp = (rx, ry);
+            for y in ry..(ry + rh).min(cpu.height()) {
+                for x in rx..(rx + rw).min(cpu.width()) {
+                    let i = ((y as usize * cpu.width() as usize) + x as usize) * 4;
+                    for c in 0..4 {
+                        let d = cpu.data()[i + c].abs_diff(gpu.data()[i + c]);
+                        sum += f64::from(d);
+                        n += 1;
+                        if d > w {
+                            w = d;
+                            wp = (x, y);
+                        }
+                    }
+                }
+            }
+            println!(
+                "  {name:14} worst {w:3} at {wp:?} (CPU {:?}, GPU {:?}), mean {:.3}",
+                px(&cpu, wp),
+                px(&gpu, wp),
+                sum / n.max(1) as f64
+            );
+        }
+    }
+    assert!(worst <= 96, "a channel differs by {worst} (mean {mean:.3})");
+    assert!(mean <= 0.5, "the mean difference is {mean:.3}");
+    assert!(over < (w * h) as usize / 200, "{over} pixels differ by more than 8");
+    // Drawn again with the shadows kept: the same pixels, and an edit makes a new one.
+    let built = {
+        let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+        scene::build_with(&d, p, &view, &mut layers)
+    }
+    .unwrap();
+    assert!(canvas.render(&device, &queue, &built, scene::background(&d, p)).is_some());
+    let again = canvas.read(&device, &queue).unwrap();
+    let (w1, m1, _, o1) = diff(&gpu, &again);
+    let shadowed = d
+        .nodes()
+        .filter(|n| {
+            n.effects.iter().any(|e| {
+                e.visible && matches!(e.kind, EffectKind::DropShadow(_) | EffectKind::InnerShadow(_))
+            })
+        })
+        .count();
+    println!("kept shadows: worst {w1}, mean {m1:.3}, {o1} differ by more than 8, {} kept of {shadowed} shadowed nodes", canvas.kept_shadows());
+    assert_eq!((w1, o1), (0, 0), "a kept shadow draws the same pixels");
+    assert!(canvas.kept_shadows() >= 10, "the page's shadows are kept");
+    // An edit is a new node, and so a new shadow.
+    let before = canvas.kept_shadows();
+    let mut changed = d.clone();
+    let star = changed.node(p).and_then(|n| n.children.get(1).copied()).unwrap();
+    changed.get_mut(star).unwrap().fills = vec![Paint::solid(Color::from_hex("20C060").unwrap_or(Color::WHITE))];
+    let built = {
+        let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+        scene::build_with(&changed, p, &view, &mut layers)
+    }
+    .unwrap();
+    assert!(canvas.render(&device, &queue, &built, scene::background(&changed, p)).is_some());
+    assert_eq!(canvas.kept_shadows(), before + 1, "a changed node's shadow is made again");
+}
+
+/// `n` rounded cards with a shadow no fast path draws straight into the scene (an ellipse), and
+/// `n` per-corner cards (their shadows are cast from a layer).
+fn shadow_layer_cards(n: u32, inner: bool) -> Document {
+    let mut d = Document::new("gpu shadow layers");
+    let p = d.first_page().unwrap();
+    let colours = ["FFFFFF", "E03030", "2040E0", "20C060", "F0C830", "A040E0"];
+    for i in 0..n {
+        let (x, y) = (f64::from(i % 6) * 150.0 + 10.0, f64::from(i / 6) * 150.0 + 10.0);
+        let kind = if inner { NodeKind::Rectangle } else { NodeKind::Ellipse { start: 0.0, sweep: std::f64::consts::TAU, inner: 0.0 } };
+        let id = d.create(p, kind, "Card", x, y, 130.0, 130.0).unwrap();
+        let node = d.get_mut(id).unwrap();
+        if inner {
+            node.corners.radii = [0.0, 34.0, 12.0, 26.0];
+            let mut s = figcraft_doc::Shadow::default();
+            s.radius = 14.0;
+            s.offset = (0.0, 4.0);
+            node.effects = vec![Effect { kind: EffectKind::InnerShadow(s), visible: true }];
+        } else {
+            node.effects = vec![Effect::drop_shadow()];
+        }
+        node.fills = vec![Paint::solid(Color::from_hex(colours[i as usize % colours.len()]).unwrap_or(Color::WHITE))];
+    }
+    d
+}
+
+/// The same if only `n` per-corner cards with drop shadows.
+fn shadow_layer_cards_rounded(n: u32, shadow: bool) -> Document {
+    let mut d = Document::new("gpu shadow rounded");
+    let p = d.first_page().unwrap();
+    for i in 0..n {
+        let (x, y) = (f64::from(i % 6) * 150.0 + 10.0, f64::from(i / 6) * 150.0 + 10.0);
+        let id = d.create(p, NodeKind::Rectangle, "Card", x, y, 130.0, 130.0).unwrap();
+        let node = d.get_mut(id).unwrap();
+        node.corners.radii = [0.0, 34.0, 12.0, 26.0];
+        node.fills = vec![Paint::solid(Color::WHITE)];
+        if shadow {
+            node.effects = vec![Effect::drop_shadow()];
+        }
+    }
+    d
+}
+
+#[test]
+#[ignore = "timing: run in release with --ignored --nocapture"]
+fn shadow_pass_timings() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let mut canvas = CanvasGpu::new(&device, 904, 860).unwrap();
+    let mut scene = vello::Scene::new();
+    use figcraft_geom::Shape as _;
+    let circle = figcraft_geom::kurbo::Circle::new((65.0, 65.0), 60.0).to_path(0.1);
+    let white: vello::peniko::Brush = vello::peniko::Brush::Solid(vello::peniko::Color::new([1.0, 1.0, 1.0, 1.0]));
+    scene.fill(vello::peniko::Fill::NonZero, vello::kurbo::Affine::IDENTITY, &white, None, &circle);
+    let color = Color { a: 0.25, ..Color::BLACK };
+    let n = 60;
+    {
+        let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+        let _ = layers.shadow(&scene, 130, 130, 5.5, color, None);
+    }
+    let t = std::time::Instant::now();
+    {
+        let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+        for _ in 0..n {
+            let _ = layers.shadow(&scene, 130, 130, 5.5, color, None);
+        }
+    }
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    println!("shadow pass, 130 × 130: {:.3} ms a shadow", t.elapsed().as_secs_f64() * 1000.0 / f64::from(n));
+    // The same with only the render (no blur, no tint).
+    let t = std::time::Instant::now();
+    {
+        for _ in 0..n {
+            let texture = canvas.render_layer(&device, &queue, &scene, 130, 130).unwrap();
+            let _ = &texture;
+        }
+    }
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    println!("  render only: {:.3} ms", t.elapsed().as_secs_f64() * 1000.0 / f64::from(n));
+    // What the pieces cost on their own.
+    let make = |w: u32, h: u32| {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: crate::canvas::FORMAT,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+    };
+    let t = std::time::Instant::now();
+    for _ in 0..n {
+        let _ = make(130, 130);
+    }
+    println!("  a texture: {:.3} ms", t.elapsed().as_secs_f64() * 1000.0 / f64::from(n));
+    let t = std::time::Instant::now();
+    for _ in 0..n {
+        let encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        queue.submit([encoder.finish()]);
+    }
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    println!("  an empty submit: {:.3} ms", t.elapsed().as_secs_f64() * 1000.0 / f64::from(n));
+    let t = std::time::Instant::now();
+    for _ in 0..n {
+        let encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        queue.submit([encoder.finish()]);
+    }
+    println!("  an empty submit (unpolled): {:.3} ms", t.elapsed().as_secs_f64() * 1000.0 / f64::from(n));
+}
+
+#[test]
+#[ignore = "timing: run in release with --ignored --nocapture"]
+fn shadow_layer_timings() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    for (label, d) in [
+        ("30 ellipse shadows", shadow_layer_cards(30, false)),
+        ("30 per-corner shadows", shadow_layer_cards_rounded(30, true)),
+        ("30 per-corner cards", shadow_layer_cards_rounded(30, false)),
+        ("30 inner shadows", shadow_layer_cards(30, true)),
+    ] {
+        for (w, h) in [(904u32, 860u32), (2400, 1600)] {
+            let p = d.first_page().unwrap();
+            let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+            let _ = render_view(&d, p, &view, &Options::default());
+            let cpu = frame_ms(|| render_view(&d, p, &view, &Options::default()).is_some(), 3);
+            let background = scene::background(&d, p);
+            let draw = |canvas: &mut CanvasGpu| {
+                let built = {
+                    let mut layers = crate::canvas::GpuLayers { canvas, device: &device, queue: &queue };
+                    scene::build_with(&d, p, &view, &mut layers)
+                };
+                let ok = built.is_ok_and(|s| canvas.render(&device, &queue, &s, background).is_some());
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                ok
+            };
+            // The first frame: every shadow is made (and its pipelines compile).
+            let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+            let t = std::time::Instant::now();
+            assert!(draw(&mut canvas));
+            let cold = t.elapsed().as_secs_f64() * 1000.0;
+            // Then the frame as the app draws it: a drag redraws the page, the shadows are kept.
+            let frame = frame_ms(|| draw(&mut canvas), 5);
+            println!("{label}, {w} × {h}: CPU {cpu:.2} ms | GPU first frame {cold:.2} ms, then {frame:.2} ms");
+        }
+    }
 }
 
 #[test]

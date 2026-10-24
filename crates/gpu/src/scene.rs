@@ -6,6 +6,7 @@
 //! it cannot draw exactly yet, which makes the canvas fall back to the CPU for that frame.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use figcraft_color::{BlendMode, Color, Gradient, GradientKind, Paint, PaintKind};
@@ -87,9 +88,11 @@ pub fn glass_setup(doc: &Document, id: NodeId, view: &View) -> Option<(figcraft_
     Some((pane, (x0 as i32, y0 as i32)))
 }
 
-/// The device rectangle of `n`'s effect layer, in whole pixels (`None` past the layer cap).
+/// The device rectangle of `n`'s effect layer, in whole pixels (`None` past the layer cap). The
+/// renderer's own layer rectangle: its paint bounds without its effects' margin, which is what a
+/// shadow cast by the layer is cropped to.
 fn layer_rect_impl(doc: &Document, n: &Node, view: &View) -> Result<Option<(f64, f64, u32, u32)>, Unsupported> {
-    let Some(bounds) = figcraft_render::paint_bounds(doc, n.id) else { return Ok(None) };
+    let Some(bounds) = figcraft_render::layer_bounds(doc, n.id) else { return Ok(None) };
     let (x0f, y0f) = ((bounds.x0 - view.origin.0) * view.scale, (bounds.y0 - view.origin.1) * view.scale);
     let (x1f, y1f) = ((bounds.x1 - view.origin.0) * view.scale, (bounds.y1 - view.origin.1) * view.scale);
     if !(x0f.is_finite() && y0f.is_finite() && x1f.is_finite() && y1f.is_finite()) {
@@ -243,6 +246,26 @@ pub trait Layers {
     /// A backdrop node's effect pixels from `back`, the accumulated page (`view`-sized): the whole
     /// view blurred, or a glass pane's layer computed from a crop of it.
     fn backdrop_effect(&mut self, doc: &Document, id: NodeId, view: &View, back: &wgpu::Texture) -> Option<ImageData>;
+    /// A shadow cast by `scene` (a silhouette, or a shape inverted for an inner shadow): its pixels
+    /// `width` × `height` device pixels, blurred by `sigma` and tinted `color`. `key` lets a shadow
+    /// that did not change be kept between frames.
+    fn shadow(&mut self, scene: &Scene, width: u32, height: u32, sigma: f64, color: Color, key: Option<(u64, u64)>) -> Option<ImageData>;
+    /// A shadow cast by a node's own pixels: `scene`'s alpha grown (`grow > 0`) or shrunk by whole
+    /// pixels, blurred by `sigma` and tinted `color`.
+    fn shadow_of_pixels(
+        &mut self,
+        scene: &Scene,
+        width: u32,
+        height: u32,
+        grow: i32,
+        sigma: f64,
+        color: Color,
+        key: Option<(u64, u64)>,
+    ) -> Option<ImageData>;
+    /// A shadow kept from an earlier frame under `key` (`None`: there is none, or keeping is off).
+    fn kept_shadow(&mut self, _key: (u64, u64)) -> Option<ImageData> {
+        None
+    }
 }
 
 /// Accepts effect layers without drawing them (the feature check).
@@ -261,6 +284,21 @@ impl Layers for Probe {
     fn backdrop_effect(&mut self, _doc: &Document, _id: NodeId, view: &View, _back: &wgpu::Texture) -> Option<ImageData> {
         Some(crate::canvas::blank_image(view.width, view.height))
     }
+    fn shadow(&mut self, _scene: &Scene, width: u32, height: u32, _sigma: f64, _color: Color, _key: Option<(u64, u64)>) -> Option<ImageData> {
+        Some(crate::canvas::blank_image(width, height))
+    }
+    fn shadow_of_pixels(
+        &mut self,
+        scene: &Scene,
+        width: u32,
+        height: u32,
+        _grow: i32,
+        sigma: f64,
+        color: Color,
+        key: Option<(u64, u64)>,
+    ) -> Option<ImageData> {
+        self.shadow(scene, width, height, sigma, color, key)
+    }
 }
 
 /// Refuses effect layers: a build without a device.
@@ -277,6 +315,21 @@ impl Layers for NoLayers {
         None
     }
     fn backdrop_effect(&mut self, _doc: &Document, _id: NodeId, _view: &View, _back: &wgpu::Texture) -> Option<ImageData> {
+        None
+    }
+    fn shadow(&mut self, _scene: &Scene, _width: u32, _height: u32, _sigma: f64, _color: Color, _key: Option<(u64, u64)>) -> Option<ImageData> {
+        None
+    }
+    fn shadow_of_pixels(
+        &mut self,
+        _scene: &Scene,
+        _width: u32,
+        _height: u32,
+        _grow: i32,
+        _sigma: f64,
+        _color: Color,
+        _key: Option<(u64, u64)>,
+    ) -> Option<ImageData> {
         None
     }
 }
@@ -333,7 +386,13 @@ enum Effects {
     /// Drop shadows a node casts straight into the scene: its silhouette is one rounded rect, so
     /// each shadow is vello's blurred rounded rect under the node, with no layer.
     Shadows(ShadowShape),
-    /// Anything else (glass, grain, inner shadows, several kinds of effect).
+    /// Drop shadows cast from a layer the GPU blurs and tints: its outline grown by the spread, or
+    /// its own pixels.
+    ShadowLayer,
+    /// Inner shadows: everything outside the shape at the shadow's offset, blurred and clipped to
+    /// the shape (drawn between the node's fills and its children).
+    InnerShadows,
+    /// Anything else (grain, several kinds of effect).
     Other,
 }
 
@@ -481,10 +540,20 @@ fn effects_of(doc: &Document, n: &Node) -> Effects {
     {
         return Effects::LayerBlur(b.sanitized().radius);
     }
-    match shadow_shape(doc, n) {
-        Some(shape) => Effects::Shadows(shape),
-        None => Effects::Other,
+    // One kind of effect at a time: drop shadows (straight into the scene when they are one rounded
+    // rect, else from a layer) or inner shadows.
+    let only = |wanted: fn(&figcraft_doc::EffectKind) -> bool| n.effects.iter().filter(|e| e.visible).all(|e| wanted(&e.kind));
+    if only(|k| matches!(k, figcraft_doc::EffectKind::DropShadow(_))) {
+        return match shadow_shape(doc, n) {
+            Some(shape) => Effects::Shadows(shape),
+            None => Effects::ShadowLayer,
+        };
     }
+    if only(|k| matches!(k, figcraft_doc::EffectKind::InnerShadow(_))) {
+        // A group's is cast from its pixels, not one outline: the CPU's for now.
+        return if matches!(n.kind, NodeKind::Group | NodeKind::Page { .. }) { Effects::Other } else { Effects::InnerShadows };
+    }
+    Effects::Other
 }
 
 impl Builder<'_> {
@@ -519,6 +588,9 @@ impl Builder<'_> {
                 let xf = parent_xf * n.transform;
                 self.draw_shadows(n, &shape, xf);
             }
+            Effects::ShadowLayer => self.shadow_layers(n, depth)?,
+            // Drawn inside the content, between the fills and the children.
+            Effects::InnerShadows => {}
             Effects::Other => return Err(Unsupported::Effect),
         }
         // vello has no plus-darker composition: the CPU draws it.
@@ -700,37 +772,9 @@ impl Builder<'_> {
         if n.blend == BlendMode::PlusDarker {
             return Err(Unsupported::Structure);
         }
-        let Some(bounds) = figcraft_render::paint_bounds(self.doc, n.id) else { return Ok(()) };
+        let Some((x0, y0, w, h)) = self.layer_rect(n)? else { return Ok(()) };
+        let sub_scene = self.content_scene(n, (x0, y0, w, h), depth)?;
         let view = self.view.clone();
-        let scale = view.scale.max(1e-9);
-        let (x0f, y0f) = ((bounds.x0 - view.origin.0) * view.scale, (bounds.y0 - view.origin.1) * view.scale);
-        let (x1f, y1f) = ((bounds.x1 - view.origin.0) * view.scale, (bounds.y1 - view.origin.1) * view.scale);
-        if !(x0f.is_finite() && y0f.is_finite() && x1f.is_finite() && y1f.is_finite()) {
-            return Err(Unsupported::Structure);
-        }
-        let (x0, y0) = (x0f.floor(), y0f.floor());
-        let (w, h) = ((x1f.ceil() - x0).max(1.0), (y1f.ceil() - y0).max(1.0));
-        // A layer this big is cheaper (and exact) on the CPU.
-        const MAX_LAYER: f64 = 8_192.0;
-        if w > MAX_LAYER || h > MAX_LAYER {
-            return Err(Unsupported::Effect);
-        }
-        let (w, h) = (w as u32, h as u32);
-        let layer = View { origin: (view.origin.0 + x0 / scale, view.origin.1 + y0 / scale), scale: view.scale, width: w, height: h };
-        let parent = n.parent.map(|p| self.doc.world_transform(p)).unwrap_or(Affine::IDENTITY);
-        let mut sub = Builder {
-            doc: self.doc,
-            scene: Some(Scene::new()),
-            layers: &mut *self.layers,
-            view: layer.clone(),
-            page: self.page,
-            hidden: self.hidden.clone(),
-            no_strokes: self.no_strokes.clone(),
-        };
-        // The content only: its opacity and blend mode apply to the blurred result, not inside it.
-        sub.content(n, layer.transform() * parent * n.transform, depth)?;
-        let sub_scene = sub.scene.take().ok_or(Unsupported::Structure)?;
-        drop(sub);
         let sigma = radius / 2.0 * view.scale;
         let Some(image) = self.layers.blurred(&sub_scene, w, h, sigma) else { return Err(Unsupported::Effect) };
         let isolated = n.opacity < 1.0 || !matches!(n.blend, BlendMode::PassThrough | BlendMode::Normal);
@@ -745,6 +789,238 @@ impl Builder<'_> {
             s.pop_layer();
         }
         Ok(())
+    }
+
+    /// The node's content alone, drawn into its own `width` × `height` layer (what a blur, a
+    /// shadow or a backdrop effect reads), with the layer's top-left at `(x0, y0)`.
+    fn content_scene(&mut self, n: &Node, (x0, y0, w, h): (f64, f64, u32, u32), depth: usize) -> Result<Scene, Unsupported> {
+        let view = self.view.clone();
+        let scale = view.scale.max(1e-9);
+        let layer = View { origin: (view.origin.0 + x0 / scale, view.origin.1 + y0 / scale), scale: view.scale, width: w, height: h };
+        let parent = n.parent.map(|p| self.doc.world_transform(p)).unwrap_or(Affine::IDENTITY);
+        let mut sub = Builder {
+            doc: self.doc,
+            scene: Some(Scene::new()),
+            layers: &mut *self.layers,
+            view: layer.clone(),
+            page: self.page,
+            hidden: self.hidden.clone(),
+            no_strokes: self.no_strokes.clone(),
+        };
+        // The content only: the node's opacity and blend mode apply to the result, not inside it.
+        sub.content(n, layer.transform() * parent * n.transform, depth)?;
+        sub.scene.take().ok_or(Unsupported::Structure)
+    }
+
+    /// Drop shadows the GPU casts from a layer — a node the fast path can't draw straight into the
+    /// scene (an ellipse, a star, a vector, text, per-corner radii, a group): its silhouette grown
+    /// by the spread, or its own pixels, blurred and tinted, under the node.
+    fn shadow_layers(&mut self, n: &Node, depth: usize) -> Result<(), Unsupported> {
+        let Some((x0, y0, w, h)) = self.layer_rect(n)? else { return Ok(()) };
+        let view = self.view.clone();
+        let parent = n.parent.map(|p| self.doc.world_transform(p)).unwrap_or(Affine::IDENTITY);
+        let xf = view.transform() * parent * n.transform;
+        let layer_xf = Affine::translate((-x0, -y0)) * xf;
+        let scale = view.scale;
+        let shadows: Vec<figcraft_doc::Shadow> = n
+            .effects
+            .iter()
+            .filter(|e| e.visible)
+            .filter_map(|e| match &e.kind {
+                figcraft_doc::EffectKind::DropShadow(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        if shadows.is_empty() {
+            return Err(Unsupported::Effect);
+        }
+        let silhouette = figcraft_render::shadow::silhouette(self.doc, n);
+        let outside = figcraft_render::shadow::cover(self.doc, n).map(|c| outside(&c));
+        // The node's own pixels, drawn once however many shadows it casts.
+        let mut content: Option<Scene> = None;
+        let bounds = KRect::new(x0, y0, x0 + f64::from(w), y0 + f64::from(h));
+        for (index, s) in shadows.iter().enumerate() {
+            if !(s.offset.0.is_finite() && s.offset.1.is_finite() && s.radius.is_finite() && s.spread.is_finite()) {
+                return Err(Unsupported::Effect);
+            }
+            let (dx, dy) = (s.offset.0 * scale, s.offset.1 * scale);
+            let spread = s.spread;
+            // The shadow is drawn at the node's opacity (as the CPU composites it), so its colour's
+            // alpha carries it.
+            let mut color = s.color.sanitized();
+            color.a *= n.opacity.clamp(0.0, 1.0);
+            if color.a <= 0.0 {
+                continue;
+            }
+            let sigma = s.radius / 2.0 * scale;
+            let key = self.shadow_key(n, index as u64, xf);
+            let (image, at) = match self.layers.kept_shadow(key) {
+                Some(image) => (Some(image), shadow_place(&silhouette, spread, (x0, y0), (dx, dy))),
+                None => match &silhouette {
+                    Some(sil) if spread != 0.0 => {
+                        let mut scene = Scene::new();
+                        silhouette_scene(&mut scene, sil, spread, layer_xf, (dx, dy), KRect::new(0.0, 0.0, f64::from(w), f64::from(h)));
+                        (self.layers.shadow(&scene, w, h, sigma, color, Some(key)), (x0, y0))
+                    }
+                    _ => {
+                        if content.is_none() {
+                            content = Some(self.content_scene(n, (x0, y0, w, h), depth)?);
+                        }
+                        let Some(scene) = content.as_ref() else { return Err(Unsupported::Structure) };
+                        let grow = whole_px(spread * scale);
+                        (
+                            self.layers.shadow_of_pixels(scene, w, h, grow, sigma, color, Some(key)),
+                            (x0 + f64::from(whole_px(dx)), y0 + f64::from(whole_px(dy))),
+                        )
+                    }
+                },
+            };
+            let Some(image) = image else { return Err(Unsupported::Effect) };
+            // A shadow that hides behind the paints is cut where they cover (the CPU masks it by
+            // its cover); one that shows behind is not.
+            let hole = if s.show_behind { None } else { outside.as_ref() };
+            self.draw_shadow_image(&image, at, Some(&bounds), hole, s.blend, xf);
+        }
+        Ok(())
+    }
+
+    /// Draw a shadow's pixels at `at` (device pixels), cut to `bounds` (the CPU crops it to the
+    /// layer), outside `hole` (the node's paints) when given, in the shadow's own blend mode.
+    fn draw_shadow_image(&mut self, image: &ImageData, at: (f64, f64), bounds: Option<&KRect>, hole: Option<&figcraft_geom::BezPath>, mode: BlendMode, xf: Affine) {
+        let Some(s) = &mut self.scene else { return };
+        let blended = mode != BlendMode::Normal && mode != BlendMode::PassThrough;
+        let target = KRect::new(0.0, 0.0, 32_768.0, 32_768.0);
+        if blended {
+            s.push_layer(Fill::NonZero, blend(mode), 1.0, KAffine::IDENTITY, &target);
+        }
+        let mut clips = 0;
+        if let Some(r) = bounds {
+            s.push_clip_layer(Fill::NonZero, KAffine::IDENTITY, &r.to_path(0.0));
+            clips += 1;
+        }
+        if let Some(hole) = hole {
+            s.push_clip_layer(Fill::EvenOdd, k_affine(xf), hole);
+            clips += 1;
+        }
+        let sampler = ImageSampler { x_extend: Extend::Pad, y_extend: Extend::Pad, quality: ImageQuality::Low, alpha: 1.0 };
+        s.draw_image(ImageBrush { image, sampler }, KAffine::translate(at));
+        for _ in 0..clips {
+            s.pop_layer();
+        }
+        if blended {
+            s.pop_layer();
+        }
+    }
+
+    /// A node's inner shadows: everything outside its shape at the shadow's offset (shrunk by the
+    /// spread), blurred and tinted, over its fills and under its children and strokes.
+    fn inner_shadows(&mut self, n: &Node, xf: Affine) -> Result<(), Unsupported> {
+        let shadows: Vec<figcraft_doc::Shadow> = n
+            .effects
+            .iter()
+            .filter(|e| e.visible)
+            .filter_map(|e| match &e.kind {
+                figcraft_doc::EffectKind::InnerShadow(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        if shadows.is_empty() {
+            return Ok(());
+        }
+        // A group's inner shadow is cast from its pixels: that is the CPU's for now.
+        let Some((shape, rule)) = node_outline(self.doc, n) else { return Err(Unsupported::Effect) };
+        let Some((x0, y0, w, h)) = self.layer_rect(n)? else { return Ok(()) };
+        let scale = self.view.scale;
+        let layer_xf = Affine::translate((-x0, -y0)) * xf;
+        for (index, s) in shadows.iter().enumerate() {
+            if !(s.offset.0.is_finite() && s.offset.1.is_finite() && s.radius.is_finite() && s.spread.is_finite()) {
+                return Err(Unsupported::Effect);
+            }
+            let key = self.shadow_key(n, 1u64 << 32 | index as u64, xf);
+            let (image, at) = match self.layers.kept_shadow(key) {
+                Some(image) => {
+                    let (dx, dy) = (s.offset.0 * scale, s.offset.1 * scale);
+                    let reach = s.radius.abs() / 2.0 * scale * 3.0
+                        + s.spread.abs() * scale * figcraft_doc::SPREAD_MITER_LIMIT
+                        + dx.abs().max(dy.abs());
+                    let pad = if reach.is_finite() { reach.ceil().clamp(0.0, 2048.0) as u32 + 2 } else { 2 };
+                    (image, (x0 - f64::from(pad), y0 - f64::from(pad)))
+                }
+                None => self.inner_shadow_image(&shape, rule, (x0, y0, w, h), layer_xf, scale, s, key)?,
+            };
+            let Some(scene) = &mut self.scene else { continue };
+            let sampler = ImageSampler { x_extend: Extend::Pad, y_extend: Extend::Pad, quality: ImageQuality::Low, alpha: 1.0 };
+            scene.push_clip_layer(fill_rule(rule), k_affine(xf), &shape);
+            scene.draw_image(ImageBrush { image: &image, sampler }, KAffine::translate(at));
+            scene.pop_layer();
+        }
+        Ok(())
+    }
+
+    /// One inner shadow's pixels and where they go: the shape's outside at its offset in a buffer
+    /// padded by its reach, blurred and tinted (the builder clips them to the shape).
+    fn inner_shadow_image(
+        &mut self,
+        shape: &figcraft_geom::BezPath,
+        rule: FillRule,
+        (x0, y0, w, h): (f64, f64, u32, u32),
+        layer_xf: Affine,
+        scale: f64,
+        s: &figcraft_doc::Shadow,
+        key: (u64, u64),
+    ) -> Result<(ImageData, (f64, f64)), Unsupported> {
+        let (dx, dy) = (s.offset.0 * scale, s.offset.1 * scale);
+        let spread = s.spread;
+        // Everything outside the shape casts shadow inwards, from every edge: the buffer reaches as
+        // far as the shadow does (the renderer's own reach).
+        let reach = s.radius.abs() / 2.0 * scale * 3.0 + spread.abs() * scale * figcraft_doc::SPREAD_MITER_LIMIT + dx.abs().max(dy.abs());
+        let pad = if reach.is_finite() { reach.ceil().clamp(0.0, 2048.0) as u32 + 2 } else { 2 };
+        let (bw, bh) = (w.saturating_add(pad * 2).min(16_384), h.saturating_add(pad * 2).min(16_384));
+        let big = KRect::new(0.0, 0.0, f64::from(bw), f64::from(bh));
+        let at = KAffine::translate((f64::from(pad) + dx, f64::from(pad) + dy)) * k_affine(layer_xf);
+        let white = PColor::new([1.0, 1.0, 1.0, 1.0]);
+        let mut scene = Scene::new();
+        scene.fill(Fill::NonZero, KAffine::IDENTITY, &Brush::Solid(white), None, &big);
+        // Cut the shape (or, shrinking, the shape grown by the spread) out of the buffer.
+        let band = Stroke::new((2.0 * spread.abs()).max(0.0)).with_join(vello::kurbo::Join::Miter).with_miter_limit(figcraft_doc::SPREAD_MITER_LIMIT);
+        let place = |scene: &mut Scene| {
+            scene.fill(fill_rule(rule), at, &Brush::Solid(white), None, shape);
+            scene.stroke(&band, at, &Brush::Solid(white), None, shape);
+        };
+        scene.push_layer(Fill::NonZero, dest_out(), 1.0, KAffine::IDENTITY, &big);
+        if spread > 0.0 {
+            // The hole shrinks: only the shape goes, then the band comes back as its inner ring.
+            scene.fill(fill_rule(rule), at, &Brush::Solid(white), None, shape);
+        } else {
+            place(&mut scene);
+        }
+        scene.pop_layer();
+        if spread > 0.0 {
+            scene.stroke(&band, at, &Brush::Solid(white), None, shape);
+        }
+        let sigma = s.radius / 2.0 * scale;
+        let image = self.layers.shadow(&scene, bw, bh, sigma, s.color, Some(key)).ok_or(Unsupported::Effect)?;
+        Ok((image, (x0 - f64::from(pad), y0 - f64::from(pad))))
+    }
+
+    /// A key for one of `n`'s shadows: the node and everything under it (a node is a shared `Arc`,
+    /// so an edit is a new address), the view, the zoom and the shadow's place in the list — plus
+    /// the document's shape (ids, node count), so another file's nodes at the same addresses can't
+    /// match.
+    fn shadow_key(&self, n: &Node, index: u64, xf: Affine) -> (u64, u64) {
+        let mut first = std::collections::hash_map::DefaultHasher::new();
+        subtree_hash(self.doc, n, 0).hash(&mut first);
+        index.hash(&mut first);
+        self.doc.pages.hash(&mut first);
+        (self.doc.next_id(), self.doc.node_count()).hash(&mut first);
+        (n.width.to_bits(), n.height.to_bits()).hash(&mut first);
+        figcraft_text::layout_generation().hash(&mut first);
+        self.doc.color_profile.hash(&mut first);
+        let mut second = std::collections::hash_map::DefaultHasher::new();
+        for v in xf.as_coeffs().map(f64::to_bits) {
+            v.hash(&mut second);
+        }
+        (first.finish(), second.finish())
     }
 
     /// A layer for the node's opacity and blend mode, clipped to what the scene can see: the whole
@@ -787,6 +1063,10 @@ impl Builder<'_> {
             for p in &n.fills {
                 self.fill(p, path, *rule, (n.width, n.height), xf)?;
             }
+        }
+        // Inner shadows paint over the fills, under the children and strokes (the CPU's order).
+        if n.effects.iter().any(|e| e.visible && matches!(e.kind, figcraft_doc::EffectKind::InnerShadow(_))) {
+            self.inner_shadows(n, xf)?;
         }
         if !matches!(n.kind, NodeKind::BooleanOp { .. }) && !n.hides_contents() {
             let clips = n.clip && n.kind.is_frame_like() && !n.children.is_empty();
@@ -1066,6 +1346,76 @@ fn handle_frame(g: &Gradient, w: f64, h: f64) -> Affine {
     let t = (g.to.0 * w, g.to.1 * h);
     let k = (g.width.0 * w, g.width.1 * h);
     Affine::new([t.0 - f.0, t.1 - f.1, k.0 - f.0, k.1 - f.1, f.0, f.1])
+}
+
+/// The region outside `outlines` in local space: a huge rectangle with them as holes (even-odd).
+fn outside(outlines: &[figcraft_render::shadow::Outline]) -> figcraft_geom::BezPath {
+    let mut path = KRect::new(-1e5, -1e5, 1e5, 1e5).to_path(0.0);
+    for (p, _) in outlines {
+        path.extend(p.elements().iter().copied());
+    }
+    path
+}
+
+/// `outlines` grown (`spread > 0`) or shrunk by `spread` local units, shifted by `(dx, dy)` device
+/// pixels, in white — the renderer's `shadow::spread_alpha`.
+fn silhouette_scene(scene: &mut Scene, outlines: &[figcraft_render::shadow::Outline], spread: f64, layer_xf: Affine, (dx, dy): (f64, f64), rect: KRect) {
+    let at = KAffine::translate((dx, dy)) * k_affine(layer_xf);
+    let white = PColor::new([1.0, 1.0, 1.0, 1.0]);
+    for (path, rule) in outlines {
+        scene.fill(fill_rule(*rule), at, &Brush::Solid(white), None, path);
+    }
+    if !(spread.is_finite() && spread.abs() > 1e-6) {
+        return;
+    }
+    let band = Stroke::new(2.0 * spread.abs()).with_join(vello::kurbo::Join::Miter).with_miter_limit(figcraft_doc::SPREAD_MITER_LIMIT);
+    if spread > 0.0 {
+        for (path, _) in outlines {
+            scene.stroke(&band, at, &Brush::Solid(white), None, path);
+        }
+    } else {
+        // Shrinking cuts the band out of the fill, as the renderer's clear pass does.
+        scene.push_layer(Fill::NonZero, dest_out(), 1.0, KAffine::IDENTITY, &rect);
+        for (path, _) in outlines {
+            scene.stroke(&band, at, &Brush::Solid(white), None, path);
+        }
+        scene.pop_layer();
+    }
+}
+
+/// The compose operator that takes what is drawn out of the layer under it.
+fn dest_out() -> PBlend {
+    PBlend::new(Mix::Normal, Compose::DestOut)
+}
+
+/// A device distance as a whole pixel offset (the renderer's `shadow::whole_px`).
+fn whole_px(v: f64) -> i32 {
+    if v.is_finite() { v.round().clamp(-100_000.0, 100_000.0) as i32 } else { 0 }
+}
+
+/// Where a shadow's pixels go from the node's layer corner, given how it is cast (a silhouette is
+/// drawn with its offset baked in; pixels are moved by whole device pixels).
+fn shadow_place(silhouette: &Option<Vec<figcraft_render::shadow::Outline>>, spread: f64, at: (f64, f64), (dx, dy): (f64, f64)) -> (f64, f64) {
+    match silhouette {
+        Some(_) if spread != 0.0 => at,
+        _ => (at.0 + f64::from(whole_px(dx)), at.1 + f64::from(whole_px(dy))),
+    }
+}
+
+/// The identity of a node and everything under it: nodes are shared `Arc`s, so a changed node is a
+/// new address, and a changed child shows here as a changed address too (the renderer's
+/// `layers::subtree`).
+fn subtree_hash(doc: &Document, n: &Node, depth: usize) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (n as *const Node as usize).hash(&mut h);
+    if depth < MAX_DEPTH {
+        for c in &n.children {
+            if let Some(cn) = doc.node(*c) {
+                subtree_hash(doc, cn, depth + 1).hash(&mut h);
+            }
+        }
+    }
+    h.finish()
 }
 
 fn fill_rule(r: FillRule) -> Fill {

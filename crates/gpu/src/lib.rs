@@ -13,6 +13,7 @@ pub mod canvas;
 mod compose;
 mod glass;
 pub mod scene;
+mod shadow;
 
 use std::sync::Arc;
 
