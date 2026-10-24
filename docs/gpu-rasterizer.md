@@ -149,6 +149,14 @@ nodes cost more than one and the canvas limits pages to one. The fix is to draw 
 Tests: the three-pane page gets a timing case and must beat its 12–15 ms cached CPU frame; the
 existing parity tests cover each effect.
 
+**Attempted, not enabled.** A first implementation (segments rendered into their own textures and
+laid over an accumulation with a premultiplied-over blit) matched the CPU inside the effects
+(mean 0.06–0.11/255) but failed at their borders: a pane's rim showed the page background, and a
+background blur's edge showed blur where the CPU shows none (worst 123–223 on 250–1600 pixels).
+It is not in the tree. The suspects, in order: the compose pass (`LoadOp::Load` with
+premultiplied-over), whether vello clears a target it renders an empty scene into (the
+accumulation's first fill), and the effect image's placement relative to the layer's origin.
+
 ### P4 — default on, cleanup
 
 - GPU canvas by default on desktop; document the fallback and the wasm/CPU policy here and in
