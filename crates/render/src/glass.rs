@@ -309,6 +309,13 @@ fn clear_geometry() {
     }
 }
 
+/// The kept geometry is one cache for the whole process: the tests that empty it take turns.
+#[cfg(test)]
+fn geometry_turn() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Bilinear sample of premultiplied `p` at pixel coordinates `(x, y)` (centres at +0.5), each
 /// channel 0..=255; transparent outside.
 #[inline]
@@ -589,6 +596,7 @@ mod tests {
 
     #[test]
     fn the_geometry_of_a_pane_is_kept_between_frames() {
+        let _turn = geometry_turn();
         clear_geometry();
         let (a, cov) = pane(100, 80);
         let (b, _) = pane(100, 80);
@@ -614,6 +622,7 @@ mod tests {
         use figcraft_color::{Color, Paint};
         use figcraft_doc::{Document, Effect, EffectKind, NodeKind};
 
+        let _turn = geometry_turn();
         let mut d = Document::new("glass");
         let p = d.first_page().unwrap();
         // Stripes under the pane, so where it sits shows in what it bends.

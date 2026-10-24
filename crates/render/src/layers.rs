@@ -69,6 +69,15 @@ pub(crate) fn clear() {
     let mut state = state().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     state.map.clear();
     state.bytes = 0;
+    let mut seen = seen().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    seen.set.clear();
+    seen.order.clear();
+}
+
+/// The bytes the kept layers take (tests check that a drag doesn't fill the cache).
+#[cfg(test)]
+pub(crate) fn kept_bytes() -> usize {
+    state().lock().unwrap_or_else(std::sync::PoisonError::into_inner).bytes
 }
 
 /// Whether node `n`'s layer can be kept: nothing in it may read the backdrop (glass, background
@@ -94,8 +103,7 @@ fn backdrop_free(doc: &Document, n: &Node, depth: usize) -> bool {
 }
 
 /// The kept layer of `n` drawn through `page_xf` (local → page device pixels), if there is one.
-pub(crate) fn get(ctx: &Ctx, n: &Node, page_xf: Affine) -> Option<Arc<Layer>> {
-    let key = key(ctx, n, page_xf);
+pub(crate) fn get(key: Key) -> Option<Arc<Layer>> {
     let mut state = state().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     state.tick += 1;
     let tick = state.tick;
@@ -104,9 +112,25 @@ pub(crate) fn get(ctx: &Ctx, n: &Node, page_xf: Affine) -> Option<Arc<Layer>> {
     Some(Arc::clone(&entry.layer))
 }
 
+/// Whether `key` was drawn before: a layer is only kept from its second sight, because a layer
+/// that changes every frame (one being dragged) is never found again, and drawing the whole of it
+/// to keep it would cost more than cutting it to what a render needs.
+pub(crate) fn settled(key: Key) -> bool {
+    let mut seen = seen().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !seen.set.insert(key) {
+        return true;
+    }
+    seen.order.push_back(key);
+    while seen.order.len() > SEEN_MAX {
+        if let Some(old) = seen.order.pop_front() {
+            seen.set.remove(&old);
+        }
+    }
+    false
+}
+
 /// Keep `layer`, `n`'s pixels drawn through `page_xf` with its top-left at `anchor`.
-pub(crate) fn put(ctx: &Ctx, n: &Node, page_xf: Affine, layer: Arc<Layer>) {
-    let key = key(ctx, n, page_xf);
+pub(crate) fn put(key: Key, layer: Arc<Layer>) {
     let bytes = layer.pix.data().len() + layer.shadows.iter().map(|s| s.pix.data().len()).sum::<usize>();
     if bytes > BUDGET {
         return;
@@ -127,7 +151,21 @@ pub(crate) fn put(ctx: &Ctx, n: &Node, page_xf: Affine, layer: Arc<Layer>) {
     state.map.insert(key, Entry { layer, bytes, used: tick });
 }
 
-fn key(ctx: &Ctx, n: &Node, page_xf: Affine) -> Key {
+/// What [`settled`] remembers: the keys drawn lately, oldest out first.
+struct Seen {
+    set: std::collections::HashSet<Key>,
+    order: std::collections::VecDeque<Key>,
+}
+
+fn seen() -> &'static Mutex<Seen> {
+    static SEEN: OnceLock<Mutex<Seen>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(Seen { set: std::collections::HashSet::new(), order: std::collections::VecDeque::new() }))
+}
+
+/// Keys remembered as drawn (a page of a few hundred effect layers fits many times over).
+const SEEN_MAX: usize = 2048;
+
+pub(crate) fn key(ctx: &Ctx, n: &Node, page_xf: Affine) -> Key {
     let mut first = DefaultHasher::new();
     (ctx.cache, ctx.lod, figcraft_text::layout_generation()).hash(&mut first);
     // Images are decoded into the file's colour space: another profile draws them differently.

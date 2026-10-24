@@ -527,8 +527,10 @@ fn draw_layer(ctx: &Ctx, pix: &mut Pixmap, n: &Node, parent_xf: Affine, depth: u
     // didn't change can be kept between frames and composited again: a drag then redraws the layers
     // that moved, not every layer in the damaged area.
     let page_xf = Affine::translate((ctx.page_at.0, ctx.page_at.1)) * xf;
-    let kept = layers::cacheable(ctx, n);
-    if kept && let Some(hit) = layers::get(ctx, n, page_xf) {
+    let key = layers::cacheable(ctx, n).then(|| layers::key(ctx, n, page_xf));
+    if let Some(key) = key
+        && let Some(hit) = layers::get(key)
+    {
         let at = (hit.anchor.0 - ctx.page_at.0.round() as i32, hit.anchor.1 - ctx.page_at.1.round() as i32);
         for sh in &hit.shadows {
             composite(pix, at, &sh.pix, sh.opacity, sh.blend);
@@ -536,7 +538,10 @@ fn draw_layer(ctx: &Ctx, pix: &mut Pixmap, n: &Node, parent_xf: Affine, depth: u
         composite(pix, at, &hit.pix, n.opacity.clamp(0.0, 1.0), n.blend);
         return;
     }
-    let whole = kept.then(|| whole_layer(dev)).flatten();
+    // Drawn a second time unchanged, a layer is kept whole; the first sight of it (and a layer
+    // changing every frame, a drag) is cut to what this render needs, as it always was.
+    let kept = key.filter(|k| layers::settled(*k));
+    let whole = kept.and_then(|_| whole_layer(dev));
     let (rx0, ry0, rw, rh) = match whole {
         Some(r) => r,
         None => {
@@ -625,7 +630,7 @@ fn draw_layer(ctx: &Ctx, pix: &mut Pixmap, n: &Node, parent_xf: Affine, depth: u
             if let EffectKind::DropShadow(s) = &e.kind
                 && let Some(sh) = shadow::drop_shadow(&caster, s)
             {
-                if kept {
+                if kept.is_some() {
                     // Kept with the layer: the next frame composites it instead of drawing it.
                     shadows.push(layers::ShadowPart { pix: sh, opacity: op, blend: s.blend });
                 } else {
@@ -642,9 +647,9 @@ fn draw_layer(ctx: &Ctx, pix: &mut Pixmap, n: &Node, parent_xf: Affine, depth: u
         }
         layer_effects(ctx, &mut layer, n, id, lxf);
     }
-    if kept {
+    if let Some(key) = kept {
         let made = Arc::new(layers::Layer { pix: layer, anchor, shadows });
-        layers::put(ctx, n, page_xf, Arc::clone(&made));
+        layers::put(key, Arc::clone(&made));
         for sh in &made.shadows {
             composite(pix, (lx, ly), &sh.pix, sh.opacity, sh.blend);
         }
