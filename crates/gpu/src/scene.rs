@@ -556,7 +556,7 @@ impl Builder<'_> {
             let snap = |v: f64| if s.spread == 0.0 && scale.is_finite() && scale > 0.0 { (v * scale).round() / scale } else { v };
             let grow = shape.grow + s.spread;
             let rect = rect.inflate(grow, grow);
-            if !(rect.width() > 0.0 && rect.height() > 0.0) {
+            if rect.width() <= 0.0 || rect.height() <= 0.0 {
                 continue;
             }
             let radius = (shape.radius + grow).max(0.0);
@@ -564,7 +564,7 @@ impl Builder<'_> {
             // A spreading shadow is cast from the paints' outline, which is opaque coverage: the CPU
             // reads the fills' alpha only when the shadow comes from the layer's pixels.
             let alpha = f64::from(c.a) * if s.spread != 0.0 { 1.0 } else { shape.alpha };
-            if !(alpha > 0.0) {
+            if !alpha.is_finite() || alpha <= 0.0 {
                 continue;
             }
             let at = KAffine::translate((snap(s.offset.0), snap(s.offset.1))) * k_affine(xf);
@@ -897,7 +897,7 @@ fn squared_linear(g: &Gradient, (w, h): (f64, f64)) -> bool {
     let d = ((g.to.0 - g.from.0) * w, (g.to.1 - g.from.1) * h);
     let k = ((g.width.0 - g.from.0) * w, (g.width.1 - g.from.1) * h);
     let len = (d.0 * d.0 + d.1 * d.1).sqrt() * (k.0 * k.0 + k.1 * k.1).sqrt();
-    if !(len.is_finite() && len > 1e-12) {
+    if !len.is_finite() || len <= 1e-12 {
         return true;
     }
     ((d.0 * k.0 + d.1 * k.1) / len).abs() <= 1e-6
