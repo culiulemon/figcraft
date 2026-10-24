@@ -171,12 +171,50 @@ fn unsupported_pages_are_refused() {
     d.get_mut(id).unwrap().fills[0].opacity = 0.5;
     assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Effect));
     d.get_mut(id).unwrap().fills[0] = opaque;
-    // A shadow with a spread, or one that shows behind, needs the layer.
+    // A shadow that spreads grows the card's own silhouette; one that shows behind is hidden by an
+    // opaque card either way; one with a blend mode composites as a layer. None needs a layer.
     d.get_mut(id).unwrap().effects = vec![Effect::drop_shadow()];
     if let Some(figcraft_doc::EffectKind::DropShadow(s)) = d.get_mut(id).ok().and_then(|n| n.effects.first_mut()).map(|e| &mut e.kind) {
         s.spread = 6.0;
     }
+    assert_eq!(scene::supported(&d, p), Ok(()));
+    if let Some(figcraft_doc::EffectKind::DropShadow(s)) = d.get_mut(id).ok().and_then(|n| n.effects.first_mut()).map(|e| &mut e.kind) {
+        s.spread = 0.0;
+        s.show_behind = true;
+        s.blend = BlendMode::Multiply;
+    }
+    assert_eq!(scene::supported(&d, p), Ok(()));
+    // A gradient fill covers the card as opaquely as a solid one (its stops are all opaque).
+    let solid = d.node(id).and_then(|n| n.fills.first().cloned()).unwrap();
+    let mut g = Gradient {
+        kind: GradientKind::Linear,
+        stops: vec![
+            figcraft_color::ColorStop { position: 0.0, color: Color::from_hex("F0C830").unwrap_or(Color::WHITE) },
+            figcraft_color::ColorStop { position: 1.0, color: Color::from_hex("20B0D0").unwrap_or(Color::WHITE) },
+        ],
+        from: (0.0, 0.5),
+        to: (1.0, 0.5),
+        width: (0.0, 1.0),
+    };
+    d.get_mut(id).unwrap().fills = vec![Paint::gradient(g.clone())];
+    assert_eq!(scene::supported(&d, p), Ok(()));
+    // A linear gradient whose width handle isn't square to its axis (imported files can skew one)
+    // draws different bands in vello's projection: the CPU has it.
+    g.from = (0.0, 0.0);
+    g.to = (1.0, 1.0);
+    g.width = (1.0, 0.0);
+    d.get_mut(id).unwrap().fills = vec![Paint::gradient(g)];
+    assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Paint));
+    d.get_mut(id).unwrap().fills = vec![solid];
+    // An opaque stroke grows the silhouette; a translucent one would let the shadow through it.
+    d.get_mut(id).unwrap().strokes = vec![Paint::solid(Color::WHITE)];
+    d.get_mut(id).unwrap().stroke.weight = 4.0;
+    d.get_mut(id).unwrap().stroke.align = StrokeAlign::Outside;
+    assert_eq!(scene::supported(&d, p), Ok(()), "an outside stroke is the renderer's band");
+    d.get_mut(id).unwrap().strokes[0].opacity = 0.5;
     assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Effect));
+    d.get_mut(id).unwrap().strokes.clear();
+    d.get_mut(id).unwrap().stroke.weight = 0.0;
     d.get_mut(id).unwrap().effects = vec![Effect::drop_shadow()];
     // One layer blur is drawn on the GPU (its own layer, blurred there).
     d.get_mut(id).unwrap().effects = vec![Effect::layer_blur()];
@@ -505,6 +543,124 @@ fn the_gpu_page_matches_with_several_backdrop_layers() {
     assert!(mean <= 2.0, "the mean difference is {mean:.3}");
 }
 
+/// The shadow variations the fast path now draws without a layer: spread, several shadows, a
+/// gradient fill, an opaque stroke, a clipping frame with children, a rotation and a shadow with a
+/// blend mode of its own.
+fn shadow_breadth_doc() -> Document {
+    let mut d = Document::new("gpu shadow breadth");
+    let p = d.first_page().unwrap();
+    let hex = |s: &str| Color::from_hex(s).unwrap_or(Color::WHITE);
+    let stops =
+        |a: Color, b: Color| vec![figcraft_color::ColorStop { position: 0.0, color: a }, figcraft_color::ColorStop { position: 1.0, color: b }];
+    let shadow = |radius: f64, spread: f64, offset: (f64, f64), show_behind: bool, blend: BlendMode| {
+        let mut e = Effect::drop_shadow();
+        if let EffectKind::DropShadow(s) = &mut e.kind {
+            s.radius = radius;
+            s.spread = spread;
+            s.offset = offset;
+            s.show_behind = show_behind;
+            s.blend = blend;
+        }
+        e
+    };
+
+    let spread = d.create(p, NodeKind::Rectangle, "spread", 24.0, 20.0, 140.0, 90.0).unwrap();
+    {
+        let n = d.get_mut(spread).unwrap();
+        n.corners.radii = [18.0; 4];
+        let mut g =
+            Gradient { kind: GradientKind::Linear, stops: stops(hex("F0C830"), hex("E03030")), from: (0.0, 0.0), to: (1.0, 1.0), width: (-0.5, 0.5) };
+        g.square_linear_width(140.0, 90.0);
+        n.fills = vec![Paint::gradient(g)];
+        n.effects = vec![shadow(10.0, 6.0, (4.0, 6.0), false, BlendMode::Normal)];
+    }
+
+    let two = d.create(p, NodeKind::Rectangle, "two shadows", 200.0, 20.0, 140.0, 90.0).unwrap();
+    {
+        let n = d.get_mut(two).unwrap();
+        n.corners.radii = [12.0; 4];
+        n.fills = vec![Paint::solid(hex("2040E0"))];
+        n.effects = vec![shadow(8.0, 0.0, (0.0, 4.0), false, BlendMode::Normal), shadow(14.0, 2.0, (2.0, 8.0), false, BlendMode::Multiply)];
+    }
+
+    let stroked = d.create(p, NodeKind::Rectangle, "stroked", 380.0, 20.0, 150.0, 90.0).unwrap();
+    {
+        let n = d.get_mut(stroked).unwrap();
+        n.corners.radii = [8.0; 4];
+        n.fills = vec![Paint::solid(hex("20C060"))];
+        n.strokes = vec![Paint::solid(hex("FFFFFF"))];
+        n.stroke.weight = 6.0;
+        n.stroke.align = StrokeAlign::Outside;
+        n.effects = vec![shadow(6.0, 0.0, (0.0, 3.0), false, BlendMode::Normal)];
+    }
+
+    // A clipping frame: its children paint over the shadow, and cannot reach past the frame.
+    let frame = d.create(p, NodeKind::Frame, "clipped card", 24.0, 150.0, 160.0, 110.0).unwrap();
+    {
+        let n = d.get_mut(frame).unwrap();
+        n.corners.radii = [16.0; 4];
+        n.fills = vec![Paint::solid(hex("FFFFFF"))];
+        n.clip = true;
+        n.effects = vec![shadow(6.0, -2.0, (0.0, 2.0), false, BlendMode::Normal)];
+    }
+    let child = d.create(frame, NodeKind::Rectangle, "child", 96.0, 60.0, 120.0, 90.0).unwrap();
+    d.get_mut(child).unwrap().fills = vec![Paint::solid(hex("20B0D0"))];
+
+    let turned = d.create(p, NodeKind::Rectangle, "turned", 240.0, 160.0, 120.0, 80.0).unwrap();
+    {
+        let n = d.get_mut(turned).unwrap();
+        let turn = 12f64.to_radians();
+        n.transform = figcraft_geom::Affine::new([turn.cos(), turn.sin(), -turn.sin(), turn.cos(), 260.0, 170.0]);
+        n.corners.radii = [10.0; 4];
+        n.fills = vec![Paint::solid(hex("A040E0"))];
+        n.effects = vec![shadow(8.0, 3.0, (3.0, 5.0), false, BlendMode::Normal)];
+    }
+
+    let behind = d.create(p, NodeKind::Rectangle, "shows behind", 400.0, 160.0, 150.0, 90.0).unwrap();
+    {
+        let n = d.get_mut(behind).unwrap();
+        n.corners.radii = [20.0; 4];
+        n.fills = vec![Paint::solid(hex("F0C830"))];
+        n.effects = vec![shadow(9.0, 1.0, (0.0, 6.0), true, BlendMode::Normal)];
+    }
+    d
+}
+
+#[test]
+fn the_gpu_draws_the_shadow_variations() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let d = shadow_breadth_doc();
+    let p = d.first_page().unwrap();
+    assert_eq!(scene::supported(&d, p), Ok(()), "a page of shadow variations stays on the GPU");
+    let (w, h) = PARITY;
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+    let cpu = render_view(&d, p, &view, &Options::default()).unwrap();
+    let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+    let built = scene::build_with(&d, p, &view, &mut scene::NoLayers).expect("the GPU draws the shadows");
+    assert!(canvas.render(&device, &queue, &built, scene::background(&d, p)).is_some());
+    let gpu = canvas.read(&device, &queue).unwrap();
+    if std::env::var("FIGCRAFT_PARITY_PNG").is_ok() {
+        let dir = std::env::temp_dir();
+        let _ = cpu.save_png(dir.join("figcraft-shadows-cpu.png"));
+        let _ = gpu.save_png(dir.join("figcraft-shadows-gpu.png"));
+    }
+    let (worst, mean, at, over) = diff(&cpu, &gpu);
+    let px = |p: &Pixmap, (x, y): (u32, u32)| {
+        let i = ((y as usize * p.width() as usize) + x as usize) * 4;
+        p.data().get(i..i + 4).map(<[u8]>::to_vec)
+    };
+    println!(
+        "shadow breadth parity: worst {worst} at {at:?} (CPU {:?}, GPU {:?}), mean {mean:.3}, {over} pixels differ by more than 8",
+        px(&cpu, at),
+        px(&gpu, at)
+    );
+    assert!(worst <= 96, "a channel differs by {worst} (mean {mean:.3})");
+    assert!(mean <= 1.0, "the mean difference is {mean:.3}");
+}
+
 #[test]
 fn the_gpu_canvas_reads_back() {
     let Some((device, queue)) = device() else {
@@ -612,6 +768,11 @@ fn layer_blur_timings() {
 
 /// `n` shadowed cards (opaque, rounded) at `w` × `h`.
 fn shadow_cards(n: u32) -> Document {
+    shadow_cards_with(n, 0.0)
+}
+
+/// `n` shadowed cards whose shadows spread by `spread` document units.
+fn shadow_cards_with(n: u32, spread: f64) -> Document {
     let mut d = Document::new("gpu shadows");
     let p = d.first_page().unwrap();
     let colours = ["FFFFFF", "E03030", "2040E0", "20C060", "F0C830", "A040E0"];
@@ -624,6 +785,7 @@ fn shadow_cards(n: u32) -> Document {
         node.effects = vec![Effect::drop_shadow()];
         if let Some(figcraft_doc::EffectKind::DropShadow(s)) = node.effects.first_mut().map(|e| &mut e.kind) {
             s.radius = 12.0;
+            s.spread = spread;
         }
     }
     d
@@ -636,25 +798,27 @@ fn shadow_timings() {
         eprintln!("no GPU adapter: skipping");
         return;
     };
-    for (w, h) in [(904u32, 860u32), (2320, 1440)] {
-        let d = shadow_cards(30);
-        let p = d.first_page().unwrap();
-        let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
-        let _ = render_view(&d, p, &view, &Options::default());
-        let cpu = frame_ms(|| render_view(&d, p, &view, &Options::default()).is_some(), 5);
-        let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
-        let _ = canvas.render(&device, &queue, &scene::build(&d, p, &view).unwrap(), scene::background(&d, p));
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-        let frame = frame_ms(
-            || {
-                let s = scene::build(&d, p, &view).unwrap();
-                let ok = canvas.render(&device, &queue, &s, scene::background(&d, p)).is_some();
-                let _ = device.poll(wgpu::PollType::wait_indefinitely());
-                ok
-            },
-            8,
-        );
-        println!("30 shadowed cards, {w} × {h}: CPU {cpu:.2} ms | GPU frame {frame:.2} ms");
+    for (spread, label) in [(0.0, "30 shadowed cards"), (6.0, "30 spread shadows")] {
+        for (w, h) in [(904u32, 860u32), (2320, 1440)] {
+            let d = shadow_cards_with(30, spread);
+            let p = d.first_page().unwrap();
+            let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+            let _ = render_view(&d, p, &view, &Options::default());
+            let cpu = frame_ms(|| render_view(&d, p, &view, &Options::default()).is_some(), 5);
+            let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+            let _ = canvas.render(&device, &queue, &scene::build(&d, p, &view).unwrap(), scene::background(&d, p));
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let frame = frame_ms(
+                || {
+                    let s = scene::build(&d, p, &view).unwrap();
+                    let ok = canvas.render(&device, &queue, &s, scene::background(&d, p)).is_some();
+                    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                    ok
+                },
+                8,
+            );
+            println!("{label}, {w} × {h}: CPU {cpu:.2} ms | GPU frame {frame:.2} ms");
+        }
     }
 }
 

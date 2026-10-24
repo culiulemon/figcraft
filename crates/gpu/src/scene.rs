@@ -325,46 +325,109 @@ enum Effects {
     BackgroundBlur(f64),
     /// One glass pane.
     Glass(figcraft_doc::Glass),
-    /// Drop shadows a rounded, opaque rectangle can cast straight into the scene (their shape is
-    /// the rectangle's own outline, so no layer is needed).
-    Shadows(Vec<figcraft_doc::Shadow>),
+    /// Drop shadows a node casts straight into the scene: its silhouette is one rounded rect, so
+    /// each shadow is vello's blurred rounded rect under the node, with no layer.
+    Shadows(ShadowShape),
     /// Anything else (glass, grain, inner shadows, several kinds of effect).
     Other,
 }
 
-/// A shadow drawn without a layer: vello's blurred rounded rect, cut off where an opaque card
-/// covers it (as the CPU masks it).
-fn simple_shadows(n: &Node) -> Option<Vec<figcraft_doc::Shadow>> {
-    if !matches!(n.kind, NodeKind::Rectangle) || !n.children.is_empty() {
+/// A node whose drop shadows are drawn straight into the scene (no layer).
+struct ShadowShape {
+    /// The corner radius of the node's outline.
+    radius: f64,
+    /// How far its paints reach past the outline: a centred stroke's outer half, all of an outside
+    /// one — the silhouette's own growth, in the node's units.
+    grow: f64,
+    shadows: Vec<figcraft_doc::Shadow>,
+}
+
+/// Whether the node's own outline is a rectangle with corners: a shape or a frame, component,
+/// instance or section.
+fn is_rect_kind(k: &NodeKind) -> bool {
+    matches!(
+        k,
+        NodeKind::Rectangle
+            | NodeKind::Frame
+            | NodeKind::Component { .. }
+            | NodeKind::ComponentSet { .. }
+            | NodeKind::Instance { .. }
+            | NodeKind::Section { .. }
+    )
+}
+
+/// Whether `p` paints opaque coverage (its blend mode aside: what it covers hides a shadow under
+/// the layer exactly there).
+fn paint_opaque(p: &Paint) -> bool {
+    p.visible
+        && p.opacity >= 1.0
+        && p.blend == BlendMode::Normal
+        && match &p.kind {
+            PaintKind::Solid { color } => color.a >= 1.0,
+            PaintKind::Gradient(g) => g.stops.iter().all(|s| s.color.a >= 1.0),
+            PaintKind::Image(_) | PaintKind::Pattern(_) => false,
+        }
+}
+
+/// The rounded rect a node's drop shadows cast from, when every shadow can be drawn straight into
+/// the scene; `None` leaves the node (and the page) to the CPU.
+///
+/// The CPU casts a shadow from the layer's pixels (or, when it spreads, from the paints' outline)
+/// and hides it behind the paints' *cover*: a fill or stroke hides it whether or not it is
+/// translucent. Drawing the shadow under the node hides it exactly where the node's pixels are
+/// opaque, so the node's own paints must be opaque over the silhouette (an opaque fill covering
+/// the shape, and an opaque stroke if there is one), its opacity 1 and its blend normal. Children
+/// may paint over the shadow wherever they are; they are allowed only in a clipping frame, where
+/// they cannot reach past the shape the shadow is cast from.
+fn shadow_shape(doc: &Document, n: &Node) -> Option<ShadowShape> {
+    if !is_rect_kind(&n.kind) || n.corners.smoothing != 0.0 {
         return None;
     }
-    if n.corners.uniform().is_none() || n.corners.smoothing != 0.0 {
+    if n.opacity < 1.0 || !matches!(n.blend, BlendMode::PassThrough | BlendMode::Normal) {
         return None;
     }
-    if n.opacity < 1.0 || !matches!(n.blend, BlendMode::PassThrough | BlendMode::Normal) || n.has_visible_stroke() {
+    let radius = n.corners.uniform()?.max(0.0);
+    if !n.fills.iter().any(paint_opaque) {
         return None;
     }
-    // The card must cover the shadow where they overlap, or the shadow would show through it.
-    let [paint] = n.fills.as_slice() else { return None };
-    if paint.blend != BlendMode::Normal || paint.opacity < 1.0 {
-        return None;
-    }
-    let color = paint.solid_color()?;
-    if color.a < 1.0 {
+    let grow = if n.has_visible_stroke() {
+        let stroke = &n.stroke;
+        let weight = if stroke.weight.is_finite() { stroke.weight.max(0.0) } else { 0.0 };
+        // A band that isn't the plain outline (dashes, a width profile, per-side widths, a brush)
+        // is not a rounded rect; a translucent band would let the shadow show through it.
+        if stroke.sides.is_some() || !stroke.dashes.is_empty() || stroke.width_profile.is_some() || stroke.brush.is_some() {
+            return None;
+        }
+        if !n.strokes.iter().filter(|p| p.visible).all(paint_opaque) {
+            return None;
+        }
+        match stroke.align {
+            figcraft_doc::StrokeAlign::Inside => 0.0,
+            figcraft_doc::StrokeAlign::Center => weight / 2.0,
+            figcraft_doc::StrokeAlign::Outside => weight,
+        }
+    } else {
+        0.0
+    };
+    let kids = n.children.iter().any(|c| doc.node(*c).is_some_and(|c| c.visible && c.opacity > 0.0));
+    if kids && !(n.kind.is_frame_like() && n.clip) {
         return None;
     }
     let mut shadows = Vec::new();
     for e in n.effects.iter().filter(|e| e.visible) {
         let figcraft_doc::EffectKind::DropShadow(s) = &e.kind else { return None };
-        if s.spread != 0.0 || s.show_behind || s.blend != BlendMode::Normal {
+        if !(s.offset.0.is_finite() && s.offset.1.is_finite() && s.radius.is_finite() && s.spread.is_finite()) {
+            return None;
+        }
+        if matches!(s.blend, BlendMode::PlusLighter | BlendMode::PlusDarker) {
             return None;
         }
         shadows.push(s.clone());
     }
-    (!shadows.is_empty()).then_some(shadows)
+    (!shadows.is_empty()).then_some(ShadowShape { radius, grow, shadows })
 }
 
-fn effects_of(n: &Node) -> Effects {
+fn effects_of(doc: &Document, n: &Node) -> Effects {
     if let Some(b) = backdrop_of(n) {
         return match b {
             Backdrop::Blur(radius) => Effects::BackgroundBlur(radius),
@@ -380,8 +443,8 @@ fn effects_of(n: &Node) -> Effects {
     {
         return Effects::LayerBlur(b.sanitized().radius);
     }
-    match simple_shadows(n) {
-        Some(shadows) => Effects::Shadows(shadows),
+    match shadow_shape(doc, n) {
+        Some(shape) => Effects::Shadows(shape),
         None => Effects::Other,
     }
 }
@@ -409,14 +472,14 @@ impl Builder<'_> {
         if n.is_mask {
             return Err(Unsupported::Mask);
         }
-        match effects_of(n) {
+        match effects_of(self.doc, n) {
             Effects::None => {}
             Effects::LayerBlur(radius) => return self.blurred_layer(n, parent_xf, depth, radius),
             Effects::BackgroundBlur(radius) => return self.backdrop_layer(n, depth, radius),
             Effects::Glass(glass) => return self.glass_layer(n, depth, &glass),
-            Effects::Shadows(shadows) => {
+            Effects::Shadows(shape) => {
                 let xf = parent_xf * n.transform;
-                self.draw_shadows(n, &shadows, xf);
+                self.draw_shadows(n, &shape, xf);
             }
             Effects::Other => return Err(Unsupported::Effect),
         }
@@ -437,18 +500,38 @@ impl Builder<'_> {
     }
 
     /// Drop shadows drawn without a layer: vello's blurred rounded rect is the card's own
-    /// silhouette offset and blurred, and the card paints over it (it hides the shadow exactly
-    /// where the CPU masks it, because the card is opaque).
-    fn draw_shadows(&mut self, n: &Node, shadows: &[figcraft_doc::Shadow], xf: Affine) {
-        let Some(radius) = n.corners.uniform() else { return };
+    /// silhouette (grown by its stroke and the shadow's spread) offset and blurred, and the card
+    /// paints over it — it hides the shadow exactly where the CPU's cover mask does, because its
+    /// paints are opaque over that area.
+    fn draw_shadows(&mut self, n: &Node, shape: &ShadowShape, xf: Affine) {
         let Some(scene) = &mut self.scene else { return };
         let rect = KRect::new(0.0, 0.0, n.width, n.height);
-        for s in shadows {
+        let scale = xf.determinant().abs().sqrt();
+        for s in &shape.shadows {
+            // A shadow that spreads is cast from the outline at its exact offset; one that does
+            // not is cast from the layer's pixels, which the CPU moves by whole device pixels.
+            let snap = |v: f64| if s.spread == 0.0 && scale.is_finite() && scale > 0.0 { (v * scale).round() / scale } else { v };
+            let grow = shape.grow + s.spread;
+            let rect = rect.inflate(grow, grow);
+            if !(rect.width() > 0.0 && rect.height() > 0.0) {
+                continue;
+            }
+            let radius = (shape.radius + grow).max(0.0);
             let c = s.color.sanitized();
-            let at = KAffine::translate(s.offset) * k_affine(xf);
+            let at = KAffine::translate((snap(s.offset.0), snap(s.offset.1))) * k_affine(xf);
+            // A shadow with a blend mode of its own composites as a layer; the usual one is drawn
+            // straight into the scene.
+            let blended = s.blend != BlendMode::Normal && s.blend != BlendMode::PassThrough;
+            if blended {
+                let target = KRect::new(0.0, 0.0, 32_768.0, 32_768.0);
+                scene.push_layer(Fill::NonZero, blend(s.blend), 1.0, KAffine::IDENTITY, &target);
+            }
             // The radius and the deviation are in the shape's own units (the transform scales
             // them, and the blur with them).
-            scene.draw_blurred_rounded_rect(at, rect, PColor::new([c.r, c.g, c.b, c.a]), radius.max(0.0), (s.radius / 2.0).max(0.0));
+            scene.draw_blurred_rounded_rect(at, rect, PColor::new([c.r, c.g, c.b, c.a]), radius, (s.radius / 2.0).max(0.0));
+            if blended {
+                scene.pop_layer();
+            }
         }
     }
 
@@ -683,18 +766,27 @@ impl Builder<'_> {
             && props.brush.is_none()
             && is_plain_cap(props.cap_start)
             && props.cap_start == props.cap_end;
-        if !plain {
-            return Err(Unsupported::Stroke);
-        }
-        let stroke = Stroke::new(props.weight.max(0.0)).with_join(join(props.join)).with_caps(cap(props.cap_start));
         if text {
             // Glyph outlines are closed: inside and outside strokes clip to them.
             return Err(Unsupported::Stroke);
         }
+        if plain {
+            let stroke = Stroke::new(props.weight.max(0.0)).with_join(join(props.join)).with_caps(cap(props.cap_start));
+            for p in &n.strokes {
+                let Some((brush, brush_xf)) = self.brush(p, size)? else { continue };
+                if let Some(s) = &mut self.scene {
+                    s.stroke(&stroke, k_affine(xf), &brush, brush_xf, path);
+                }
+            }
+            return Ok(());
+        }
+        // Everything else is the band the CPU paints — inside and outside strokes, per-side widths,
+        // dashes, width profiles, brushes — as the renderer works its outline out, filled.
+        let Some((band, rule)) = figcraft_render::stroke_fill(self.doc, n) else { return Err(Unsupported::Stroke) };
         for p in &n.strokes {
             let Some((brush, brush_xf)) = self.brush(p, size)? else { continue };
             if let Some(s) = &mut self.scene {
-                s.stroke(&stroke, k_affine(xf), &brush, brush_xf, path);
+                s.fill(fill_rule(rule), k_affine(xf), &brush, brush_xf, band.as_ref());
             }
         }
         Ok(())
@@ -719,7 +811,14 @@ impl Builder<'_> {
                 }
                 Brush::Solid(pcolor(c))
             }
-            PaintKind::Gradient(g) => Brush::Gradient(gradient(g, op)?),
+            PaintKind::Gradient(g) => {
+                // vello's linear gradient is a projection onto its axis: a width handle that isn't
+                // square to it (only imported files skew one) would draw different bands there.
+                if !squared_linear(g, size) {
+                    return Err(Unsupported::Paint);
+                }
+                Brush::Gradient(gradient(g, op)?)
+            }
             PaintKind::Image(_) | PaintKind::Pattern(_) => return Err(Unsupported::Paint),
         };
         let frame = match &paint.kind {
@@ -728,6 +827,23 @@ impl Builder<'_> {
         };
         Ok(Some((brush, frame)))
     }
+}
+
+/// Whether a linear gradient's width handle is square to its axis in a `w` × `h` box — the way the
+/// canvas keeps it, so its colour bands cross the axis at right angles (see
+/// [`figcraft_color::Gradient::square_linear_width`]).
+fn squared_linear(g: &Gradient, (w, h): (f64, f64)) -> bool {
+    if g.kind != GradientKind::Linear {
+        return true;
+    }
+    let (w, h) = (w.max(1e-6), h.max(1e-6));
+    let d = ((g.to.0 - g.from.0) * w, (g.to.1 - g.from.1) * h);
+    let k = ((g.width.0 - g.from.0) * w, (g.width.1 - g.from.1) * h);
+    let len = (d.0 * d.0 + d.1 * d.1).sqrt() * (k.0 * k.0 + k.1 * k.1).sqrt();
+    if !(len.is_finite() && len > 1e-12) {
+        return true;
+    }
+    ((d.0 * k.0 + d.1 * k.1) / len).abs() <= 1e-6
 }
 
 /// A gradient brush in its unit box (`(0,0)` → from, `(1,0)` → to; see

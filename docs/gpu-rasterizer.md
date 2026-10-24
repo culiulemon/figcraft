@@ -71,10 +71,12 @@ and the app builds and runs unchanged (the CPU canvas is still the default in th
   lines, vectors and booleans (via `node_outline`), text in one style (glyph outlines), solid and
   linear/radial/angular gradients, node opacity, node blend modes, clipping frames, hidden layers.
 - Not covered (the page falls back to the CPU): effects that are not a layer blur, a drop shadow or
-  a backdrop effect (inner shadows, grain, a node with several effects), image and pattern fills,
-  diamond gradients, per-paint blend modes, `PlusDarker`, masks, inside/outside strokes, dashes,
-  width profiles, brush strokes, arrow/circle caps, text with styled runs or colour glyphs, and the
-  editor's own options (outline mode, `skip`, `solo`) which come with the canvas integration.
+  a backdrop effect (inner shadows, grain, a node with several effects), a shadow cast by anything
+  that isn't one opaque rounded rectangle (a group, an ellipse, a translucent card, a non-uniform
+  radius), image and pattern fills, diamond and skewed linear gradients, per-paint blend modes,
+  `PlusDarker`, masks, text with a stroke, arrow/circle caps, text with styled runs or colour
+  glyphs, and the editor's own options (outline mode, `skip`, `solo`) which come with the canvas
+  integration.
 
 Exit: parity tests (below) pass for the P1 feature list; a drag benchmark shows the frame cost
 at 2320 × 1440 well under the CPU's fixed 3.6–4.8 ms.
@@ -105,12 +107,28 @@ the CPU render within the parity tolerance; toggling the setting changes nothing
   composited with the node's opacity and blend mode; the pixels never leave the device. Parity
   (`the_gpu_layer_blur_matches_the_cpu_render`): mean channel difference 0.047/255, worst 33 on a
   blurred antialiased edge.
-- Landed: **drop shadows** on rounded, opaque rectangles (the common card): the shadow is vello's
+- Landed: **drop shadows** on rounded rectangles and frames (the common card): the shadow is vello's
   blurred rounded rect — the card's own outline, offset and blurred — drawn under the card, which
   hides it exactly where the CPU masks it. No offscreen layer, so a page of shadowed cards costs
   almost nothing. Parity (`the_gpu_drop_shadow_matches_the_cpu_render`): mean 0.044/255, worst 31
-  (vello's Gaussian against the CPU's three-box approximation). Spread, `showBehind`, a
-  translucent card, a stroke, a non-uniform radius or a shadow alongside another effect fall back.
+  (vello's Gaussian against the CPU's three-box approximation).
+- Landed: **shadows of any number and shape the card itself is**: a shadow that *spreads* grows the
+  rounded rect (and its radius) by the spread — the CPU's mitered silhouette dilation; one that
+  shows behind is hidden by an opaque card either way; one with a blend mode of its own composites
+  as a layer; the card may have any number of shadows, a gradient fill (its stops opaque), an
+  opaque stroke (which grows the silhouette by its outer half — inside, centred or outside), rotated
+  corners, and children in a clipping frame. `the_gpu_draws_the_shadow_variations` covers all of
+  them: mean 0.512/255, worst 59 on the softest shadow edge, 1.3% of pixels off by more than 8 —
+  the Gaussian-against-three-boxes difference, largest where two large shadows overlap. Still on the
+  CPU: a translucent card (its paints must hide the shadow where they cover), a non-uniform radius,
+  an ellipse, a group or text with a shadow, and a shadow alongside another effect (the CPU's order
+  matters).
+- Landed: **inside, outside and per-side strokes, dashes, width profiles and brush strokes**, as
+  the renderer's own band (`figcraft_render::stroke_fill`) filled — vello's native stroke draws the
+  centred, plain case. Text with a stroke still falls back.
+- A **linear gradient whose width handle isn't square to its axis** (only imported files skew one)
+  stays on the CPU: vello's linear gradient is a projection onto its axis, the CPU inverts the full
+  handle frame, and the two disagree on such a gradient's bands.
 - Landed: **background blur**: the page under the node is drawn into a view-sized texture (the
   node and everything after it left out — the renderer's `backdrop::above`), blurred by the GPU's
   box passes, shown clipped to the node's shape, and the node's content goes over it. Parity mean
@@ -141,6 +159,9 @@ the CPU render within the parity tolerance; toggling the setting changes nothing
 - *Timing* (`segmented_timings`, release, pipelined as the app draws): one pane 904 × 860 CPU
   8.3 ms / GPU 5.7 ms, 2400 × 1600 CPU 14.3 / GPU 3.3; one background blur 4.3 / 3.8 and 11.9 /
   3.2; the heavy page 48.6 / 8.8 and 53.6 / 6.2 — under the 8 ms budget at 2400 × 1600.
+- *Timing* (`shadow_timings`, release): 30 cards with radius-12 shadows **0.84–0.90 ms** a frame on
+  the GPU (CPU 21–29 ms); with a spread of 6, **0.69–0.91 ms** (CPU 28–34 ms) — a spread shadow is
+  still one rounded rect, not a layer.
 - In the app (release, control channel, canvas 904 × 860, the same page): the GPU holds
   `canvas.rasterizer = gpu` and drags it in 12–19 ms a frame where the CPU's *full* render takes
   30–34 ms; a single-layer drag is 4.3–4.5 ms on the CPU's retained layers against 12–19 ms on the
@@ -208,7 +229,7 @@ Run in `cargo xtask ci` unless marked *timing* (release, `--ignored --nocapture`
 |---|---|---|
 | 1 | `the_gpu_canvas_matches_the_cpu_render` | pixel parity per feature: shapes, radii, gradients, text, opacity, blend, strokes |
 | 1b | `the_gpu_text_matches_the_cpu_render` | text is pixel-identical (measured: 0 differing bytes) |
-| 1c | `the_gpu_layer_blur_matches_the_cpu_render`, `the_gpu_drop_shadow_matches_the_cpu_render` | effects: mean 0.011 and 0.044/255 |
+| 1c | `the_gpu_layer_blur_matches_the_cpu_render`, `the_gpu_drop_shadow_matches_the_cpu_render`, `the_gpu_draws_the_shadow_variations` | effects: mean 0.011, 0.044 and 0.512/255 (the last with spread, two shadows, a stroke, a gradient card, a clipped frame and a rotation) |
 | 1d | `the_segmented_page_matches_the_cpu_with_one_glass_pane`, `..._one_background_blur`, `the_gpu_page_matches_with_several_backdrop_layers` | backdrop effects in the accumulated renderer: mean 0.061, 0.049 and 0.725/255 |
 | 2 | `unsupported_pages_fall_back` | the predicate rejects exactly the features not yet ported |
 | 3 | `the_gpu_canvas_reads_back` | screenshot/export path: texture → `Pixmap`, premultiplied, same size |
@@ -319,5 +340,16 @@ stays on the fallback list.
     3.2 ms.
   - The first attempt failed at effect borders because vello's targets hold straight alpha; see
     "Straight vs premultiplied alpha" above.
-- Next: inner shadows, grain, spread and translucent shadows, and drop shadows cast from blurred
-  layers; then P4 (default-on policy write-up and cleanup).
+- 2026-10-24: **P3 slice 5 landed — wider drop shadows, and the strokes that cast them.** A card's
+  shadow is its own rounded rect whatever the card is painted with: spread, any number of shadows,
+  `showBehind`, a shadow blend of its own, a gradient fill with opaque stops, an opaque stroke
+  (inside, centred or outside — the silhouette grows by its outer half), rotation, and children in
+  a clipping frame. Strokes themselves are no longer limited to plain centred ones: inside, outside,
+  per-side, dashed, profiled and brush bands are filled from the renderer's own outline. A linear
+  gradient whose width handle isn't square to its axis (only imported files skew one) now stays on
+  the CPU, where vello's projection and the CPU's handle frame agree.
+  - `the_gpu_draws_the_shadow_variations`: mean 0.512/255, worst 59, 1.3% of pixels off by more
+    than 8 — the Gaussian/three-box difference on the soft edges, not a shape error.
+  - 30 spread shadows: **0.69–0.91 ms** a frame against the CPU's 28–34 ms (`shadow_timings`).
+- Next: inner shadows, grain, and shadows cast by a translucent card, a group or an ellipse (the
+  renderer's layer-sized path); then P4's cleanup.

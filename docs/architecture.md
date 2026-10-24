@@ -61,14 +61,15 @@ The desktop canvas draws on the GPU where the page is in the GPU rasterizer's fe
 draws it into one of two textures, and the window paints that texture, so no pixels cross the bus
 and nothing is uploaded per frame. A node with a single layer blur is drawn into an offscreen
 texture, blurred by the GPU's own box passes (the CPU blur's radii) and composited there too; a
-rounded opaque card's drop shadow is vello's blurred rounded rect drawn under the card; and a page
-with a backdrop effect (glass, background blur) is drawn in segments: the layers before such a node
-accumulate in a texture, the node's effect is made from that texture (a crop and a blur, or the
+card's drop shadow (spread, several of them, any blend) is vello's blurred rounded rect of the
+card's own silhouette, drawn under the card, and the card's strokes are the renderer's own band
+filled; and a page with a backdrop effect (glass, background blur) is drawn in segments: the layers
+before such a node accumulate in a texture, the node's effect is made from that texture (a crop and a blur, or the
 CPU's pane geometry through the GPU's glass shader) and its content goes over it, so the page under
 two panes is drawn once. vello's textures hold straight alpha, so a segment is premultiplied as it
 is laid over the accumulation and an effect layer before a blur or the glass shader reads it.
-Every other page — inner shadows, grain, spread or translucent shadows, images, masks, outline
-modes, soft proof — is drawn by the CPU renderer and uploaded as before; the choice is made per
+Every other page — inner shadows, grain, a shadow cast by a translucent card or a group, images,
+masks, outline modes, soft proof — is drawn by the CPU renderer and uploaded as before; the choice is made per
 frame and reported by `ui.inspect`. The
 CPU renderer is the single source of pixels for exports and the browser. The desktop canvas
 renders on a worker thread at the device pixel ratio and keeps its last image, re-rendering only
