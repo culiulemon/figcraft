@@ -91,6 +91,7 @@ at 2320 × 1440 well under the CPU's fixed 3.6–4.8 ms.
   selection, skipped layers, the focus view, soft proof and non-sRGB documents stay on the CPU.
 - `ui.inspect` reports the choice and the reason for a fallback (`canvas.rasterizer`,
   `canvas.gpuRefusal`), so a scene that stays on the CPU can be explained without a debugger.
+  `FIGCRAFT_GPU_CANVAS=0` (or `off`, `false`, `cpu`) turns the GPU canvas off for a run.
 
 Exit: dragging any page in the P1 feature set is GPU-rendered in the real app; screenshots match
 the CPU render within the parity tolerance; toggling the setting changes nothing visible.
@@ -132,7 +133,9 @@ Run in `cargo xtask ci` unless marked *timing* (release, `--ignored --nocapture`
 
 | # | test | what it proves |
 |---|---|---|
-| 1 | `the_gpu_canvas_matches_the_cpu_render` | pixel parity per feature: shapes, radii, gradients, text, images, opacity, blend, masks |
+| 1 | `the_gpu_canvas_matches_the_cpu_render` | pixel parity per feature: shapes, radii, gradients, text, opacity, blend, strokes |
+| 1b | `the_gpu_text_matches_the_cpu_render` | text is pixel-identical (measured: 0 differing bytes) |
+| 1c | `the_gpu_layer_blur_matches_the_cpu_render`, `the_gpu_drop_shadow_matches_the_cpu_render` | effects: mean 0.047 and 0.044/255 |
 | 2 | `unsupported_pages_fall_back` | the predicate rejects exactly the features not yet ported |
 | 3 | `the_gpu_canvas_reads_back` | screenshot/export path: texture → `Pixmap`, premultiplied, same size |
 | 4 | *timing* `canvas_frame_timings` | CPU vs GPU frame at 2320 × 1440, plain and heavy, p50/p95 |
@@ -216,6 +219,9 @@ stays on the fallback list.
     is the scene, not the pixels. In the app, dragging a card on that page holds 1.2–2.2 ms a
     frame (occasional GPU wake-ups spike to 7–10 ms, as on plain pages).
   - Parity: mean 0.044/255, worst 31 (the soft edge), against the CPU's three-box blur.
+- 2026-10-24: text proved pixel-identical between the two rasterizers (same glyph outlines from
+  the renderer's layout: `the_gpu_text_matches_the_cpu_render`, 0 differing bytes at 1×), and
+  `FIGCRAFT_GPU_CANVAS=0` turns the GPU canvas off for a run.
 - Next: P3's other effects (spread and non-card shadows, inner shadows, backdrop blurs, glass,
   grain), which is what makes the shadow/glass/blur page — the one that still costs 12–15 ms — run
   entirely on the GPU.

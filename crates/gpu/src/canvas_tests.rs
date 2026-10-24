@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use figcraft_color::{BlendMode, Color, Gradient, GradientKind, Paint};
-use figcraft_doc::{Document, Effect, NodeKind, StrokeAlign};
+use figcraft_doc::{Document, Effect, NodeKind, StrokeAlign, TextData};
 use figcraft_render::{Options, Pixmap, View, render_view};
 use wgpu::{Device, Queue};
 
@@ -270,6 +270,42 @@ fn the_gpu_drop_shadow_matches_the_cpu_render() {
     println!("drop shadow parity: worst {worst} at {at:?}, mean {mean:.3}, {over} pixels differ by more than 8");
     assert!(worst <= 128, "a channel differs by {worst} (mean {mean:.3})");
     assert!(mean <= 2.0, "the mean difference is {mean:.3}");
+}
+
+/// Text in one style: the renderer's layout turns it into glyph outlines.
+fn text_doc() -> Document {
+    let mut d = Document::new("gpu text");
+    let p = d.first_page().unwrap();
+    let mut td = TextData::new("Hello, FigCraft");
+    td.style.font_size = 40.0;
+    let id = d.create(p, NodeKind::Text(td), "title", 30.0, 70.0, 400.0, 80.0).unwrap();
+    d.get_mut(id).unwrap().fills = vec![Paint::solid(Color::BLACK)];
+    let mut sub = TextData::new("smaller text 123");
+    sub.style.font_size = 18.0;
+    let id = d.create(p, NodeKind::Text(sub), "body", 30.0, 160.0, 400.0, 40.0).unwrap();
+    d.get_mut(id).unwrap().fills = vec![Paint::solid(Color::from_hex("404040").unwrap_or(Color::BLACK))];
+    d
+}
+
+#[test]
+fn the_gpu_text_matches_the_cpu_render() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let d = text_doc();
+    let p = d.first_page().unwrap();
+    let (w, h) = PARITY;
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+    let cpu = render_view(&d, p, &view, &Options::default()).unwrap();
+    let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+    let built = scene::build_with(&d, p, &view, &mut scene::NoLayers).expect("the GPU draws text");
+    assert!(canvas.render(&device, &queue, &built, scene::background(&d, p)).is_some());
+    let gpu = canvas.read(&device, &queue).unwrap();
+    let (worst, mean, at, over) = diff(&cpu, &gpu);
+    println!("text parity: worst {worst} at {at:?}, mean {mean:.3}, {over} pixels differ by more than 8");
+    assert!(worst <= 160, "a channel differs by {worst} (mean {mean:.3})");
+    assert!(mean <= 1.0, "the mean difference is {mean:.3}");
 }
 
 #[test]

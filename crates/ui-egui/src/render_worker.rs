@@ -209,10 +209,16 @@ impl Renders {
 }
 
 /// Whether the GPU canvas may draw this job: the editor's outline modes, skipped layers, the
-/// focus view, soft proof and Display P3 documents are the CPU renderer's.
+/// focus view, soft proof and Display P3 documents are the CPU renderer's. `FIGCRAFT_GPU_CANVAS=0`
+/// turns the GPU canvas off (the CPU path is the reference and the fallback).
 #[cfg(not(target_arch = "wasm32"))]
 fn gpu_job(job: &Job) -> bool {
-    !job.outline && job.outlined.is_empty() && job.skip.is_empty() && job.solo.is_none() && !job.proof && job.doc.color_profile.is_srgb()
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| match std::env::var("FIGCRAFT_GPU_CANVAS") {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "cpu"),
+        Err(_) => true,
+    });
+    enabled && !job.outline && job.outlined.is_empty() && job.skip.is_empty() && job.solo.is_none() && !job.proof && job.doc.color_profile.is_srgb()
 }
 
 /// The GPU canvas's frame for `job`, if it can draw the page and this job asks nothing of it that
