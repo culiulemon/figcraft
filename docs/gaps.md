@@ -20,7 +20,7 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
 | 4 | Interaction fidelity not compared tool by tool | UI/UX | 40–60 | [ui-parity](ui-parity.md) |
 | 5 | Localization: English, reviewed Russian, plus unreviewed Spanish (and Latin American Spanish), French, German, Brazilian Portuguese, Japanese, Korean, Simplified Chinese, Indonesian and Czech drafts; Turkish and Swedish catalogs | Localization | 29–51 | [localization-parity](localization-parity.md) |
 | 6 | Plugins: widgets take clicks only, a self-hosted directory but no public catalogue; Figma's plugins don't run | Ecosystem | 8–26 | [target-app-parity](target-app-parity.md) |
-| 7 | CPU canvas where Figma uses the GPU: blurs and glass run on the window's GPU and isolated layers are kept between frames (2026-10-24), but every layer is still rasterised by tiny-skia; a drag across a page of effects is 12–15 ms a frame where Figma keeps its layers on the GPU | Hardware/performance | 25–50 | [hardware-parity](hardware-parity.md) |
+| 7 | CPU canvas where Figma uses the GPU: blurs and glass run on the window's GPU, isolated layers are kept between frames (2026-10-24) and a GPU rasterizer (vello) draws a page's shapes, text and gradients into an egui texture at 0.8–1.6 ms a frame, but the canvas still shows tiny-skia's pixels and effects, images and masks fall back to it; a drag across a page of effects is 12–15 ms a frame where Figma keeps its layers on the GPU | Hardware/performance | 25–50 | [hardware-parity](hardware-parity.md), [gpu-rasterizer](gpu-rasterizer.md) |
 | 8 | Platform QA: Linux and the browser left (Windows pass done 2026-10-11) | Stability/platforms | 10–20 | [hardware-parity](hardware-parity.md) |
 | 9 | Figma Draw: pen pressure on macOS/Linux tablets (multi-edit, brushes, pressure, text on a path and pattern fills landed) | Feature | 1–3 | [target-app-parity](target-app-parity.md) |
 | 10 | Team libraries: no team-wide lists or accounts; analytics are counts | Feature | 4–8 | [components-parity](components-parity.md) |
@@ -240,6 +240,14 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
 - **Landed (2026-10-15):** a bounded render margin is reused during panning and refilled before
   the visible view reaches its edge. The extra rendered area is capped at 1.6× visible pixels;
   this reduces blank strips without changing the CPU renderer.
+- **Landed (2026-10-24):** a GPU rasterizer in `figcraft-gpu`: vello 0.11 on the window's wgpu 30
+  device, fed by a scene builder that reuses the renderer's outlines (shapes, vectors, booleans,
+  text as glyph outlines), with node opacity, blend modes and clipping frames; it draws into an
+  `Rgba8Unorm` texture egui can sample, with no per-frame pixel copy. Parity with the CPU renderer
+  on the feature set it covers: mean channel difference 0.072/255, differences only on antialiased
+  edges; a whole 2320 × 1440 canvas redrawn per frame costs 0.8–1.6 ms against the CPU's 5.5–8.2 ms
+  (`canvas_tests`). Effects, images, masks and some stroke/text shapes are still refused and stay
+  on the CPU, and the canvas is not switched over yet: [`gpu-rasterizer.md`](gpu-rasterizer.md).
 - **Evidence (measured, `cargo xtask bench`):** a 50k-layer page ~8 ms zoomed out with levels of
   detail, single-layer edits at 10k layers ~0.2 ms; full 1440×900 renders 7–15 ms at 10k layers.
   Heavy effects (glass, background blur, noise) and 4K/5K canvases at 2x are where CPU time grows.

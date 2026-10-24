@@ -1,13 +1,17 @@
-//! GPU effects for the canvas: the raster effects that dominate a render (blurs) run on the GPU
-//! where there is one. The renderer keeps its CPU paths for exports, tests and machines without an
-//! adapter — the canvas installs this only when its window has a wgpu device.
+//! GPU work for the canvas: the raster effects that dominate a render (blurs) run on the GPU where
+//! there is one, and a GPU rasterizer draws a page's shapes into a texture egui can sample
+//! ([`canvas`], [`scene`]; plan and numbers in `docs/gpu-rasterizer.md`). The renderer keeps its
+//! CPU paths for exports, tests, the browser and machines without an adapter — the canvas installs
+//! this only when its window has a wgpu device.
 //!
 //! The blur is the CPU blur's: three box passes each way, with the same radii (see
 //! [`figcraft_render::fx::box_radii`]), so a canvas drawn with the GPU and an export drawn without
 //! it look the same.
 
 mod blur;
+pub mod canvas;
 mod glass;
+pub mod scene;
 
 use std::sync::Arc;
 
@@ -59,6 +63,9 @@ impl Accelerator for Gpu {
         self.glass.paint(&self.device, &self.queue, paint)
     }
 }
+
+#[cfg(test)]
+mod canvas_tests;
 
 #[cfg(test)]
 mod tests {

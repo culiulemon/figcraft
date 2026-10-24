@@ -26,7 +26,7 @@ replaced.
 | L3 | `figcraft-format` | ~5.2k | Native `.figcraft` (zip of `document.json` + images; streamed JSON), local library files, versions, REST API file JSON import (`rest/`) |
 | L4 | `figcraft-svg` | ~3.7k | SVG export and import (usvg) |
 | L4 | `figcraft-pdf` | ~2.3k | PDF export (krilla) with print options |
-| L4 | `figcraft-gpu` | ~0.3k | Effects on the window's GPU through wgpu (the same box-blur the CPU renderer uses), plugged into `figcraft-render`'s accelerator; exports, tests and machines without a device keep the CPU |
+| L4 | `figcraft-gpu` | ~0.9k | The window's GPU: effects (the same box-blur the CPU renderer uses, glass) through wgpu, plugged into `figcraft-render`'s accelerator, and the GPU canvas — document → vello scene → texture ([`gpu-rasterizer.md`](gpu-rasterizer.md)); exports, tests and machines without a device keep the CPU |
 | L5 | `figcraft-engine` | ~39.3k | Sessions, undo history (`Arc` snapshots), the command registry (`cmd/*`, `spec!`), pointer tools and vector edit mode, snapping and measuring, components sync, libraries, prototype runtime, Dev Mode code generation, the menu catalog (`catalog.rs`) and the keymap (`keymap.rs`), a panic guard |
 | L6 | `figcraft-ui-egui` | ~31.9k | The UI3-style frontend: canvas (render worker), toolbar, layers, Design/Prototype/Inspect panels, colour picker, menus, dialogs, presenter, comments, accessibility (AccessKit), the control channel server |
 | L6 | `figcraft-mcp` | ~2.4k | MCP server (JSON-RPC over stdio), headless or bridged to a running app |
@@ -66,6 +66,14 @@ across a page full of shadows, blurs and glass re-composites the rest instead of
 layers that read the backdrop (glass, background blur) or start from it (masks) are always drawn.
 SVG and PDF export walk the same scene and embed rasters where those formats can't
 express an effect.
+
+A GPU rasterizer is being built alongside it ([`gpu-rasterizer.md`](gpu-rasterizer.md)):
+`figcraft_gpu::scene` turns a page and a `View` into a vello scene from the renderer's own outlines,
+and `figcraft_gpu::canvas` draws it into a `wgpu` texture the window's egui samples, so a canvas
+frame no longer rasterises pixels on the CPU or uploads the whole image. It refuses — with a
+reason — anything it can't draw exactly yet (effects, images, some stroke and text shapes), and the
+canvas then draws that frame on the CPU; the CPU renderer stays the reference for exports, tests
+and the browser.
 
 ## File I/O
 

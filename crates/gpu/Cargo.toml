@@ -9,12 +9,16 @@ description = "GPU effects for the FigCraft canvas"
 workspace = true
 
 [dependencies]
+figcraft-color = { workspace = true }
+figcraft-doc = { workspace = true }
+figcraft-geom = { workspace = true }
 figcraft-render = { workspace = true }
+figcraft-text = { workspace = true }
 log = { workspace = true }
+# The canvas's GPU rasterizer (see `docs/gpu-rasterizer.md`): the same wgpu major version as the
+# window, so it draws into a texture egui can sample.
+vello = { version = "0.11", default-features = false, features = ["wgpu"] }
 wgpu = { workspace = true }
 
 [dev-dependencies]
 pollster = "0.4"
-figcraft-color = { workspace = true }
-figcraft-doc = { workspace = true }
-figcraft-geom = { workspace = true }
