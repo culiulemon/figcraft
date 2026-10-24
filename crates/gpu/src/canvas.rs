@@ -502,6 +502,10 @@ fn refusal(reason: &'static str) -> Option<Frame> {
 /// feature set (see [`crate::scene::supported`]); `None` leaves the frame to the CPU renderer.
 pub fn present(doc: &Document, page: NodeId, view: &View) -> Option<Frame> {
     let Some(backend) = backend() else { return refusal("not installed") };
+    // An animated image's frame changes under a document that did not: the CPU plays it.
+    if figcraft_render::images::animation_clock(doc, page, 0.0).is_some() {
+        return refusal("an animated image");
+    }
     let background = crate::scene::background(doc, page);
     let Ok(mut slot) = backend.canvas.lock() else { return refusal("canvas is busy") };
     if slot.is_none() {

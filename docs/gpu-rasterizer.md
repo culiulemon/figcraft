@@ -235,21 +235,35 @@ Any file with a photo, a logo or a pattern currently re-renders the whole page o
 renderer already decodes, filters (brightness, contrast, saturation, exposure, blur) and caches
 every image pixmap; the GPU only has to draw it.
 
-- **Images**: `figcraft_render::images::get`/`frame_at` (already filtered, already cached) → a
-  texture registered with vello's atlas once per image and size, drawn with the CPU's own
-  `image_transform` (Fill/Fit/Crop/Tile, rotation, crop). `Extend::Repeat` for tiles, `Pad` with the
-  renderer's 1-px transparent border for Fit and Crop; bicubic where the CPU asks for it.
-- **Pattern fills**: `figcraft_render::pattern::prepare` returns the tile pixmap, extend mode,
-  quality and transform — upload it and draw it as the image brush.
-- **Diamond gradient**: the CPU paints a 256 × 256 pixmap through the handle frame; upload the same
-  pixmap (`Prepared::Pattern`) and draw it the same way.
-- **Per-paint blend modes** (a fill or stroke with its own blend): one vello layer per paint, as the
-  node's own blend already gets one.
-- Animated GIFs and WebP stay on the CPU (a frame changes under a document that did not).
+**Landed.** A paint that isn't a solid or a linear/radial/angular gradient is handed to
+`figcraft_render::paint::prepare_at`, which returns the renderer's own prepared pixmap (decoded and
+filtered image, a pattern's cell, a diamond gradient's 256 × 256 tile), its extend mode, filter
+quality, opacity and image-pixel → local transform. The builder uploads that pixmap once (vello's
+image atlas keeps it while the same `Blob` is asked for; the `Arc` is cached, so a photo's pixmap —
+already cached by the renderer — is the same one every frame) and draws it as vello's image brush:
+
+- **Images**: Fill, Fit, Crop, Tile, rotation and crop, the renderer's padded 1-px border for Fit and
+  Crop (so `Pad` spreads transparency, not edge pixels), `Extend::Repeat` for tiles. Filtered and
+  translucent images work: the filters are in the pixmap, the paint's opacity is the sampler's
+  `alpha`.
+- **Pattern fills**: the renderer's cell pixmap, `Extend::Repeat`, bilinear.
+- **Diamond gradients**: the renderer's tile through its handle frame, `Extend::Pad`.
+- **Per-paint blend modes**: a fill or stroke with its own blend gets a vello layer of its own, as
+  the node's blend already did. `PlusDarker` still falls back (P8).
+
+Resampling is the one difference: vello's image sampling is nearest (`ImageQuality::Low`) or
+bilinear (`Medium`) — there is no bicubic — so a photo drawn much smaller than its pixels samples
+four texels where tiny-skia's bicubic samples sixteen. Measured on a page of 1:1, fitted (2×
+downscaled), cropped, tiled, rotated and filtered photos, a diamond gradient, a pattern fill and
+multiplied/screened paints: mean 0.066/255, worst 10 on one channel, 5 of 450,000 pixels off by
+more than 8 (`the_gpu_draws_the_paint_variations`).
+- Animated GIFs (the only animation the renderer plays) stay on the CPU: the canvas refuses a page
+  whose images animate, since a frame changes under a document that did not.
 
 Tests: parity per scale mode, per filter, with rotation and crop; a pattern tile; a diamond
-gradient; a multiplied fill. Exit: a page of photos, logos and pattern fills draws on the GPU within
-the page tolerance.
+gradient; a multiplied fill (`the_gpu_draws_the_paint_variations`). Exit: a page of photos, logos
+and pattern fills draws on the GPU within the page tolerance. **Met.**
+
 
 ### P6 — any-outline shadows, inner shadows
 
@@ -363,6 +377,7 @@ Run in `cargo xtask ci` unless marked *timing* (release, `--ignored --nocapture`
 | 1b | `the_gpu_text_matches_the_cpu_render` | text is pixel-identical (measured: 0 differing bytes) |
 | 1c | `the_gpu_layer_blur_matches_the_cpu_render`, `the_gpu_drop_shadow_matches_the_cpu_render`, `the_gpu_draws_the_shadow_variations` | effects: mean 0.011, 0.044 and 0.512/255 (the last with spread, two shadows, a stroke, a gradient card, a clipped frame and a rotation) |
 | 1d | `the_segmented_page_matches_the_cpu_with_one_glass_pane`, `..._one_background_blur`, `the_gpu_page_matches_with_several_backdrop_layers` | backdrop effects in the accumulated renderer: mean 0.061, 0.049 and 0.725/255 |
+| 1e | `the_gpu_draws_the_paint_variations` | paints: a photo 1:1, fitted, cropped, tiled, rotated, filtered and translucent, a pattern fill, a diamond gradient, multiplied and screened paints (mean 0.066/255, worst 10) |
 | 2 | `unsupported_pages_fall_back` | the predicate rejects exactly the features not yet ported |
 | 3 | `the_gpu_canvas_reads_back` | screenshot/export path: texture → `Pixmap`, premultiplied, same size |
 | 4 | *timing* `canvas_frame_timings`, `segmented_timings` | CPU vs GPU frame at 2320 × 1440 (plain and heavy) and 2400 × 1600 (backdrop pages) |
@@ -490,3 +505,12 @@ stays on the fallback list.
   text tail, nested backdrops and outline mode, and cross-frame retention. Each phase carries its
   own tests and exit criterion; the deliberately non-ported set (exports, the browser, soft proof
   and Display P3) is named at the end.
+- 2026-10-25: **P5 landed — paints.** Images (every scale mode, rotation, crop, filters, opacity),
+  pattern fills, diamond gradients and per-paint blend modes draw on the GPU from the renderer's own
+  prepared pixmaps; only skew-free linear gradients still use vello's own gradient brush. A page
+  with a photo, a logo or a pattern no longer re-renders on the CPU.
+  - `the_gpu_draws_the_paint_variations`: mean 0.066/255, worst 10, 5 of 450,000 pixels off by more
+    than 8 — the bilinear (vello) against bicubic (tiny-skia) difference on a 2× downscaled photo.
+  - Animated GIF pages stay on the CPU (the canvas refuses them in `present`, before any work).
+  - `PlusDarker` paints and skewed linear gradients still fall back, with a test each.
+

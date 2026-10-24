@@ -5,16 +5,21 @@
 //! module only turns outlines and paints into vello commands, and refuses — with a reason — what
 //! it cannot draw exactly yet, which makes the canvas fall back to the CPU for that frame.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use figcraft_color::{BlendMode, Color, Gradient, GradientKind, Paint, PaintKind};
 use figcraft_doc::{Document, Node, NodeId, NodeKind};
 use figcraft_geom::{Affine, Shape as _};
-use figcraft_render::{FillRule, View, node_outline};
+use figcraft_render::paint::{Prepared, prepare_at};
+use figcraft_render::{FillRule, Pixmap, View, node_outline};
+use tiny_skia::{FilterQuality, SpreadMode, Transform};
 use vello::Scene;
 use vello::kurbo::{Affine as KAffine, Point, Rect as KRect, Stroke};
 use vello::peniko::color::DynamicColor;
 use vello::peniko::{
-    BlendMode as PBlend, Brush, Color as PColor, ColorStop, ColorStops, Compose, Extend, Fill, Gradient as PGradient, ImageBrush, ImageData,
-    ImageQuality, ImageSampler, Mix,
+    BlendMode as PBlend, Blob, Brush, Color as PColor, ColorStop, ColorStops, Compose, Extend, Fill, Gradient as PGradient, ImageAlphaType,
+    ImageBrush, ImageData, ImageFormat, ImageQuality, ImageSampler, Mix,
 };
 
 /// Why a page can't be drawn on the GPU yet.
@@ -22,7 +27,7 @@ use vello::peniko::{
 pub enum Unsupported {
     /// A visible effect (shadow, blur, glass, grain): drawn by GPU passes in a later phase.
     Effect,
-    /// A paint the scene builder doesn't draw yet (image, pattern, diamond gradient).
+    /// A paint the scene builder doesn't draw exactly (a skewed linear gradient, plus-darker).
     Paint,
     /// A stroke shape it doesn't draw yet (inside/outside, dashes, variable width, brushes, arrows).
     Stroke,
@@ -745,9 +750,24 @@ impl Builder<'_> {
     /// A layer for the node's opacity and blend mode, clipped to what the scene can see: the whole
     /// target (the builder doesn't know the view's bounds here; the canvas keeps its view).
     fn push_layer(&mut self, n: &Node) {
+        self.push_blend_opacity(n.blend, n.opacity.clamp(0.0, 1.0));
+    }
+
+    /// A layer for a paint's own blend mode (`paint_layer`), clipped the same way.
+    fn push_blend(&mut self, b: BlendMode) {
+        self.push_blend_opacity(b, 1.0);
+    }
+
+    fn push_blend_opacity(&mut self, b: BlendMode, opacity: f32) {
         let Some(s) = &mut self.scene else { return };
         let target = KRect::new(0.0, 0.0, 32_768.0, 32_768.0);
-        s.push_layer(Fill::NonZero, blend(n.blend), n.opacity.clamp(0.0, 1.0), KAffine::IDENTITY, &target);
+        s.push_layer(Fill::NonZero, blend(b), opacity, KAffine::IDENTITY, &target);
+    }
+
+    fn pop_layer(&mut self) {
+        if let Some(s) = &mut self.scene {
+            s.pop_layer();
+        }
     }
 
     /// Fills, children and strokes of `n`, without opacity, blend or effects.
@@ -807,15 +827,21 @@ impl Builder<'_> {
     }
 
     fn fill(&mut self, paint: &Paint, path: &figcraft_geom::BezPath, rule: FillRule, size: (f64, f64), xf: Affine) -> Result<(), Unsupported> {
-        let Some((brush, brush_xf)) = self.brush(paint, size)? else { return Ok(()) };
-        if let Some(s) = &mut self.scene {
-            s.fill(fill_rule(rule), k_affine(xf), &brush, brush_xf, path);
+        let Some(spec) = self.spec(paint, size, xf.determinant().abs().sqrt())? else { return Ok(()) };
+        let isolated = paint_layer(paint.blend)?;
+        if isolated {
+            self.push_blend(paint.blend);
+        }
+        self.fill_spec(&spec, path, rule, xf);
+        if isolated {
+            self.pop_layer();
         }
         Ok(())
     }
 
     fn strokes(&mut self, n: &Node, path: &figcraft_geom::BezPath, size: (f64, f64), xf: Affine, text: bool) -> Result<(), Unsupported> {
         let props = &n.stroke;
+        let scale = xf.determinant().abs().sqrt();
         let plain = props.align == figcraft_doc::StrokeAlign::Center
             && props.sides.is_none()
             && props.dashes.is_empty()
@@ -830,9 +856,14 @@ impl Builder<'_> {
         if plain {
             let stroke = Stroke::new(props.weight.max(0.0)).with_join(join(props.join)).with_caps(cap(props.cap_start));
             for p in &n.strokes {
-                let Some((brush, brush_xf)) = self.brush(p, size)? else { continue };
-                if let Some(s) = &mut self.scene {
-                    s.stroke(&stroke, k_affine(xf), &brush, brush_xf, path);
+                let Some(spec) = self.spec(p, size, scale)? else { continue };
+                let isolated = paint_layer(p.blend)?;
+                if isolated {
+                    self.push_blend(p.blend);
+                }
+                self.stroke_spec(&spec, &stroke, path, xf);
+                if isolated {
+                    self.pop_layer();
                 }
             }
             return Ok(());
@@ -841,49 +872,155 @@ impl Builder<'_> {
         // dashes, width profiles, brushes — as the renderer works its outline out, filled.
         let Some((band, rule)) = figcraft_render::stroke_fill(self.doc, n) else { return Err(Unsupported::Stroke) };
         for p in &n.strokes {
-            let Some((brush, brush_xf)) = self.brush(p, size)? else { continue };
-            if let Some(s) = &mut self.scene {
-                s.fill(fill_rule(rule), k_affine(xf), &brush, brush_xf, band.as_ref());
+            let Some(spec) = self.spec(p, size, scale)? else { continue };
+            let isolated = paint_layer(p.blend)?;
+            if isolated {
+                self.push_blend(p.blend);
+            }
+            self.fill_spec(&spec, band.as_ref(), rule, xf);
+            if isolated {
+                self.pop_layer();
             }
         }
         Ok(())
     }
 
-    /// The paint's brush and its unit-box → local transform (`None`: the paint draws nothing).
-    #[allow(clippy::type_complexity)]
-    fn brush(&self, paint: &Paint, size: (f64, f64)) -> Result<Option<(Brush, Option<KAffine>)>, Unsupported> {
+    /// The paint's brush (`None`: it draws nothing), with its own blend mode's layer around it.
+    fn spec(&self, paint: &Paint, size: (f64, f64), scale: f64) -> Result<Option<BrushSpec>, Unsupported> {
         if !paint.visible || paint.opacity <= 0.0 {
             return Ok(None);
         }
-        // A paint's own blend mode needs a layer per paint: not drawn yet.
-        if !matches!(paint.blend, BlendMode::PassThrough | BlendMode::Normal) {
-            return Err(Unsupported::Paint);
-        }
         let op = paint.opacity.clamp(0.0, 1.0);
-        let brush = match &paint.kind {
+        let spec = match &paint.kind {
             PaintKind::Solid { color } => {
                 let c = color.with_alpha(color.a * op);
                 if c.a <= 0.0 {
                     return Ok(None);
                 }
-                Brush::Solid(pcolor(c))
+                BrushSpec::Solid(pcolor(c))
             }
-            PaintKind::Gradient(g) => {
+            PaintKind::Gradient(g) if g.kind != GradientKind::Diamond => {
                 // vello's linear gradient is a projection onto its axis: a width handle that isn't
                 // square to it (only imported files skew one) would draw different bands there.
                 if !squared_linear(g, size) {
                     return Err(Unsupported::Paint);
                 }
-                Brush::Gradient(gradient(g, op)?)
+                BrushSpec::Gradient(gradient(g, op)?, Some(k_affine(handle_frame(g, size.0, size.1))))
             }
-            PaintKind::Image(_) | PaintKind::Pattern(_) => return Err(Unsupported::Paint),
+            // Images, pattern fills and diamond gradients are the renderer's own pixmaps — decoded,
+            // filtered and cached there — drawn as vello's image brush through the renderer's own
+            // image transform.
+            PaintKind::Gradient(_) | PaintKind::Image(_) | PaintKind::Pattern(_) => {
+                let Some(Prepared::Pattern { pixmap, mode, quality: filter, opacity, transform }) =
+                    prepare_at(paint, size.0, size.1, scale, self.doc, 0.0)
+                else {
+                    // A missing image, a pattern past its depth: the CPU paints nothing either.
+                    return Ok(None);
+                };
+                let sampler = ImageSampler { x_extend: extend(mode), y_extend: extend(mode), quality: quality(filter), alpha: opacity };
+                BrushSpec::Image(image_data(&pixmap), sampler, ts_affine(transform))
+            }
         };
-        let frame = match &paint.kind {
-            PaintKind::Gradient(g) => Some(k_affine(handle_frame(g, size.0, size.1))),
-            _ => None,
-        };
-        Ok(Some((brush, frame)))
+        Ok(Some(spec))
     }
+
+    fn fill_spec(&mut self, spec: &BrushSpec, path: &figcraft_geom::BezPath, rule: FillRule, xf: Affine) {
+        let Some(s) = &mut self.scene else { return };
+        s.fill(fill_rule(rule), k_affine(xf), &spec.brush(), spec.transform(), path);
+    }
+
+    fn stroke_spec(&mut self, spec: &BrushSpec, stroke: &Stroke, path: &figcraft_geom::BezPath, xf: Affine) {
+        let Some(s) = &mut self.scene else { return };
+        s.stroke(stroke, k_affine(xf), &spec.brush(), spec.transform(), path);
+    }
+}
+
+/// A paint's brush. Owned because an image's data lives in the cache, past the paint's life.
+enum BrushSpec {
+    Solid(PColor),
+    Gradient(PGradient, Option<KAffine>),
+    /// The image, how to sample it, and the image-pixel → local mapping.
+    Image(ImageData, ImageSampler, KAffine),
+}
+
+impl BrushSpec {
+    fn brush(&self) -> Brush {
+        match self {
+            BrushSpec::Solid(c) => Brush::Solid(*c),
+            BrushSpec::Gradient(g, _) => Brush::Gradient(g.clone()),
+            BrushSpec::Image(image, sampler, _) => Brush::Image(ImageBrush { image: image.clone(), sampler: *sampler }),
+        }
+    }
+
+    /// The brush's own space → local mapping (`None`: the brush has no space of its own).
+    fn transform(&self) -> Option<KAffine> {
+        match self {
+            BrushSpec::Solid(_) => None,
+            BrushSpec::Gradient(_, t) => *t,
+            BrushSpec::Image(_, _, t) => Some(*t),
+        }
+    }
+}
+
+/// Whether a paint's own blend mode needs a vello layer around it (`Err` for plus-darker, which
+/// vello can't compose: the CPU draws it).
+fn paint_layer(b: BlendMode) -> Result<bool, Unsupported> {
+    if b == BlendMode::PlusDarker {
+        return Err(Unsupported::Paint);
+    }
+    Ok(!matches!(b, BlendMode::PassThrough | BlendMode::Normal))
+}
+
+/// The pixmaps handed to vello, kept so their `Blob` outlives the frame: vello's atlas only keeps
+/// an image's slot while the same blob is asked for, and a new one would upload it again.
+fn images() -> &'static Mutex<HashMap<(usize, u32, u32), (Arc<Pixmap>, ImageData)>> {
+    static IMAGES: OnceLock<Mutex<HashMap<(usize, u32, u32), (Arc<Pixmap>, ImageData)>>> = OnceLock::new();
+    IMAGES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The most images kept (a page with more re-uploads them next frame: still correct, only slower).
+const MAX_IMAGES: usize = 256;
+
+/// `pm` as a vello image, cached by the pixmap's own identity (the renderer caches decoded images,
+/// so a photo's pixmap is the same one every frame).
+fn image_data(pm: &Arc<Pixmap>) -> ImageData {
+    let key = (Arc::as_ptr(pm) as usize, pm.width(), pm.height());
+    let mut cache = images().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, data)) = cache.get(&key) {
+        return data.clone();
+    }
+    let data = ImageData {
+        data: Blob::new(Arc::new(pm.data().to_vec())),
+        format: ImageFormat::Rgba8,
+        alpha_type: ImageAlphaType::AlphaPremultiplied,
+        width: pm.width(),
+        height: pm.height(),
+    };
+    if cache.len() >= MAX_IMAGES {
+        cache.clear();
+    }
+    cache.insert(key, (pm.clone(), data.clone()));
+    data
+}
+
+fn extend(mode: SpreadMode) -> Extend {
+    match mode {
+        SpreadMode::Pad => Extend::Pad,
+        SpreadMode::Repeat => Extend::Repeat,
+        SpreadMode::Reflect => Extend::Reflect,
+    }
+}
+
+fn quality(q: FilterQuality) -> ImageQuality {
+    match q {
+        FilterQuality::Nearest => ImageQuality::Low,
+        FilterQuality::Bilinear | FilterQuality::Bicubic => ImageQuality::Medium,
+    }
+}
+
+/// tiny-skia's transform (image pixels → local) as kurbo's.
+fn ts_affine(t: Transform) -> KAffine {
+    KAffine::new([f64::from(t.sx), f64::from(t.ky), f64::from(t.kx), f64::from(t.sy), f64::from(t.tx), f64::from(t.ty)])
 }
 
 /// Whether a linear gradient's width handle is square to its axis in a `w` × `h` box — the way the

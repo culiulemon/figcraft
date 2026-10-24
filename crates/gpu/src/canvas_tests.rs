@@ -251,8 +251,15 @@ fn unsupported_pages_are_refused() {
     assert_eq!(scene::supported(&d, p), Ok(()));
     d.get_mut(id).unwrap().effects.clear();
 
-    // An image fill needs the renderer's texture atlas.
+    // An image fill draws from the renderer's own decoded, filtered, cached pixmap.
     d.get_mut(id).unwrap().fills = vec![Paint::image("hash", figcraft_color::ImageScaleMode::Fill)];
+    assert_eq!(scene::supported(&d, p), Ok(()), "an image fill is the renderer's pixmap");
+    // A paint's own blend mode composites in a layer of its own; plus-darker has no vello mode.
+    let mut p0 = Paint::solid(Color::WHITE);
+    p0.blend = BlendMode::Multiply;
+    d.get_mut(id).unwrap().fills = vec![p0];
+    assert_eq!(scene::supported(&d, p), Ok(()));
+    d.get_mut(id).unwrap().fills[0].blend = BlendMode::PlusDarker;
     assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Paint));
 }
 
@@ -688,6 +695,139 @@ fn the_gpu_draws_the_shadow_variations() {
     );
     assert!(worst <= 96, "a channel differs by {worst} (mean {mean:.3})");
     assert!(mean <= 1.0, "the mean difference is {mean:.3}");
+}
+
+/// A photo-like PNG: a diagonal gradient with a checker of squares, opaque.
+fn photo_png(w: u32, h: u32) -> Vec<u8> {
+    use image::ImageEncoder as _;
+    let mut img = image::RgbaImage::new(w, h);
+    for (x, y, px) in img.enumerate_pixels_mut() {
+        let (fx, fy) = (f64::from(x) / f64::from(w), f64::from(y) / f64::from(h));
+        let t = fx * 0.6 + fy * 0.4;
+        let band = if (x / 16 + y / 16) % 2 == 0 { 1.0 } else { 0.86 };
+        let c = |a: f64, b: f64| ((a + (b - a) * t) * band * 255.0).round().clamp(0.0, 255.0) as u8;
+        *px = image::Rgba([c(0.08, 0.95), c(0.30, 0.72), c(0.85, 0.18), 255]);
+    }
+    let mut out = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut out).write_image(img.as_raw(), w, h, image::ExtendedColorType::Rgba8).expect("png");
+    out
+}
+
+/// Every paint the GPU now draws as the renderer's own pixmap or in a layer of its own: a photo in
+/// each scale mode (1:1, fitted, cropped, tiled, rotated, translucent), a filtered one, a diamond
+/// gradient, a pattern fill and paints with their own blend modes.
+fn paints_doc() -> Document {
+    let mut d = Document::new("gpu paints");
+    let p = d.first_page().unwrap();
+    let hex = |s: &str| Color::from_hex(s).unwrap_or(Color::WHITE);
+    let photo = "photo".to_string();
+    d.images.insert(photo.clone(), figcraft_doc::ImageData { bytes: Arc::new(photo_png(320, 200)), width: 320, height: 200 });
+
+    let image = |mode: figcraft_color::ImageScaleMode, tune: &dyn Fn(&mut figcraft_color::ImagePaint)| {
+        let mut paint = Paint::image(photo.clone(), mode);
+        if let figcraft_color::PaintKind::Image(img) = &mut paint.kind {
+            tune(img);
+        }
+        paint
+    };
+    // 1:1, fitted (letterboxed), cropped, tiled and rotated.
+    fn add(d: &mut Document, p: figcraft_doc::NodeId, name: &str, at: (f64, f64), size: (f64, f64), paints: Vec<Paint>) -> figcraft_doc::NodeId {
+        let id = d.create(p, NodeKind::Rectangle, name, at.0, at.1, size.0, size.1).unwrap();
+        d.get_mut(id).unwrap().fills = paints;
+        id
+    }
+
+    add(&mut d, p, "photo 1:1", (20.0, 20.0), (320.0, 200.0), vec![image(figcraft_color::ImageScaleMode::Fill, &|_| {})]);
+    add(&mut d, p, "photo fit", (360.0, 20.0), (180.0, 200.0), vec![image(figcraft_color::ImageScaleMode::Fit, &|_| {})]);
+    add(
+        &mut d,
+        p,
+        "photo crop",
+        (560.0, 20.0),
+        (180.0, 200.0),
+        vec![image(figcraft_color::ImageScaleMode::Crop, &|i| i.crop = Some([2.0, 0.0, 0.0, 1.6, -0.5, -0.3]))],
+    );
+    add(&mut d, p, "photo tile", (20.0, 240.0), (180.0, 180.0), vec![image(figcraft_color::ImageScaleMode::Tile, &|i| i.scale = 0.5)]);
+    add(&mut d, p, "photo turned", (220.0, 240.0), (200.0, 180.0), vec![image(figcraft_color::ImageScaleMode::Fill, &|i| i.rotation = 1)]);
+    // A filtered photo, and a translucent one (the sampler's own alpha).
+    add(
+        &mut d,
+        p,
+        "photo tuned",
+        (440.0, 240.0),
+        (140.0, 180.0),
+        vec![image(figcraft_color::ImageScaleMode::Fill, &|i| i.filters.exposure = 0.3)],
+    );
+    let mut faint = image(figcraft_color::ImageScaleMode::Fill, &|_| {});
+    faint.opacity = 0.55;
+    add(&mut d, p, "photo faint", (600.0, 240.0), (140.0, 180.0), vec![faint]);
+
+    // A diamond gradient: the renderer's 256 × 256 tile through the handle frame.
+    let diamond = Gradient {
+        kind: GradientKind::Diamond,
+        stops: vec![
+            figcraft_color::ColorStop { position: 0.0, color: hex("FFF3C0") },
+            figcraft_color::ColorStop { position: 0.5, color: hex("F0A030") },
+            figcraft_color::ColorStop { position: 1.0, color: hex("6030A0") },
+        ],
+        from: (0.0, 0.0),
+        to: (1.0, 1.0),
+        width: (0.0, 1.0),
+    };
+    add(&mut d, p, "diamond", (760.0, 20.0), (120.0, 200.0), vec![Paint::gradient(diamond)]);
+
+    // A pattern fill: a hidden 24 × 24 layer tiled at its own size.
+    let tile = add(&mut d, p, "tile source", (0.0, 0.0), (24.0, 24.0), vec![Paint::solid(hex("F0C830"))]);
+    d.get_mut(tile).unwrap().visible = false;
+    d.get_mut(tile).unwrap().kind = NodeKind::Frame;
+    let dot = d.create(tile, NodeKind::Rectangle, "dot", 7.0, 7.0, 10.0, 10.0).unwrap();
+    d.get_mut(dot).unwrap().fills = vec![Paint::solid(hex("2040E0"))];
+    add(&mut d, p, "pattern", (760.0, 240.0), (120.0, 180.0), vec![Paint::pattern(tile.0)]);
+
+    // Paints with their own blend modes, in a layer each.
+    add(&mut d, p, "ground", (20.0, 440.0), (300.0, 40.0), vec![Paint::solid(hex("40A060"))]);
+    let mut over = Paint::solid(hex("E03030"));
+    over.blend = BlendMode::Multiply;
+    add(&mut d, p, "multiplied", (120.0, 450.0), (260.0, 40.0), vec![over]);
+    let mut screen = Paint::solid(hex("2040E0"));
+    screen.blend = BlendMode::Screen;
+    add(&mut d, p, "screened", (420.0, 450.0), (200.0, 40.0), vec![screen]);
+    d
+}
+
+#[test]
+fn the_gpu_draws_the_paint_variations() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let d = paints_doc();
+    let p = d.first_page().unwrap();
+    assert_eq!(scene::supported(&d, p), Ok(()), "a page of images, patterns and paint blends stays on the GPU");
+    let (w, h) = (900u32, 500u32);
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+    let cpu = render_view(&d, p, &view, &Options::default()).unwrap();
+    let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+    let built = scene::build_with(&d, p, &view, &mut scene::NoLayers).expect("the GPU draws the paints");
+    assert!(canvas.render(&device, &queue, &built, scene::background(&d, p)).is_some());
+    let gpu = canvas.read(&device, &queue).unwrap();
+    if std::env::var("FIGCRAFT_PARITY_PNG").is_ok() {
+        let dir = std::env::temp_dir();
+        let _ = cpu.save_png(dir.join("figcraft-paints-cpu.png"));
+        let _ = gpu.save_png(dir.join("figcraft-paints-gpu.png"));
+    }
+    let (worst, mean, at, over) = diff(&cpu, &gpu);
+    let px = |p: &Pixmap, (x, y): (u32, u32)| {
+        let i = ((y as usize * p.width() as usize) + x as usize) * 4;
+        p.data().get(i..i + 4).map(<[u8]>::to_vec)
+    };
+    println!(
+        "paint breadth parity: worst {worst} at {at:?} (CPU {:?}, GPU {:?}), mean {mean:.3}, {over} pixels differ by more than 8",
+        px(&cpu, at),
+        px(&gpu, at)
+    );
+    assert!(worst <= 128, "a channel differs by {worst} (mean {mean:.3})");
+    assert!(mean <= 1.5, "the mean difference is {mean:.3}");
 }
 
 #[test]

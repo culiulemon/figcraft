@@ -1624,8 +1624,10 @@ dependencies = [
  "figcraft-geom",
  "figcraft-render",
  "figcraft-text",
+ "image",
  "log",
  "pollster 0.4.0",
+ "tiny-skia 0.12.0",
  "vello",
  "wgpu",
 ]
