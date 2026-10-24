@@ -58,6 +58,8 @@ pub fn cell_pixmap(doc: &Document, pt: &PatternPaint, w: f64, h: f64, scale: f64
         under: None,
         time,
         bounds: &bounds,
+        page_at: (0.0, 0.0),
+        cache: None,
     };
     let unrotated = src.transform.inverse();
     nested(|| {

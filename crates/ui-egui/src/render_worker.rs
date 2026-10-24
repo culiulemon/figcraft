@@ -95,6 +95,8 @@ fn run(job: &Job, view: &View, retained: &mut Retained, coarse: bool) -> Option<
         skip: job.skip.clone(),
         solo: job.solo,
         lod: true,
+        // The canvas keeps unchanged layers between frames (see `figcraft_render::layers`).
+        doc_id: job.uid,
         ..Default::default()
     };
     let (view, pix, work) = retained.render(&job.doc, job.page, view, &opts)?;

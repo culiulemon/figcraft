@@ -7,6 +7,8 @@
 //! `frost` blurs the backdrop first. Distances to the outline come from an exact Euclidean
 //! distance transform of the shape's coverage.
 
+use std::sync::{Arc, Mutex, OnceLock};
+
 use figcraft_doc::Glass;
 use figcraft_geom::Affine;
 use tiny_skia::Pixmap;
@@ -96,24 +98,61 @@ pub fn inside_distance(cov: &Pixmap) -> Vec<f32> {
     g.iter().map(|s| if *s > 0.0 { (s.sqrt() - 0.5).max(0.0) as f32 } else { 0.0 }).collect()
 }
 
-/// Running-sum box blur of a `w` × `h` field along rows (`stride` 1) or columns (`stride` `w`),
-/// radius `r`, zero outside.
-fn box_pass(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize, rows: bool) {
-    let (lines, len, step, across) = if rows { (h, w, 1, w) } else { (w, h, w, 1) };
+/// Running-sum box blur of a `w` × `h` field along its rows, radius `r`, zero outside.
+fn box_pass(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize) {
     let norm = 1.0 / (2 * r + 1) as f32;
-    for l in 0..lines {
-        let base = l * across;
-        let at = |i: usize| src.get(base + i * step).copied().unwrap_or(0.0);
-        let mut acc: f32 = (0..=r.min(len.saturating_sub(1))).map(at).sum();
-        for i in 0..len {
-            if let Some(o) = dst.get_mut(base + i * step) {
+    for l in 0..h {
+        let base = l * w;
+        let at = |i: usize| src.get(base + i).copied().unwrap_or(0.0);
+        let mut acc: f32 = (0..=r.min(w.saturating_sub(1))).map(at).sum();
+        for i in 0..w {
+            if let Some(o) = dst.get_mut(base + i) {
                 *o = acc * norm;
             }
-            if i + r + 1 < len {
+            if i + r + 1 < w {
                 acc += at(i + r + 1);
             }
             if i >= r {
                 acc -= at(i - r);
+            }
+        }
+    }
+}
+
+/// [`box_pass`] down the columns: a running sum per column, row by row, so every read and write is
+/// a row in memory (a pass down a column would take a cache miss per pixel).
+fn box_pass_cols(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize) {
+    let norm = 1.0 / (2 * r + 1) as f32;
+    let mut acc = vec![0f32; w];
+    for y in 0..=r.min(h.saturating_sub(1)) {
+        let base = y * w;
+        for x in 0..w {
+            if let (Some(a), Some(s)) = (acc.get_mut(x), src.get(base + x)) {
+                *a += *s;
+            }
+        }
+    }
+    for y in 0..h {
+        let base = y * w;
+        for x in 0..w {
+            if let (Some(a), Some(d)) = (acc.get(x), dst.get_mut(base + x)) {
+                *d = a * norm;
+            }
+        }
+        if y + r + 1 < h {
+            let add = (y + r + 1) * w;
+            for x in 0..w {
+                if let (Some(a), Some(s)) = (acc.get_mut(x), src.get(add + x)) {
+                    *a += *s;
+                }
+            }
+        }
+        if y >= r {
+            let sub = (y - r) * w;
+            for x in 0..w {
+                if let (Some(a), Some(s)) = (acc.get_mut(x), src.get(sub + x)) {
+                    *a -= *s;
+                }
             }
         }
     }
@@ -137,8 +176,8 @@ fn smooth_normals(dist: &[f32], w: usize, h: usize, r: usize) -> Vec<(f32, f32)>
     let mut tmp = vec![0f32; w * h];
     for g in [&mut gx, &mut gy] {
         for _ in 0..2 {
-            box_pass(g, &mut tmp, w, h, r, true);
-            box_pass(&tmp, g, w, h, r, false);
+            box_pass(g, &mut tmp, w, h, r);
+            box_pass_cols(&tmp, g, w, h, r);
         }
     }
     gx.iter()
@@ -150,8 +189,129 @@ fn smooth_normals(dist: &[f32], w: usize, h: usize, r: usize) -> Vec<(f32, f32)>
         .collect()
 }
 
+/// The part of a pane's pixels that depends only on its shape, its size and the zoom — not on
+/// where it sits or what is behind it: its coverage's distance field and the normals smoothed from
+/// it. A drag moves a pane without changing any of that, so every frame after the first finds them
+/// (a render from scratch would work them out again).
+struct Geometry {
+    /// What it was worked out from, compared exactly on the way in.
+    shape: Outline,
+    key: Key,
+    /// Which geometry this is, for an accelerator keeping it as textures.
+    id: u64,
+    /// The coverage's alpha, `cw` × `ch`.
+    cw: usize,
+    ch: usize,
+    alpha: Vec<u8>,
+    dist: Vec<f32>,
+    normals: Vec<(f32, f32)>,
+    /// What it takes, for the cache's budget.
+    bytes: usize,
+}
+
+/// Kept geometry, least recently used first.
+static GEOMETRY: OnceLock<Mutex<Vec<Arc<Geometry>>>> = OnceLock::new();
+
+/// Keys worked out lately: a pane's geometry is kept once it is asked for again, so a resize or a
+/// zoom (a new shape every frame) doesn't fill the cache with what is never reused.
+static SEEN: OnceLock<Mutex<std::collections::VecDeque<Key>>> = OnceLock::new();
+
+/// The most keys remembered (a few panes' bands, a few frames back).
+const SEEN_MAX: usize = 64;
+
+/// What a pane's geometry is keyed by: its coverage's size, the margin and smoothing, and the grid
+/// it is rasterised on.
+type Key = (u32, u32, u32, usize, [u64; 6]);
+
+/// The most the kept geometry may take (bytes; an entry is about 12 bytes a pixel).
+const GEOMETRY_BUDGET: usize = 64 << 20;
+
+// How many geometries this thread worked out (tests: a moved pane works out none).
+#[cfg(test)]
+thread_local! {
+    static COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn computed() -> usize {
+    COMPUTED.with(|c| c.get())
+}
+
+/// The transform a pane's pixels are rasterised with, bit for bit: a render that cuts the pane
+/// (a band, a patch) shifts it, while moving the pane leaves it alone.
+fn grid(xf: Affine) -> [u64; 6] {
+    xf.as_coeffs().map(f64::to_bits)
+}
+
+/// The geometry of a pane with `cov`erage (its shape through `xf`, grown by `m` each way, smoothed
+/// over `r` pixels), from the cache when this pane was drawn before.
+fn geometry(shape: &Outline, xf: Affine, m: u32, r: usize, cov: &Pixmap) -> Arc<Geometry> {
+    let (cw, ch) = (cov.width(), cov.height());
+    let key: Key = (cw, ch, m, r, grid(xf));
+    let cache = GEOMETRY.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(mut kept) = cache.lock()
+        && let Some(i) = kept.iter().position(|g| g.key == key && g.shape == *shape)
+    {
+        let g = kept.remove(i);
+        kept.push(g.clone());
+        return g;
+    }
+    let dist = inside_distance(cov);
+    let normals = smooth_normals(&dist, cw as usize, ch as usize, r);
+    #[cfg(test)]
+    COMPUTED.with(|c| c.set(c.get() + 1));
+    let alpha: Vec<u8> = cov.data().chunks_exact(4).map(|p| p.get(3).copied().unwrap_or(0)).collect();
+    let bytes = alpha.len() + dist.len() * std::mem::size_of::<f32>() + normals.len() * std::mem::size_of::<(f32, f32)>();
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let g = Arc::new(Geometry { shape: shape.clone(), key, id, cw: cw as usize, ch: ch as usize, alpha, dist, normals, bytes });
+    // Kept from the second sight on: a moving pane asks for its geometry every frame, while a
+    // resize or a zoom never asks twice (keeping those would only fill memory).
+    if seen(&key)
+        && bytes <= GEOMETRY_BUDGET
+        && let Ok(mut kept) = cache.lock()
+    {
+        let mut total: usize = kept.iter().map(|g| g.bytes).sum();
+        while total.saturating_add(bytes) > GEOMETRY_BUDGET && !kept.is_empty() {
+            total = total.saturating_sub(kept.remove(0).bytes);
+        }
+        kept.push(g.clone());
+    }
+    g
+}
+
+/// Whether `key` was worked out before (remembering it for the next time).
+fn seen(key: &Key) -> bool {
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::VecDeque::new()));
+    let Ok(mut seen) = seen.lock() else { return false };
+    if seen.contains(key) {
+        return true;
+    }
+    if seen.len() >= SEEN_MAX {
+        seen.pop_front();
+    }
+    seen.push_back(*key);
+    false
+}
+
+/// Empty the kept geometry (tests).
+#[cfg(test)]
+fn clear_geometry() {
+    if let Some(cache) = GEOMETRY.get()
+        && let Ok(mut kept) = cache.lock()
+    {
+        kept.clear();
+    }
+    if let Some(seen) = SEEN.get()
+        && let Ok(mut seen) = seen.lock()
+    {
+        seen.clear();
+    }
+}
+
 /// Bilinear sample of premultiplied `p` at pixel coordinates `(x, y)` (centres at +0.5), each
 /// channel 0..=255; transparent outside.
+#[inline]
 fn sample(p: &Pixmap, x: f32, y: f32) -> [f32; 4] {
     let (w, h) = (p.width() as i64, p.height() as i64);
     let (x, y) = (x - 0.5, y - 0.5);
@@ -159,6 +319,25 @@ fn sample(p: &Pixmap, x: f32, y: f32) -> [f32; 4] {
     let (tx, ty) = (x - x0, y - y0);
     let (x0, y0) = (x0 as i64, y0 as i64);
     let data = p.data();
+    // Wholly inside (the common case): two rows of two texels, read in one piece each.
+    if x0 >= 0 && y0 >= 0 && x0 + 1 < w && y0 + 1 < h {
+        let i = ((y0 * w + x0) * 4) as usize;
+        let j = i + w as usize * 4;
+        if let (Some(r0), Some(r1)) = (data.get(i..i + 8), data.get(j..j + 8)) {
+            let lerp = |a: u8, b: u8, c: u8, d: u8| {
+                let (a, b, c, d) = (f32::from(a), f32::from(b), f32::from(c), f32::from(d));
+                let top = a + (b - a) * tx;
+                let bot = c + (d - c) * tx;
+                top + (bot - top) * ty
+            };
+            return [
+                lerp(r0[0], r0[4], r1[0], r1[4]),
+                lerp(r0[1], r0[5], r1[1], r1[5]),
+                lerp(r0[2], r0[6], r1[2], r1[6]),
+                lerp(r0[3], r0[7], r1[3], r1[7]),
+            ];
+        }
+    }
     let px = |xi: i64, yi: i64| -> [f32; 4] {
         if xi < 0 || yi < 0 || xi >= w || yi >= h {
             return [0.0; 4];
@@ -202,9 +381,10 @@ pub fn glass(g: &Glass, shape: &Outline, back: &Pixmap, pad: u32, w: u32, h: u32
     // smoothed from (2r + 1 further).
     let m = depth.max(reach).ceil() as u32 + 4 * r as u32 + 4;
     let cov = spread_alpha(std::slice::from_ref(shape), 0.0, Affine::translate((f64::from(m), f64::from(m))) * xf, w + 2 * m, h + 2 * m)?;
-    let dist = inside_distance(&cov);
-    let (cw, ch) = (cov.width() as usize, cov.height() as usize);
-    let normals = smooth_normals(&dist, cw, ch, r);
+    // The distance field and normals don't move with the pane: a drag finds the ones it worked out
+    // the frame before (see [`geometry`]).
+    let geom = geometry(shape, xf, m, r, &cov);
+    let cw = cov.width() as usize;
     let mut frosted = back.clone();
     fx::blur(&mut frosted, g.frost / 2.0 * scale);
     let ang = g.light_angle.to_radians();
@@ -219,29 +399,127 @@ pub fn glass(g: &Glass, shape: &Outline, back: &Pixmap, pad: u32, w: u32, h: u32
     let fall = 1.0 - floor;
     let intensity = g.light_intensity as f32;
     let depth = depth as f32;
+    // The pixels themselves: an accelerator draws them where it can (the geometry is its own
+    // textures, kept from frame to frame), and the CPU draws them otherwise.
+    let paint = fx::GlassPaint {
+        alpha: &geom.alpha,
+        dist: &geom.dist,
+        normals: &geom.normals,
+        cw: geom.cw,
+        ch: geom.ch,
+        m,
+        frosted: &frosted,
+        w,
+        h,
+        pad,
+        depth,
+        bend_max,
+        fringe,
+        power,
+        band,
+        reach,
+        floor,
+        fall,
+        intensity,
+        light,
+        geometry: geom.id,
+    };
+    if let Some(accelerator) = fx::accelerator()
+        && let Some(out) = accelerator.glass(&paint)
+    {
+        return Some(out);
+    }
     let mut out = Pixmap::new(w, h)?;
-    let dst = out.data_mut();
-    let cd = cov.data();
-    let d_at = |x: usize, y: usize| dist.get(y * cw + x).copied().unwrap_or(0.0);
-    for y in 0..h as usize {
-        for x in 0..w as usize {
-            let (mx, my) = (x + m as usize, y + m as usize);
-            let c = f32::from(cd.get((my * cw + mx) * 4 + 3).copied().unwrap_or(0)) / 255.0;
+    let pane = Pane {
+        cov: cov.data(),
+        dist: &geom.dist,
+        normals: &geom.normals,
+        frosted: &frosted,
+        w: w as usize,
+        cw,
+        m: m as usize,
+        pad: pad as usize,
+        depth,
+        bend_max,
+        fringe,
+        power,
+        band,
+        reach,
+        floor,
+        fall,
+        intensity,
+        light,
+    };
+    let row = w as usize * 4;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        // Rows are independent: one thread per band of rows, same pixels as one thread would draw.
+        if (w as usize).saturating_mul(h as usize) >= fx::PARALLEL_PIXELS {
+            out.data_mut().par_chunks_mut(row).enumerate().for_each(|(y, dst)| pane.row(y, dst));
+        } else {
+            for (y, dst) in out.data_mut().chunks_mut(row).enumerate() {
+                pane.row(y, dst);
+            }
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    for (y, dst) in out.data_mut().chunks_mut(row).enumerate() {
+        pane.row(y, dst);
+    }
+    Some(out)
+}
+
+/// Everything a pane's pixels are computed from; one row at a time, so rows can run side by side.
+struct Pane<'a> {
+    cov: &'a [u8],
+    dist: &'a [f32],
+    normals: &'a [(f32, f32)],
+    frosted: &'a Pixmap,
+    w: usize,
+    cw: usize,
+    m: usize,
+    pad: usize,
+    depth: f32,
+    bend_max: f32,
+    fringe: f32,
+    power: f32,
+    band: f32,
+    reach: f32,
+    floor: f32,
+    fall: f32,
+    intensity: f32,
+    light: (f32, f32),
+}
+
+impl Pane<'_> {
+    /// Row `y` of the pane's pixels (premultiplied RGBA bytes, `w` pixels).
+    fn row(&self, y: usize, dst: &mut [u8]) {
+        let Pane { cov, dist, normals, frosted, w, cw, m, pad, depth, bend_max, fringe, power, band, reach, floor, fall, intensity, light } = *self;
+        // The three fields this row reads, as rows of their own: no per-pixel row arithmetic.
+        let my = y + m;
+        let (Some(cov_row), Some(dist_row), Some(norm_row)) =
+            (cov.get(my * cw * 4..(my + 1) * cw * 4), dist.get(my * cw..(my + 1) * cw), normals.get(my * cw..(my + 1) * cw))
+        else {
+            return;
+        };
+        for x in 0..w {
+            let i = x + m;
+            let (Some(&c), Some(&d), Some(&inward)) = (cov_row.get(i * 4 + 3), dist_row.get(i), norm_row.get(i)) else { continue };
+            let c = f32::from(c) / 255.0;
             if c <= 0.0 {
                 continue;
             }
-            let d = d_at(mx, my);
-            let inward = normals.get(my * cw + mx).copied().unwrap_or((0.0, 0.0));
             let t = (d / depth).min(1.0);
             let bend = bend_max * (1.0 - t) * (1.0 - t);
             let (bx, by) = (x as f32 + pad as f32 + 0.5, y as f32 + pad as f32 + 0.5);
             let base = if bend == 0.0 {
                 // Nothing bends (past `depth`, or no refraction): the three channels' samples are
                 // at the same point, so one sample.
-                let s = sample(&frosted, bx, by);
+                let s = sample(frosted, bx, by);
                 [s[0].min(s[3]), s[1].min(s[3]), s[2].min(s[3]), s[3]]
             } else {
-                let at = |k: f32| sample(&frosted, bx + inward.0 * bend * k, by + inward.1 * bend * k);
+                let at = |k: f32| sample(frosted, bx + inward.0 * bend * k, by + inward.1 * bend * k);
                 let (rs, gs, bs) = (at(1.0 - fringe), at(1.0), at(1.0 + fringe));
                 let a = rs[3].max(gs[3]).max(bs[3]);
                 [rs[0].min(a), gs[1].min(a), bs[2].min(a), a]
@@ -255,15 +533,14 @@ pub fn glass(g: &Glass, shape: &Outline, back: &Pixmap, pad: u32, w: u32, h: u32
             } else {
                 0.0
             };
-            let i = (y * w as usize + x) * 4;
-            if let Some(p) = dst.get_mut(i..i + 4) {
+            let at = x * 4;
+            if let Some(p) = dst.get_mut(at..at + 4) {
                 for (o, v) in p.iter_mut().zip(base) {
                     *o = ((v * (1.0 - hl) + 255.0 * hl) * c).round().clamp(0.0, 255.0) as u8;
                 }
             }
         }
     }
-    Some(out)
 }
 
 #[cfg(test)]
@@ -293,5 +570,80 @@ mod tests {
             assert_eq!(light_reach(band, intensity), 0.0, "{band} {intensity}");
         }
         assert_eq!(light_reach(1e6, 1.0), MAX_LIGHT_PX);
+    }
+
+    /// A rounded pane's outline and its coverage (for the geometry cache).
+    fn pane(w: u32, h: u32) -> (Outline, Pixmap) {
+        let mut path = figcraft_geom::kurbo::BezPath::new();
+        path.move_to((4.0, 4.0));
+        path.line_to((f64::from(w) - 4.0, 4.0));
+        path.line_to((f64::from(w) - 4.0, f64::from(h) - 4.0));
+        path.line_to((4.0, f64::from(h) - 4.0));
+        path.close_path();
+        let mut cov = Pixmap::new(w, h).unwrap();
+        let r = tiny_skia::Rect::from_xywh(4.0, 4.0, (w - 8) as f32, (h - 8) as f32).unwrap();
+        let paint = tiny_skia::Paint { shader: tiny_skia::Shader::SolidColor(tiny_skia::Color::WHITE), ..Default::default() };
+        cov.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
+        ((path, tiny_skia::FillRule::Winding), cov)
+    }
+
+    #[test]
+    fn the_geometry_of_a_pane_is_kept_between_frames() {
+        clear_geometry();
+        let (a, cov) = pane(100, 80);
+        let (b, _) = pane(100, 80);
+        let xf = Affine::scale(1.0);
+        // The first sight is worked out, the second keeps it for the frames after.
+        let first = geometry(&a, xf, 8, 2, &cov);
+        let kept = geometry(&a, xf, 8, 2, &cov);
+        assert!(!Arc::ptr_eq(&first, &kept), "the first sight isn't kept yet");
+        assert!(Arc::ptr_eq(&kept, &geometry(&b, xf, 8, 2, &cov)), "the same pane finds its geometry");
+        // Another shape, zoom, margin or rasterised offset is worked out anew.
+        let mut other = pane(100, 80).0;
+        other.0.line_to((90.0, 70.0));
+        assert!(!Arc::ptr_eq(&kept, &geometry(&other, xf, 8, 2, &cov)), "another shape");
+        assert!(!Arc::ptr_eq(&kept, &geometry(&a, Affine::scale(2.0), 8, 2, &cov)), "another zoom");
+        assert!(!Arc::ptr_eq(&kept, &geometry(&a, Affine::translate((3.0, 5.0)) * xf, 8, 2, &cov)), "another offset");
+        assert!(!Arc::ptr_eq(&kept, &geometry(&a, xf, 9, 2, &cov)), "another margin");
+        assert!(!Arc::ptr_eq(&kept, &geometry(&a, xf, 8, 3, &cov)), "another smoothing");
+    }
+
+    #[test]
+    fn a_dragged_pane_reuses_its_geometry_and_draws_what_a_fresh_one_does() {
+        use crate::{Options, View, render_view};
+        use figcraft_color::{Color, Paint};
+        use figcraft_doc::{Document, Effect, EffectKind, NodeKind};
+
+        let mut d = Document::new("glass");
+        let p = d.first_page().unwrap();
+        // Stripes under the pane, so where it sits shows in what it bends.
+        for (i, hex) in ["#e03030", "#2040e0", "#20c060"].into_iter().enumerate() {
+            let s = d.create(p, NodeKind::Rectangle, "Stripe", 8.0 + i as f64 * 20.0, 8.0, 20.0, 60.0).unwrap();
+            d.get_mut(s).unwrap().fills = vec![Paint::solid(Color::from_hex(hex).unwrap())];
+        }
+        let pane = d.create(p, NodeKind::Rectangle, "Glass", 0.0, 0.0, 60.0, 40.0).unwrap();
+        {
+            let n = d.get_mut(pane).unwrap();
+            n.transform = Affine::translate((20.0, 20.0));
+            n.corners.radii = [8.0; 4];
+            n.fills = vec![Paint::solid(Color { a: 0.2, ..Color::WHITE })];
+            n.effects = vec![Effect { kind: EffectKind::Glass(Glass::default()), visible: true }];
+        }
+        let view = View { origin: (0.0, 0.0), scale: 1.0, width: 120, height: 100 };
+        clear_geometry();
+        let before = render_view(&d, p, &view, &Options::default()).unwrap();
+        // The frame after works it out once more, and keeps it from then on.
+        let _ = render_view(&d, p, &view, &Options::default()).unwrap();
+        let settled = computed();
+        assert!(settled > 0, "the first frames work the geometry out");
+        // Seven pixels on: the pane's own geometry is the one kept from the frame before.
+        d.get_mut(pane).unwrap().transform = Affine::translate((27.0, 20.0));
+        let moved = render_view(&d, p, &view, &Options::default()).unwrap();
+        assert_eq!(computed(), settled, "the moved pane reused its geometry");
+        assert_ne!(before.data(), moved.data(), "the pane moved over its backdrop");
+        // Emptied, the cache draws the same pixels as the kept geometry did.
+        clear_geometry();
+        let fresh = render_view(&d, p, &view, &Options::default()).unwrap();
+        assert_eq!(moved.data(), fresh.data(), "kept geometry draws what a fresh one does");
     }
 }

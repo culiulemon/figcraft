@@ -1,0 +1,20 @@
+[package]
+name = "figcraft-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GPU effects for the FigCraft canvas"
+
+[lints]
+workspace = true
+
+[dependencies]
+figcraft-render = { workspace = true }
+log = { workspace = true }
+wgpu = { workspace = true }
+
+[dev-dependencies]
+pollster = "0.4"
+figcraft-color = { workspace = true }
+figcraft-doc = { workspace = true }
+figcraft-geom = { workspace = true }

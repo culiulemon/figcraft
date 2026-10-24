@@ -26,6 +26,7 @@ replaced.
 | L3 | `figcraft-format` | ~5.2k | Native `.figcraft` (zip of `document.json` + images; streamed JSON), local library files, versions, REST API file JSON import (`rest/`) |
 | L4 | `figcraft-svg` | ~3.7k | SVG export and import (usvg) |
 | L4 | `figcraft-pdf` | ~2.3k | PDF export (krilla) with print options |
+| L4 | `figcraft-gpu` | ~0.3k | Effects on the window's GPU through wgpu (the same box-blur the CPU renderer uses), plugged into `figcraft-render`'s accelerator; exports, tests and machines without a device keep the CPU |
 | L5 | `figcraft-engine` | ~39.3k | Sessions, undo history (`Arc` snapshots), the command registry (`cmd/*`, `spec!`), pointer tools and vector edit mode, snapping and measuring, components sync, libraries, prototype runtime, Dev Mode code generation, the menu catalog (`catalog.rs`) and the keymap (`keymap.rs`), a panic guard |
 | L6 | `figcraft-ui-egui` | ~31.9k | The UI3-style frontend: canvas (render worker), toolbar, layers, Design/Prototype/Inspect panels, colour picker, menus, dialogs, presenter, comments, accessibility (AccessKit), the control channel server |
 | L6 | `figcraft-mcp` | ~2.4k | MCP server (JSON-RPC over stdio), headless or bridged to a running app |
@@ -59,7 +60,11 @@ The CPU renderer is the single source of pixels for the canvas, exports and the 
 desktop canvas renders on a worker thread at the device pixel ratio and keeps its last image,
 re-rendering only the region a pan uncovers or an edit touches; overlays (selection, handles,
 guides, labels) are drawn by egui on top. A seeded random walk checks the retained canvas against
-full renders. SVG and PDF export walk the same scene and embed rasters where those formats can't
+full renders. Within that region, isolated layers (opacity, blend modes, effects) are rasterised on
+the page's pixel grid and kept between frames (`figcraft_render::layers`), so dragging a few layers
+across a page full of shadows, blurs and glass re-composites the rest instead of drawing it again;
+layers that read the backdrop (glass, background blur) or start from it (masks) are always drawn.
+SVG and PDF export walk the same scene and embed rasters where those formats can't
 express an effect.
 
 ## File I/O

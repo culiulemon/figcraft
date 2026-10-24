@@ -15,6 +15,7 @@ pub mod glass;
 pub mod grain;
 pub mod image_profile;
 pub mod images;
+mod layers;
 pub mod lod;
 pub mod paint;
 pub mod pattern;
@@ -23,6 +24,7 @@ pub mod shadow;
 
 pub use draw::{node_outline, paint_bounds, stroke_fill, subtree_outline, ts_path};
 pub use export_depth::{ExportDepthError, MAX_EXPORT_DEPTH, check_export_depth};
+pub use fx::{Accelerator, GlassPaint, set_accelerator};
 pub use retained::{Retained, Work};
 pub use tiny_skia::{FillRule, Pixmap};
 
@@ -79,6 +81,10 @@ pub struct Options {
     /// detail, see [`lod`]. Off for everything that must be exact (exports, thumbnails); no
     /// effect in outline mode.
     pub lod: bool,
+    /// A stable id for the document (the canvas passes the document's address), letting isolated
+    /// layers that didn't change be kept between renders (see [`layers`]). `0` draws every render
+    /// from the document, as exports and thumbnails must.
+    pub doc_id: u64,
 }
 
 fn new_pixmap(w: u32, h: u32) -> Option<Pixmap> {
@@ -104,7 +110,15 @@ pub fn render_view(doc: &Document, page: NodeId, view: &View, opts: &Options) ->
     #[cfg(not(target_arch = "wasm32"))]
     {
         let threads = rayon::current_num_threads().clamp(1, 16) as u32;
-        let bands = threads.min(view.height / 96).max(1);
+        let bands = match std::env::var("FIGCRAFT_BANDS").ok().and_then(|v| v.parse::<u32>().ok()) {
+            // Benchmarks pick a band count by hand.
+            Some(n) => n.clamp(1, 16),
+            // Layers whose effects read their backdrop (glass, background blur) hand the window's
+            // GPU one submission a band and wait for it: with those, a band more costs a round-trip
+            // and buys little (the layers below the band are drawn in parallel either way).
+            None if fx::accelerated() && backdrop_effects(doc, page) => threads.min(2),
+            None => threads.min(view.height / 96).max(1),
+        };
         if bands > 1
             && view.width.saturating_mul(view.height) > 300_000
             && let Some(p) = render_bands(doc, page, view, opts, bands)
@@ -113,6 +127,11 @@ pub fn render_view(doc: &Document, page: NodeId, view: &View, opts: &Options) ->
         }
     }
     render_view_single(doc, page, view, opts)
+}
+
+/// Whether the page has a layer whose effects read its backdrop (glass, background blur).
+fn backdrop_effects(doc: &Document, page: NodeId) -> bool {
+    doc.subtree(page).iter().skip(1).any(|id| doc.node(*id).is_some_and(backdrop::has_effects))
 }
 
 /// Render `view` as `bands` horizontal bands in parallel. Bands overlap by what background blurs
@@ -182,6 +201,8 @@ pub fn render_view_single(doc: &Document, page: NodeId, view: &View, opts: &Opti
         under: None,
         time: 0.0,
         bounds: &bounds,
+        page_at: (view.origin.0 * view.scale, view.origin.1 * view.scale),
+        cache: (opts.doc_id != 0).then_some(opts.doc_id),
     };
     let xf = view.transform();
     let Some(p) = doc.node(page) else { return Some(pix) };
@@ -215,6 +236,8 @@ fn nodes_into(doc: &Document, ids: &[NodeId], view: &View, pix: &mut Pixmap, tim
         under: None,
         time,
         bounds: &bounds,
+        page_at: (view.origin.0 * view.scale, view.origin.1 * view.scale),
+        cache: None,
     };
     for id in ids {
         draw::draw_node(&ctx, pix, *id, view.transform() * parent_transform(doc, *id), 0);
@@ -457,6 +480,8 @@ mod group_effects_tests;
 mod image_budget_tests;
 #[cfg(test)]
 mod image_profile_tests;
+#[cfg(test)]
+mod layers_tests;
 #[cfg(test)]
 mod lod_tests;
 #[cfg(test)]

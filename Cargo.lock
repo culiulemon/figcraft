@@ -1475,6 +1475,7 @@ dependencies = [
  "figcraft-collab-net",
  "figcraft-engine",
  "figcraft-format",
+ "figcraft-gpu",
  "figcraft-text",
  "figcraft-ui-egui",
  "fmv-macos-events",
@@ -1612,6 +1613,19 @@ version = "0.10.0"
 dependencies = [
  "kurbo",
  "serde",
+]
+
+[[package]]
+name = "figcraft-gpu"
+version = "0.10.0"
+dependencies = [
+ "figcraft-color",
+ "figcraft-doc",
+ "figcraft-geom",
+ "figcraft-render",
+ "log",
+ "pollster 0.4.0",
+ "wgpu",
 ]
 
 [[package]]

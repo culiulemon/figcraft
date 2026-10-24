@@ -1,7 +1,72 @@
 //! Raster effects on premultiplied RGBA8 pixmaps: blur (3× box ≈ Gaussian), dilate/erode (spread),
 //! alpha extraction and tinting.
 
+use std::sync::{Arc, Mutex, OnceLock};
+
 use tiny_skia::Pixmap;
+
+/// What a glass pane's pixels are computed from, for [`Accelerator::glass`].
+pub struct GlassPaint<'a> {
+    /// The pane's coverage alpha (`cw` × `ch`, one byte a pixel).
+    pub alpha: &'a [u8],
+    /// Its distance to the outline, and the smoothed inward normals (same size).
+    pub dist: &'a [f32],
+    pub normals: &'a [(f32, f32)],
+    pub cw: usize,
+    pub ch: usize,
+    /// The margin the coverage was grown by (`Geometry`'s `m`).
+    pub m: u32,
+    /// The backdrop around the pane, blurred (`pad` pixels more each way).
+    pub frosted: &'a Pixmap,
+    pub w: u32,
+    pub h: u32,
+    pub pad: u32,
+    pub depth: f32,
+    pub bend_max: f32,
+    pub fringe: f32,
+    pub power: f32,
+    pub band: f32,
+    pub reach: f32,
+    pub floor: f32,
+    pub fall: f32,
+    pub intensity: f32,
+    pub light: (f32, f32),
+    /// Which geometry this is (the same id whenever the pane's shape, size and zoom are the same):
+    /// an accelerator keeps it as textures and works it out once.
+    pub geometry: u64,
+}
+
+/// A GPU (or other) accelerator for the raster effects that dominate a render. The CPU paths stay
+/// (exports, tests and machines without a device): this only stands in for them where it can, and
+/// every method says whether it did.
+pub trait Accelerator: Send + Sync {
+    /// Blur `p` in place with standard deviation `sigma` (pixels); false when it can't, and the
+    /// CPU blurs it instead.
+    fn blur(&self, p: &mut Pixmap, sigma: f64) -> bool;
+    /// A glass pane's pixels; `None` when it can't, and the CPU paints them instead.
+    fn glass(&self, paint: &GlassPaint<'_>) -> Option<Pixmap> {
+        let _ = paint;
+        None
+    }
+}
+
+static ACCELERATOR: OnceLock<Mutex<Option<Arc<dyn Accelerator>>>> = OnceLock::new();
+
+/// Install (or remove) the accelerator effects use (the canvas installs the window's GPU).
+pub fn set_accelerator(accelerator: Option<Arc<dyn Accelerator>>) {
+    if let Ok(mut slot) = ACCELERATOR.get_or_init(|| Mutex::new(None)).lock() {
+        *slot = accelerator;
+    }
+}
+
+pub(crate) fn accelerator() -> Option<Arc<dyn Accelerator>> {
+    ACCELERATOR.get()?.lock().ok()?.clone()
+}
+
+/// Whether effects run on an accelerator (the canvas's GPU) rather than on the CPU.
+pub(crate) fn accelerated() -> bool {
+    ACCELERATOR.get().is_some_and(|slot| slot.lock().is_ok_and(|s| s.is_some()))
+}
 
 /// Box radii for three passes approximating a Gaussian of `sigma` (Kovesi).
 fn box_sizes(sigma: f64) -> [usize; 3] {
@@ -21,50 +86,113 @@ fn box_sizes(sigma: f64) -> [usize; 3] {
     [r(0), r(1), r(2)]
 }
 
+/// Below this many pixels a pass stays on one thread (starting threads costs more than it saves).
+pub(crate) const PARALLEL_PIXELS: usize = 40_000;
+
+/// Call `row(y, row_pixels)` for every row of `dst` (`w` × `h` premultiplied RGBA bytes), on
+/// several threads where the pixmap is big enough for that to pay: rows are independent, so the
+/// pixels come out exactly as one thread would draw them.
+pub(crate) fn each_row(dst: &mut [u8], w: usize, h: usize, row: impl Fn(usize, &mut [u8]) + Sync + Send) {
+    let row_len = w.saturating_mul(4);
+    let rows = dst.len().checked_div(row_len).map_or(0, |n| h.min(n));
+    let Some(len) = row_len.checked_mul(rows) else { return };
+    let Some(dst) = dst.get_mut(..len) else { return };
+    let parallel = len >= PARALLEL_PIXELS;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        if parallel {
+            dst.par_chunks_mut(row_len).enumerate().for_each(|(y, d)| row(y, d));
+            return;
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = parallel;
+    for (y, d) in dst.chunks_mut(row_len).enumerate() {
+        row(y, d);
+    }
+}
+
 fn box_blur_h(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
     if r == 0 {
         dst.copy_from_slice(src);
         return;
     }
     let div = (2 * r + 1) as u32;
-    for y in 0..h {
-        let row = y * w * 4;
+    each_row(dst, w, h, |y, dst| {
+        let base = y * w * 4;
         let mut acc = [0u32; 4];
         // Edge: transparent outside.
         for x in 0..=r.min(w.saturating_sub(1)) {
             for c in 0..4 {
-                acc[c] += u32::from(src.get(row + x * 4 + c).copied().unwrap_or(0));
+                acc[c] += u32::from(src.get(base + x * 4 + c).copied().unwrap_or(0));
             }
         }
         for x in 0..w {
             for c in 0..4 {
-                if let Some(d) = dst.get_mut(row + x * 4 + c) {
+                if let Some(d) = dst.get_mut(x * 4 + c) {
                     *d = (acc[c] / div) as u8;
                 }
             }
             let add = x + r + 1;
             if add < w {
                 for c in 0..4 {
-                    acc[c] += u32::from(src.get(row + add * 4 + c).copied().unwrap_or(0));
+                    acc[c] += u32::from(src.get(base + add * 4 + c).copied().unwrap_or(0));
                 }
             }
             if x >= r {
                 let sub = x - r;
                 for c in 0..4 {
-                    acc[c] = acc[c].saturating_sub(u32::from(src.get(row + sub * 4 + c).copied().unwrap_or(0)));
+                    acc[c] = acc[c].saturating_sub(u32::from(src.get(base + sub * 4 + c).copied().unwrap_or(0)));
                 }
             }
         }
-    }
+    });
 }
 
-fn transpose(src: &[u8], dst: &mut [u8], w: usize, h: usize) {
-    for y in 0..h {
+/// Box blur of `w` × `h` down the columns: a running sum per column, row by row, so every read and
+/// write is a row in memory (a pass down a column would take a cache miss per pixel).
+fn box_blur_v(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
+    if r == 0 {
+        dst.copy_from_slice(src);
+        return;
+    }
+    let div = (2 * r + 1) as u32;
+    let mut acc = vec![[0u32; 4]; w];
+    let base = |y: usize| y * w * 4;
+    let add_row = |acc: &mut [[u32; 4]], y: usize| {
+        let b = base(y);
         for x in 0..w {
-            let s = (y * w + x) * 4;
-            let d = (x * h + y) * 4;
-            if let (Some(sp), Some(dp)) = (src.get(s..s + 4), dst.get_mut(d..d + 4)) {
-                dp.copy_from_slice(sp);
+            for c in 0..4 {
+                if let Some(a) = acc.get_mut(x) {
+                    a[c] += u32::from(src.get(b + x * 4 + c).copied().unwrap_or(0));
+                }
+            }
+        }
+    };
+    for y in 0..=r.min(h.saturating_sub(1)) {
+        add_row(&mut acc, y);
+    }
+    for y in 0..h {
+        let b = base(y);
+        for x in 0..w {
+            for c in 0..4 {
+                if let (Some(a), Some(d)) = (acc.get(x), dst.get_mut(b + x * 4 + c)) {
+                    *d = (a[c] / div) as u8;
+                }
+            }
+        }
+        if y + r + 1 < h {
+            add_row(&mut acc, y + r + 1);
+        }
+        if y >= r {
+            let sub = base(y - r);
+            for x in 0..w {
+                for c in 0..4 {
+                    if let Some(a) = acc.get_mut(x) {
+                        a[c] = a[c].saturating_sub(u32::from(src.get(sub + x * 4 + c).copied().unwrap_or(0)));
+                    }
+                }
             }
         }
     }
@@ -76,12 +204,22 @@ fn transpose(src: &[u8], dst: &mut [u8], w: usize, h: usize) {
 /// in full at any zoom.
 pub const MAX_SIGMA: f64 = 1_000_000.0;
 
+/// The three box radii a blur of `sigma` uses (an accelerator blurs with the same ones).
+pub fn box_radii(sigma: f64) -> [usize; 3] {
+    box_sizes(if sigma.is_finite() { sigma.min(MAX_SIGMA) } else { MAX_SIGMA })
+}
+
 /// Gaussian-like blur of the whole pixmap with standard deviation `sigma` (pixels).
 pub fn blur(p: &mut Pixmap, sigma: f64) {
     if !(sigma.is_finite() && sigma > 0.3) {
         return;
     }
     let sigma = sigma.min(MAX_SIGMA);
+    if let Some(accelerator) = accelerator()
+        && accelerator.blur(p, sigma)
+    {
+        return;
+    }
     let (w, h) = (p.width() as usize, p.height() as usize);
     let radii = box_sizes(sigma);
     let mut a = p.data().to_vec();
@@ -90,14 +228,11 @@ pub fn blur(p: &mut Pixmap, sigma: f64) {
         box_blur_h(&a, &mut b, w, h, r);
         std::mem::swap(&mut a, &mut b);
     }
-    transpose(&a, &mut b, w, h);
-    std::mem::swap(&mut a, &mut b);
     for r in radii {
-        box_blur_h(&a, &mut b, h, w, r);
+        box_blur_v(&a, &mut b, w, h, r);
         std::mem::swap(&mut a, &mut b);
     }
-    transpose(&a, &mut b, h, w);
-    p.data_mut().copy_from_slice(&b);
+    p.data_mut().copy_from_slice(&a);
 }
 
 /// Grow (`r > 0`) or shrink (`r < 0`) the alpha of a pixmap by `r` pixels (square structuring

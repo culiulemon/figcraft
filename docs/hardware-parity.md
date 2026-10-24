@@ -33,6 +33,13 @@ since 2025). FigCraft renders the canvas on the CPU and presents it through wgpu
 | `.figcraft` at 50k layers: save / load | ~0.09 s / ~0.16 s | n/a |
 | Idle window | 0 frames, ~0% CPU | — |
 
+One case on the owner's Windows PC (Intel Arc A750, release build, canvas 904 × 860): dragging a
+glass pane across a page of 30 shadowed cards, 3 glass panes and 2 blurred cards took ~95 ms a
+frame; with isolated layers kept between frames (`figcraft_render::layers`) and the blur and glass
+on the GPU it's 12–15 ms (`cargo test -p figcraft-gpu --release heavy_scene_timings -- --ignored`).
+The same scene with the glass cut off each frame is ~1 ms. Glass and background blur are still
+drawn again wherever the damage reaches, as they read the backdrop.
+
 Nothing has been timed against Figma on the same document (needs `.fig` import). 
 
 ## Platforms
