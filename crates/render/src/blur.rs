@@ -59,7 +59,7 @@ impl Ramp {
 
 /// The radii blurred for a ramp from `lo` to `hi` (pixels): `lo`, then geometric steps from one
 /// pixel (or `lo`) up to `hi`, at most [`MAX_LEVELS`].
-pub(crate) fn levels(lo: f64, hi: f64) -> Vec<f64> {
+pub fn levels(lo: f64, hi: f64) -> Vec<f64> {
     let mut out = Vec::with_capacity(MAX_LEVELS);
     let base = lo.max(1.0);
     if lo < base {

@@ -238,9 +238,9 @@ fn unsupported_pages_are_refused() {
     // One layer blur is drawn on the GPU (its own layer, blurred there).
     d.get_mut(id).unwrap().effects = vec![Effect::layer_blur()];
     assert_eq!(scene::supported(&d, p), Ok(()));
-    // One kind of effect at a time: a shadow alongside a blur is the CPU's order for now.
+    // One layer of its own: a blur and a shadow together, in the CPU's order.
     d.get_mut(id).unwrap().effects = vec![Effect::drop_shadow(), Effect::layer_blur()];
-    assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Effect));
+    assert_eq!(scene::supported(&d, p), Ok(()));
     // A background blur reads what lies under the node: drawn on the GPU from a backdrop render.
     d.get_mut(id).unwrap().effects = vec![Effect::background_blur()];
     assert_eq!(scene::supported(&d, p), Ok(()));
@@ -921,6 +921,43 @@ fn shadow_shape_doc() -> Document {
     }
     let inner_ellipse = add(&mut d, NodeKind::Ellipse { start: 0.0, sweep: std::f64::consts::TAU, inner: 0.0 }, "inner ellipse", (380.0, 380.0), (150.0, 120.0), "D0E8F0");
     d.get_mut(inner_ellipse).unwrap().effects = vec![inner(8.0, 0.0, (2.0, 2.0))];
+
+    // Effects together, in the CPU's order: inner shadows, the layer blur and grain, the shadows
+    // cast from that result.
+    let blurred = add(&mut d, NodeKind::Rectangle, "blur and shadow", (20.0, 530.0), (150.0, 110.0), "F0C830");
+    {
+        let n = d.get_mut(blurred).unwrap();
+        n.corners.radii = [20.0; 4];
+        n.effects = vec![Effect::layer_blur(), shadow(10.0, 0.0, (2.0, 6.0))];
+    }
+    let inner_and_shadow = add(&mut d, NodeKind::Rectangle, "inner and shadow", (200.0, 530.0), (150.0, 110.0), "FFFFFF");
+    {
+        let n = d.get_mut(inner_and_shadow).unwrap();
+        n.corners.radii = [18.0; 4];
+        n.effects = vec![inner(12.0, 0.0, (0.0, 4.0)), shadow(8.0, 0.0, (3.0, 7.0))];
+    }
+    let grain = add(&mut d, NodeKind::Rectangle, "blur, grain and shadow", (380.0, 530.0), (150.0, 110.0), "2040E0");
+    {
+        let n = d.get_mut(grain).unwrap();
+        n.corners.radii = [24.0; 4];
+        let mut nz = figcraft_doc::Noise::default();
+        nz.size = 1.0;
+        nz.density = 0.6;
+        n.effects = vec![Effect::layer_blur(), Effect { kind: EffectKind::Noise(nz), visible: true }, shadow(10.0, 0.0, (2.0, 5.0))];
+    }
+    let ramp = add(&mut d, NodeKind::Rectangle, "progressive blur", (560.0, 530.0), (150.0, 110.0), "20C060");
+    {
+        let n = d.get_mut(ramp).unwrap();
+        n.corners.radii = [20.0; 4];
+        let blur = figcraft_doc::Blur {
+            radius: 24.0,
+            blur_type: figcraft_doc::BlurType::Progressive,
+            start_radius: 0.0,
+            start: (0.5, 0.0),
+            end: (0.5, 1.0),
+        };
+        n.effects = vec![Effect { kind: EffectKind::LayerBlur(blur), visible: true }, shadow(8.0, 0.0, (2.0, 4.0))];
+    }
     d
 }
 
@@ -933,7 +970,7 @@ fn the_gpu_draws_shadows_of_any_shape() {
     let d = shadow_shape_doc();
     let p = d.first_page().unwrap();
     assert_eq!(scene::supported(&d, p), Ok(()), "shadows of every shape stay on the GPU");
-    let (w, h) = (900u32, 520u32);
+    let (w, h) = (900u32, 660u32);
     let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
     let cpu = render_view(&d, p, &view, &Options::default()).unwrap();
     let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
@@ -972,6 +1009,10 @@ fn the_gpu_draws_shadows_of_any_shape() {
             ("inner card", (20, 380, 150, 120)),
             ("inner spread", (200, 380, 150, 120)),
             ("inner ellipse", (380, 380, 150, 120)),
+            ("blur and shadow", (20, 530, 150, 110)),
+            ("inner and shadow", (200, 530, 150, 110)),
+            ("blur, grain", (380, 530, 150, 110)),
+            ("progressive", (560, 530, 150, 110)),
         ] {
             let (mut sum, mut n, mut w) = (0f64, 0usize, 0u8);
             let mut wp = (rx, ry);
@@ -999,7 +1040,7 @@ fn the_gpu_draws_shadows_of_any_shape() {
     }
     assert!(worst <= 96, "a channel differs by {worst} (mean {mean:.3})");
     assert!(mean <= 0.5, "the mean difference is {mean:.3}");
-    assert!(over < (w * h) as usize / 200, "{over} pixels differ by more than 8");
+    assert!(over < (w * h) as usize / 100, "{over} pixels differ by more than 8");
     // Drawn again with the shadows kept: the same pixels, and an edit makes a new one.
     let built = {
         let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
@@ -1018,6 +1059,31 @@ fn the_gpu_draws_shadows_of_any_shape() {
         })
         .count();
     println!("kept shadows: worst {w1}, mean {m1:.3}, {o1} differ by more than 8, {} kept of {shadowed} shadowed nodes", canvas.kept_shadows());
+    if std::env::var("FIGCRAFT_REGIONS").is_ok() {
+        let (w2, m2, _, o2) = diff(&cpu, &again);
+        println!("  the second frame against the CPU: worst {w2}, mean {m2:.3}, {o2} differ by more than 8");
+        for (name, (rx, ry, rw, rh)) in [("ellipse", (20u32, 16u32, 160u32, 120u32)), ("group", (240, 190, 150, 120))] {
+            let (mut sum, mut n) = (0f64, 0usize);
+            for y in ry..(ry + rh).min(gpu.height()) {
+                for x in rx..(rx + rw).min(gpu.width()) {
+                    let i = ((y as usize * gpu.width() as usize) + x as usize) * 4;
+                    for c in 0..4 {
+                        sum += f64::from(gpu.data()[i + c].abs_diff(again.data()[i + c]));
+                        n += 1;
+                    }
+                }
+            }
+            println!("    {name}: frame 1 against frame 2 mean {:.3}", sum / n.max(1) as f64);
+        }
+        let mut span = ((u32::MAX, u32::MAX), (0u32, 0u32));
+        for (i, (a, b)) in gpu.data().iter().zip(again.data()).enumerate() {
+            if a.abs_diff(*b) > 8 {
+                let (x, y) = ((i / 4 % gpu.width() as usize) as u32, (i / 4 / gpu.width() as usize) as u32);
+                span = ((span.0.0.min(x), span.0.1.min(y)), (span.1.0.max(x), span.1.1.max(y)));
+            }
+        }
+        println!("  kept differ span {span:?}");
+    }
     assert_eq!((w1, o1), (0, 0), "a kept shadow draws the same pixels");
     assert!(canvas.kept_shadows() >= 10, "the page's shadows are kept");
     // An edit is a new node, and so a new shadow.

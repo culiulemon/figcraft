@@ -12,6 +12,7 @@ mod blur;
 pub mod canvas;
 mod compose;
 mod glass;
+mod mix;
 pub mod scene;
 mod shadow;
 

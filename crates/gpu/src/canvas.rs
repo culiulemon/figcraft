@@ -12,7 +12,7 @@ use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene}
 use wgpu::{Device, Queue, Texture, TextureFormat, TextureUsages, TextureView};
 
 use crate::blur::Blur;
-use crate::scene::Layers;
+use crate::scene::{Layer, Layers};
 
 /// vello draws into `Rgba8Unorm` (premultiplied, sRGB-encoded bytes) — what tiny-skia's pixmap
 /// holds, and what egui can show without a conversion.
@@ -27,6 +27,8 @@ pub struct CanvasGpu {
     glass: crate::glass::Glass,
     /// The shadow passes: a blurred silhouette tinted, and a layer's alpha grown or shrunk.
     shadow: crate::shadow::Shadow,
+    /// The progressive blur's blend of its levels.
+    mix: crate::mix::Mix,
     /// Lays a page segment over the accumulation.
     compose: crate::compose::Compose,
     targets: [Target; 2],
@@ -39,9 +41,9 @@ pub struct CanvasGpu {
     generation: u64,
     /// The page being accumulated (kept between frames: a canvas-sized allocation a frame is not
     /// free, and neither is the clear it would need).
-    page: Option<Layer>,
+    page: Option<Scratch>,
     /// One segment on its way onto the page.
-    segment: Option<Layer>,
+    segment: Option<Scratch>,
     /// Shadow images kept between frames, by what they were made from: while one layer moves, the
     /// shadows of the others are drawn again as they are instead of being rebuilt.
     shadows: HashMap<(u64, u64), Kept>,
@@ -52,7 +54,7 @@ pub struct CanvasGpu {
 
 /// A kept shadow: its image, the device bytes it takes, and when it was last used.
 struct Kept {
-    image: ImageData,
+    layer: crate::scene::Layer,
     bytes: usize,
     used: u64,
 }
@@ -67,7 +69,7 @@ struct Target {
 }
 
 /// A canvas-sized layer kept between frames.
-struct Layer {
+struct Scratch {
     texture: Texture,
     view: TextureView,
     size: (u32, u32),
@@ -92,12 +94,14 @@ impl CanvasGpu {
         let blur = Blur::new(device)?;
         let glass = crate::glass::Glass::new(device)?;
         let shadow = crate::shadow::Shadow::new(device)?;
+        let mix = crate::mix::Mix::new(device)?;
         let compose = crate::compose::Compose::new(device)?;
         Some(Self {
             renderer,
             blur,
             glass,
             shadow,
+            mix,
             compose,
             targets: [target(device, width, height), target(device, width, height)],
             next: 0,
@@ -247,18 +251,32 @@ impl CanvasGpu {
         data
     }
 
+    /// `texture` as a layer: its image for the scene, and the texture the passes read.
+    pub(crate) fn as_layer(&mut self, texture: Texture) -> crate::scene::Layer {
+        let size = (texture.width(), texture.height());
+        let image = self.register_layer(texture.clone());
+        crate::scene::Layer { image, texture: Some(texture), size }
+    }
+
+    /// Mark a kept layer's image as changed so vello copies its texture into its atlas again.
+    pub(crate) fn refresh_image(&mut self, image: &ImageData) {
+        self.renderer.mark_override_image_dirty(image);
+    }
+
     /// A shadow kept from an earlier frame, if it was made from the same thing.
-    pub(crate) fn kept_shadow(&mut self, key: (u64, u64)) -> Option<ImageData> {
+    pub(crate) fn kept_shadow(&mut self, key: (u64, u64)) -> Option<crate::scene::Layer> {
         self.tick += 1;
         let tick = self.tick;
         let kept = self.shadows.get_mut(&key)?;
         kept.used = tick;
-        Some(kept.image.clone())
+        let layer = kept.layer.clone();
+        self.renderer.mark_override_image_dirty(&layer.image);
+        Some(layer)
     }
 
-    /// Keep `image` as the shadow made from `key`, dropping the least recently used while the
+    /// Keep `layer` as the shadow made from `key`, dropping the least recently used while the
     /// cache is over its budget.
-    pub(crate) fn keep_shadow(&mut self, key: (u64, u64), image: ImageData, bytes: usize) {
+    pub(crate) fn keep_shadow(&mut self, key: (u64, u64), layer: crate::scene::Layer, bytes: usize) {
         if bytes > KEPT_SHADOW_BYTES {
             return;
         }
@@ -274,7 +292,7 @@ impl CanvasGpu {
             }
         }
         self.shadows_bytes += bytes;
-        self.shadows.insert(key, Kept { image, bytes, used: tick });
+        self.shadows.insert(key, Kept { layer, bytes, used: tick });
     }
 
     /// How many shadows are kept (tests: a drag keeps the ones that did not move).
@@ -298,32 +316,28 @@ pub(crate) struct GpuLayers<'a> {
 }
 
 impl crate::scene::Layers for GpuLayers<'_> {
-    fn blurred(&mut self, scene: &Scene, width: u32, height: u32, sigma: f64) -> Option<ImageData> {
+    fn blurred(&mut self, scene: &Scene, width: u32, height: u32, sigma: f64) -> Option<Layer> {
         let texture = self.canvas.render_layer(self.device, self.queue, scene, width, height)?;
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let blurred = crate::blur::blur_texture(self.device, self.queue, &self.canvas.blur, &view, (width, height), sigma)?;
-        Some(self.canvas.register_layer(blurred))
+        self.blurred_texture(texture, sigma)
     }
 
-    fn backdrop(&mut self, scene: &Scene, width: u32, height: u32, sigma: f64) -> Option<ImageData> {
+    fn backdrop(&mut self, scene: &Scene, width: u32, height: u32, sigma: f64) -> Option<Layer> {
         self.blurred(scene, width, height, sigma)
     }
 
-    fn glass(&mut self, scene: &Scene, (vw, vh): (u32, u32), pane: &figcraft_render::glass::GlassPane, at: (i32, i32)) -> Option<ImageData> {
+    fn glass(&mut self, scene: &Scene, (vw, vh): (u32, u32), pane: &figcraft_render::glass::GlassPane, at: (i32, i32)) -> Option<Layer> {
         let back = self.canvas.render_layer(self.device, self.queue, scene, vw, vh)?;
         self.glass_from(&back, pane, at)
     }
 
-    fn backdrop_effect(&mut self, doc: &Document, id: NodeId, view: &View, back: &Texture) -> Option<ImageData> {
+    fn backdrop_effect(&mut self, doc: &Document, id: NodeId, view: &View, back: &Texture) -> Option<Layer> {
         match crate::scene::backdrop_of_node(doc, id)? {
             crate::scene::Backdrop::Blur(radius) => {
                 // The blur reads the node's padded layer, as the CPU's does — not the whole view.
                 let ((x, y), (w, h)) = crate::scene::blur_rect(doc, id, view)?;
                 let cropped = crop(self.device, self.queue, back, (x as i32, y as i32), (w, h))?;
-                let src = cropped.create_view(&wgpu::TextureViewDescriptor::default());
                 let sigma = radius / 2.0 * view.scale;
-                let blurred = crate::blur::blur_texture(self.device, self.queue, &self.canvas.blur, &src, (w, h), sigma)?;
-                Some(self.canvas.register_layer(blurred))
+                self.blurred_texture(cropped, sigma)
             }
             crate::scene::Backdrop::Glass(_) => {
                 let (pane, at) = crate::scene::glass_setup(doc, id, view)?;
@@ -332,8 +346,59 @@ impl crate::scene::Layers for GpuLayers<'_> {
         }
     }
 
-    fn shadow(&mut self, scene: &Scene, width: u32, height: u32, sigma: f64, color: figcraft_color::Color, key: Option<(u64, u64)>) -> Option<ImageData> {
-        self.cast(scene, (width, height), sigma, color, None, key)
+    fn layer(&mut self, scene: &Scene, width: u32, height: u32, key: Option<(u64, u64)>) -> Option<Layer> {
+        if let Some(key) = key
+            && let Some(hit) = self.canvas.kept_shadow(key)
+        {
+            return Some(hit);
+        }
+        let texture = self.canvas.render_layer(self.device, self.queue, scene, width, height)?;
+        let layer = self.canvas.as_layer(texture);
+        self.keep(key, &layer);
+        Some(layer)
+    }
+
+    fn blur_layer(&mut self, layer: &Layer, sigma: f64, key: Option<(u64, u64)>) -> Option<Layer> {
+        if let Some(key) = key
+            && let Some(hit) = self.canvas.kept_shadow(key)
+        {
+            return Some(hit);
+        }
+        let blurred = self.blurred_texture(layer.texture.clone()?, sigma)?;
+        self.keep(key, &blurred);
+        Some(blurred)
+    }
+
+    fn progressive(&mut self, layer: &Layer, s0: f64, s1: f64, a: (f64, f64), b: (f64, f64), key: Option<(u64, u64)>) -> Option<Layer> {
+        if let Some(key) = key
+            && let Some(hit) = self.canvas.kept_shadow(key)
+        {
+            return Some(hit);
+        }
+        let texture = layer.texture.clone()?;
+        let cap = |s: f64| if s.is_finite() { s.clamp(0.0, figcraft_render::fx::MAX_SIGMA) } else { 0.0 };
+        let (s0, s1) = (cap(s0), cap(s1));
+        // Too flat a ramp is one blur, as the renderer does it.
+        if (s1 - s0).abs() < 0.05 {
+            let made = self.blurred_texture(texture, s1)?;
+            self.keep(key, &made);
+            return Some(made);
+        }
+        let deviations = figcraft_render::blur::levels(s0.min(s1), s0.max(s1));
+        let size = layer.size;
+        let mut levels = Vec::with_capacity(deviations.len());
+        for d in &deviations {
+            levels.push(self.blur_texture_only(&texture, *d)?);
+        }
+        let out = self.canvas.mix.mix(self.device, self.queue, &levels, &deviations, (s0, s1, a, b), size)?;
+        let made = self.canvas.as_layer(out);
+        self.keep(key, &made);
+        Some(made)
+    }
+
+    fn shadow(&mut self, scene: &Scene, width: u32, height: u32, sigma: f64, color: figcraft_color::Color, key: Option<(u64, u64)>) -> Option<Layer> {
+        let texture = self.canvas.render_layer(self.device, self.queue, scene, width, height)?;
+        self.cast(texture, sigma, color, None, key)
     }
 
     fn shadow_of_pixels(
@@ -345,56 +410,77 @@ impl crate::scene::Layers for GpuLayers<'_> {
         sigma: f64,
         color: figcraft_color::Color,
         key: Option<(u64, u64)>,
-    ) -> Option<ImageData> {
-        self.cast(scene, (width, height), sigma, color, (grow != 0).then_some(grow), key)
+    ) -> Option<Layer> {
+        let texture = self.canvas.render_layer(self.device, self.queue, scene, width, height)?;
+        self.cast(texture, sigma, color, (grow != 0).then_some(grow), key)
     }
 
-    fn kept_shadow(&mut self, key: (u64, u64)) -> Option<ImageData> {
+    fn shadow_of_layer(&mut self, layer: &Layer, grow: i32, sigma: f64, color: figcraft_color::Color, key: Option<(u64, u64)>) -> Option<Layer> {
+        self.cast(layer.texture.clone()?, sigma, color, (grow != 0).then_some(grow), key)
+    }
+
+    fn layer_pixels(&mut self, layer: &Layer) -> Option<figcraft_render::Pixmap> {
+        read(self.device, self.queue, layer.texture.as_ref()?, layer.size)
+    }
+
+    fn kept_shadow(&mut self, key: (u64, u64)) -> Option<Layer> {
         self.canvas.kept_shadow(key)
     }
 }
 
 impl GpuLayers<'_> {
-    /// A shadow from what `scene` draws: rendered into its own layer, grown or shrunk by whole
-    /// pixels, blurred by `sigma`, and tinted `color` — all on the device. A shadow kept from an
-    /// earlier frame under `key` is drawn again as it is.
-    fn cast(
-        &mut self,
-        scene: &Scene,
-        (w, h): (u32, u32),
-        sigma: f64,
-        color: figcraft_color::Color,
-        grow: Option<i32>,
-        key: Option<(u64, u64)>,
-    ) -> Option<ImageData> {
-        if let Some(key) = key
-            && let Some(image) = self.canvas.kept_shadow(key)
-        {
-            return Some(image);
+    /// `texture` blurred by `sigma` (as it is, when the renderer would leave the blur out).
+    fn blur_texture_only(&mut self, texture: &Texture, sigma: f64) -> Option<Texture> {
+        if !(sigma > 0.3) {
+            return Some(texture.clone());
         }
-        let layer = self.canvas.render_layer(self.device, self.queue, scene, w, h)?;
+        let size = (texture.width(), texture.height());
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        crate::blur::blur_texture(self.device, self.queue, &self.canvas.blur, &view, size, sigma)
+    }
+
+    /// `texture` blurred by `sigma` (no blur when the renderer would leave it out).
+    fn blurred_texture(&mut self, texture: Texture, sigma: f64) -> Option<Layer> {
+        let out = self.blur_texture_only(&texture, sigma)?;
+        Some(self.canvas.as_layer(out))
+    }
+
+    /// A shadow from `texture`: grown or shrunk by whole pixels, blurred by `sigma`, and tinted
+    /// `color` — all on the device. A shadow kept from an earlier frame under `key` is reused.
+    fn cast(&mut self, texture: Texture, sigma: f64, color: figcraft_color::Color, grow: Option<i32>, key: Option<(u64, u64)>) -> Option<Layer> {
+        if let Some(key) = key
+            && let Some(hit) = self.canvas.kept_shadow(key)
+        {
+            return Some(hit);
+        }
+        let size = (texture.width(), texture.height());
         let shaped = match grow {
-            Some(grow) => self.canvas.shadow.morph(self.device, self.queue, &layer, (w, h), grow, false)?,
-            None => layer,
+            Some(grow) => self.canvas.shadow.morph(self.device, self.queue, &texture, size, grow, false)?,
+            None => texture,
         };
-        // The renderer leaves a blur this faint out altogether.
         let blurred = if sigma > 0.3 {
             let view = shaped.create_view(&wgpu::TextureViewDescriptor::default());
-            crate::blur::blur_texture(self.device, self.queue, &self.canvas.blur, &view, (w, h), sigma)?
+            crate::blur::blur_texture(self.device, self.queue, &self.canvas.blur, &view, size, sigma)?
         } else {
             shaped
         };
-        let tinted = self.canvas.shadow.tint(self.device, self.queue, &blurred, (w, h), color)?;
-        let image = self.canvas.register_layer(tinted);
+        let tinted = self.canvas.shadow.tint(self.device, self.queue, &blurred, size, color)?;
+        let layer = self.canvas.as_layer(tinted);
+        self.keep(key, &layer);
+        Some(layer)
+    }
+
+    /// Keep `layer` under `key` for the next frame.
+    fn keep(&mut self, key: Option<(u64, u64)>, layer: &Layer) {
         if let Some(key) = key {
-            self.canvas.keep_shadow(key, image.clone(), w as usize * h as usize * 4);
+            let bytes = layer.size.0 as usize * layer.size.1 as usize * 4;
+            self.canvas.keep_shadow(key, layer.clone(), bytes);
         }
-        Some(image)
     }
 
     /// A pane's pixels from `back` (the page under it): its padded region cropped, frosted and
     /// run through the glass shader.
-    fn glass_from(&mut self, back: &Texture, pane: &figcraft_render::glass::GlassPane, at: (i32, i32)) -> Option<ImageData> {
+    fn glass_from(&mut self, back: &Texture, pane: &figcraft_render::glass::GlassPane, at: (i32, i32)) -> Option<Layer> {
         let pad = pane.pad;
         let (cw, ch) = (pane.w.checked_add(pad.checked_mul(2)?)?, pane.h.checked_add(pad.checked_mul(2)?)?);
         let cropped = crop(self.device, self.queue, back, (at.0 - pad as i32, at.1 - pad as i32), (cw, ch))?;
@@ -402,7 +488,7 @@ impl GpuLayers<'_> {
         let frosted = crate::blur::blur_texture(self.device, self.queue, &self.canvas.blur, &view, (cw, ch), pane.frost_sigma)?;
         let frosted_view = frosted.create_view(&wgpu::TextureViewDescriptor::default());
         let glass = self.canvas.glass.paint_texture(self.device, self.queue, pane, &frosted_view)?;
-        Some(self.canvas.register_layer(glass))
+        Some(self.canvas.as_layer(glass))
     }
 }
 
@@ -464,7 +550,7 @@ fn crop(device: &Device, queue: &Queue, src: &Texture, (x, y): (i32, i32), (w, h
 }
 
 /// The kept layer in `slot`, allocated (or reallocated) for `size`.
-fn keep(slot: &mut Option<Layer>, device: &Device, (w, h): (u32, u32), label: &str) -> Option<(Texture, TextureView)> {
+fn keep(slot: &mut Option<Scratch>, device: &Device, (w, h): (u32, u32), label: &str) -> Option<(Texture, TextureView)> {
     let stale = match slot.as_ref() {
         Some(l) => l.size != (w, h),
         None => true,
@@ -472,7 +558,7 @@ fn keep(slot: &mut Option<Layer>, device: &Device, (w, h): (u32, u32), label: &s
     if stale {
         let texture = layer_texture(device, label, w, h);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        *slot = Some(Layer { texture, view, size: (w, h) });
+        *slot = Some(Scratch { texture, view, size: (w, h) });
     }
     slot.as_ref().map(|l| (l.texture.clone(), l.view.clone()))
 }

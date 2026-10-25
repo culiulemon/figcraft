@@ -324,22 +324,33 @@ shape**; a group's inner shadow is the remaining one.
 ### P7 — effect combinations, grain, progressive blur
 
 The CPU applies a node's effects in list order: inner shadows, then the layer blur, grain and
-texture, then drop shadows, over the backdrop read. A node with two kinds currently falls back
-whole.
+texture, then drop shadows, over the backdrop read. A node with two kinds used to fall back whole.
 
-- **Combinations**: the builder reads the effect list and drives the same pipeline on the GPU —
-  content → layer blur / grain / texture (in order) → drop shadows from that result → backdrop.
-  Each stage is a pass the canvas already has, chained through one layer.
-- **Grain and texture**: the renderer's noise is deterministic (`grain::noise`/`grains`/`texture`
-  take the node, transform and seed), so the CPU can compute the grain tile once and the canvas
-  uploads it (cached by node, seed and zoom) — the pixels are the CPU's own. A node-scale change
-  regenerates the tile.
-- **Progressive blur**: the CPU's radius ramps along an axis; draw it as several band passes of the
-  box blur at increasing radii, masked by the ramp, or as one blur with a ramp-weighted mix — the
-  second is cheaper and within the effect tolerance.
+**Landed.** A node whose effects are any mix of inner shadows, a layer blur, grain and drop shadows
+is drawn as one layer, in that order (`Builder::layer_pipeline`):
 
-Tests: parity for shadow + layer blur, two blurs, blur + grain, grain on text, a progressive blur
-card. Exit: any single node's effect list draws on the GPU.
+- The content (with its inner shadows, drawn in `content`) goes into a layer of its own.
+- Each **layer blur** in the list is applied in order: a uniform one is the GPU's box blur, a
+  **progressive** one is the renderer's own levels — `figcraft_render::blur::levels` of uniform
+  blurs, mixed per pixel by `mix.wgsl` from the ramp (`bracket`'s two levels at that pixel) — so a
+  ramp of any steepness costs at most eight blurs and one pass.
+- **Grain** is the renderer's own noise: the layer's pixels are read back once, `grain::grains`
+  works them out on the CPU (the grains are a hash of the cell and the node, so they land exactly
+  where an export's do), and the pass draws them over the layer in the noise's blend mode.
+- The **drop shadows** are cast from that result — the outline grown by the spread, or the layer's
+  pixels (`shadow_of_layer`) — and drawn under it, then the layer over them, at the node's opacity
+  and blend mode.
+- Everything is keyed on the node's subtree, the view and the zoom: a drag rebuilds only the layers
+  of the nodes that moved.
+
+Still on the CPU: **texture** (a per-pixel scatter of the layer's pixels, not a blur: it needs a
+pass of its own), a **group's** inner shadow, and a backdrop effect beside another effect.
+
+Tests: parity for a blur and a shadow, an inner shadow and a shadow, a blur with grain and a shadow,
+and a progressive blur with a shadow, beside the P6 shapes (`the_gpu_draws_shadows_of_any_shape`):
+mean 0.130/255, worst 50 on antialiased shape edges, 0.47% of pixels off by more than 8 — the
+progressive card's outermost pixel row is the one place the ramp and the blur disagree.
+Exit: any single node's effect list draws on the GPU — met apart from the three exclusions above.
 
 ### P8 — masks and plus-darker
 
@@ -560,4 +571,13 @@ stays on the fallback list.
     document's ids), so a drag rebuilds one shadow and redraws the rest. 30 shadow-layer cards:
     **1.2–2.4 ms** a frame where the CPU takes 17–43; the first frame (all thirty, and the new
     pipelines compiled) 90–170 ms.
+- 2026-10-25: **P7 landed — effect combinations, grain, progressive blur.** A node's effects are one
+  layer in the CPU's order: content and inner shadows → each layer blur (uniform, or progressive as
+  the renderer's own blur levels mixed by `mix.wgsl`) → grain (the renderer's noise from the layer's
+  pixels, read back once) → the drop shadows cast from that result → the layer over them.
+  - `the_gpu_draws_shadows_of_any_shape` also covers a blur and a shadow, an inner shadow and a
+    shadow, a blur with grain and a shadow, and a progressive blur with a shadow: mean 0.130/255,
+    worst 50, 0.47% of pixels off by more than 8 (the progressive card's outermost row).
+  - Still on the CPU: texture, a group's inner shadow, and a backdrop effect beside another effect
+    (named in P7 and P10).
 

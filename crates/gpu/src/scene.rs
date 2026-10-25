@@ -202,7 +202,7 @@ pub fn draw_backdrop_into(
     view: &View,
     layers: &mut dyn Layers,
     id: NodeId,
-    image: &ImageData,
+    image: &Layer,
     out: &mut Scene,
 ) -> Result<(), Unsupported> {
     let Some(n) = doc.node(id) else { return Ok(()) };
@@ -233,23 +233,47 @@ pub fn draw_backdrop_into(
     Ok(())
 }
 
+/// A layer the GPU (or, while only checking a page, a stand-in) holds: its pixels for the scene to
+/// draw, and the texture the GPU passes read.
+#[derive(Clone)]
+pub struct Layer {
+    pub image: ImageData,
+    pub(crate) texture: Option<wgpu::Texture>,
+    pub size: (u32, u32),
+}
+
+impl Layer {
+    /// A stand-in with no pixels: what the feature check hands the builder.
+    fn blank(width: u32, height: u32) -> Self {
+        Self { image: crate::canvas::blank_image(width, height), texture: None, size: (width, height) }
+    }
+}
+
 /// Where a node's effect layer goes: the GPU renders it offscreen and blurs it without leaving the
 /// device (see `crate::canvas::GpuLayers`). [`supported`] accepts such layers without drawing them.
 pub trait Layers {
     /// A blurred `width` × `height` layer of `scene` (device pixels, transparent ground).
-    fn blurred(&mut self, scene: &Scene, width: u32, height: u32, sigma: f64) -> Option<ImageData>;
+    fn blurred(&mut self, scene: &Scene, width: u32, height: u32, sigma: f64) -> Option<Layer>;
     /// What lies under a node — a whole page drawn into a `width` × `height` texture — blurred.
-    fn backdrop(&mut self, scene: &Scene, width: u32, height: u32, sigma: f64) -> Option<ImageData>;
+    fn backdrop(&mut self, scene: &Scene, width: u32, height: u32, sigma: f64) -> Option<Layer>;
     /// A glass pane's pixels from `scene` (the page under the node); its layer's top-left is `at`
     /// in the `view`-sized scene, and `pane.pad` around it is the backdrop it reads.
-    fn glass(&mut self, scene: &Scene, view: (u32, u32), pane: &figcraft_render::glass::GlassPane, at: (i32, i32)) -> Option<ImageData>;
+    fn glass(&mut self, scene: &Scene, view: (u32, u32), pane: &figcraft_render::glass::GlassPane, at: (i32, i32)) -> Option<Layer>;
     /// A backdrop node's effect pixels from `back`, the accumulated page (`view`-sized): the whole
     /// view blurred, or a glass pane's layer computed from a crop of it.
-    fn backdrop_effect(&mut self, doc: &Document, id: NodeId, view: &View, back: &wgpu::Texture) -> Option<ImageData>;
+    fn backdrop_effect(&mut self, doc: &Document, id: NodeId, view: &View, back: &wgpu::Texture) -> Option<Layer>;
+    /// `scene` drawn into a layer of its own, with no effect on it: a node's content (and its inner
+    /// shadows), which its layer blur, grain and shadows then read.
+    fn layer(&mut self, scene: &Scene, width: u32, height: u32, key: Option<(u64, u64)>) -> Option<Layer>;
+    /// `layer` blurred by `sigma` (one node's layer blur, after whatever came before it).
+    fn blur_layer(&mut self, layer: &Layer, sigma: f64, key: Option<(u64, u64)>) -> Option<Layer>;
+    /// `layer` blurred progressively: `s0` at the layer's pixel `a`, `s1` at `b` (the renderer's
+    /// blend of a few uniform blurs between them).
+    fn progressive(&mut self, layer: &Layer, s0: f64, s1: f64, a: (f64, f64), b: (f64, f64), key: Option<(u64, u64)>) -> Option<Layer>;
     /// A shadow cast by `scene` (a silhouette, or a shape inverted for an inner shadow): its pixels
     /// `width` × `height` device pixels, blurred by `sigma` and tinted `color`. `key` lets a shadow
     /// that did not change be kept between frames.
-    fn shadow(&mut self, scene: &Scene, width: u32, height: u32, sigma: f64, color: Color, key: Option<(u64, u64)>) -> Option<ImageData>;
+    fn shadow(&mut self, scene: &Scene, width: u32, height: u32, sigma: f64, color: Color, key: Option<(u64, u64)>) -> Option<Layer>;
     /// A shadow cast by a node's own pixels: `scene`'s alpha grown (`grow > 0`) or shrunk by whole
     /// pixels, blurred by `sigma` and tinted `color`.
     fn shadow_of_pixels(
@@ -261,9 +285,13 @@ pub trait Layers {
         sigma: f64,
         color: Color,
         key: Option<(u64, u64)>,
-    ) -> Option<ImageData>;
-    /// A shadow kept from an earlier frame under `key` (`None`: there is none, or keeping is off).
-    fn kept_shadow(&mut self, _key: (u64, u64)) -> Option<ImageData> {
+    ) -> Option<Layer>;
+    /// A shadow cast by `layer`'s own pixels (a layer blur or grain before it, already in them).
+    fn shadow_of_layer(&mut self, layer: &Layer, grow: i32, sigma: f64, color: Color, key: Option<(u64, u64)>) -> Option<Layer>;
+    /// `layer`'s pixels, for the effects the CPU works out (grain's noise, the texture's scatter).
+    fn layer_pixels(&mut self, layer: &Layer) -> Option<Pixmap>;
+    /// A layer kept from an earlier frame under `key` (`None`: there is none, or keeping is off).
+    fn kept_shadow(&mut self, _key: (u64, u64)) -> Option<Layer> {
         None
     }
 }
@@ -272,32 +300,47 @@ pub trait Layers {
 struct Probe;
 
 impl Layers for Probe {
-    fn blurred(&mut self, _scene: &Scene, width: u32, height: u32, _sigma: f64) -> Option<ImageData> {
-        Some(crate::canvas::blank_image(width, height))
+    fn blurred(&mut self, _scene: &Scene, width: u32, height: u32, _sigma: f64) -> Option<Layer> {
+        Some(Layer::blank(width, height))
     }
-    fn backdrop(&mut self, scene: &Scene, width: u32, height: u32, sigma: f64) -> Option<ImageData> {
+    fn backdrop(&mut self, scene: &Scene, width: u32, height: u32, sigma: f64) -> Option<Layer> {
         self.blurred(scene, width, height, sigma)
     }
-    fn glass(&mut self, _scene: &Scene, _view: (u32, u32), pane: &figcraft_render::glass::GlassPane, _at: (i32, i32)) -> Option<ImageData> {
-        Some(crate::canvas::blank_image(pane.w, pane.h))
+    fn glass(&mut self, _scene: &Scene, _view: (u32, u32), pane: &figcraft_render::glass::GlassPane, _at: (i32, i32)) -> Option<Layer> {
+        Some(Layer::blank(pane.w, pane.h))
     }
-    fn backdrop_effect(&mut self, _doc: &Document, _id: NodeId, view: &View, _back: &wgpu::Texture) -> Option<ImageData> {
-        Some(crate::canvas::blank_image(view.width, view.height))
+    fn backdrop_effect(&mut self, _doc: &Document, _id: NodeId, view: &View, _back: &wgpu::Texture) -> Option<Layer> {
+        Some(Layer::blank(view.width, view.height))
     }
-    fn shadow(&mut self, _scene: &Scene, width: u32, height: u32, _sigma: f64, _color: Color, _key: Option<(u64, u64)>) -> Option<ImageData> {
-        Some(crate::canvas::blank_image(width, height))
+    fn layer(&mut self, _scene: &Scene, width: u32, height: u32, _key: Option<(u64, u64)>) -> Option<Layer> {
+        Some(Layer::blank(width, height))
+    }
+    fn blur_layer(&mut self, layer: &Layer, _sigma: f64, _key: Option<(u64, u64)>) -> Option<Layer> {
+        Some(Layer::blank(layer.size.0, layer.size.1))
+    }
+    fn progressive(&mut self, layer: &Layer, _s0: f64, _s1: f64, _a: (f64, f64), _b: (f64, f64), _key: Option<(u64, u64)>) -> Option<Layer> {
+        Some(Layer::blank(layer.size.0, layer.size.1))
+    }
+    fn shadow(&mut self, _scene: &Scene, width: u32, height: u32, _sigma: f64, _color: Color, _key: Option<(u64, u64)>) -> Option<Layer> {
+        Some(Layer::blank(width, height))
     }
     fn shadow_of_pixels(
         &mut self,
-        scene: &Scene,
+        _scene: &Scene,
         width: u32,
         height: u32,
         _grow: i32,
-        sigma: f64,
-        color: Color,
-        key: Option<(u64, u64)>,
-    ) -> Option<ImageData> {
-        self.shadow(scene, width, height, sigma, color, key)
+        _sigma: f64,
+        _color: Color,
+        _key: Option<(u64, u64)>,
+    ) -> Option<Layer> {
+        Some(Layer::blank(width, height))
+    }
+    fn shadow_of_layer(&mut self, layer: &Layer, _grow: i32, _sigma: f64, _color: Color, _key: Option<(u64, u64)>) -> Option<Layer> {
+        Some(Layer::blank(layer.size.0, layer.size.1))
+    }
+    fn layer_pixels(&mut self, layer: &Layer) -> Option<Pixmap> {
+        Pixmap::new(layer.size.0, layer.size.1)
     }
 }
 
@@ -305,19 +348,28 @@ impl Layers for Probe {
 pub struct NoLayers;
 
 impl Layers for NoLayers {
-    fn blurred(&mut self, _scene: &Scene, _width: u32, _height: u32, _sigma: f64) -> Option<ImageData> {
+    fn blurred(&mut self, _scene: &Scene, _width: u32, _height: u32, _sigma: f64) -> Option<Layer> {
         None
     }
-    fn backdrop(&mut self, _scene: &Scene, _width: u32, _height: u32, _sigma: f64) -> Option<ImageData> {
+    fn backdrop(&mut self, _scene: &Scene, _width: u32, _height: u32, _sigma: f64) -> Option<Layer> {
         None
     }
-    fn glass(&mut self, _scene: &Scene, _view: (u32, u32), _pane: &figcraft_render::glass::GlassPane, _at: (i32, i32)) -> Option<ImageData> {
+    fn glass(&mut self, _scene: &Scene, _view: (u32, u32), _pane: &figcraft_render::glass::GlassPane, _at: (i32, i32)) -> Option<Layer> {
         None
     }
-    fn backdrop_effect(&mut self, _doc: &Document, _id: NodeId, _view: &View, _back: &wgpu::Texture) -> Option<ImageData> {
+    fn backdrop_effect(&mut self, _doc: &Document, _id: NodeId, _view: &View, _back: &wgpu::Texture) -> Option<Layer> {
         None
     }
-    fn shadow(&mut self, _scene: &Scene, _width: u32, _height: u32, _sigma: f64, _color: Color, _key: Option<(u64, u64)>) -> Option<ImageData> {
+    fn layer(&mut self, _scene: &Scene, _width: u32, _height: u32, _key: Option<(u64, u64)>) -> Option<Layer> {
+        None
+    }
+    fn blur_layer(&mut self, _layer: &Layer, _sigma: f64, _key: Option<(u64, u64)>) -> Option<Layer> {
+        None
+    }
+    fn progressive(&mut self, _layer: &Layer, _s0: f64, _s1: f64, _a: (f64, f64), _b: (f64, f64), _key: Option<(u64, u64)>) -> Option<Layer> {
+        None
+    }
+    fn shadow(&mut self, _scene: &Scene, _width: u32, _height: u32, _sigma: f64, _color: Color, _key: Option<(u64, u64)>) -> Option<Layer> {
         None
     }
     fn shadow_of_pixels(
@@ -329,7 +381,13 @@ impl Layers for NoLayers {
         _sigma: f64,
         _color: Color,
         _key: Option<(u64, u64)>,
-    ) -> Option<ImageData> {
+    ) -> Option<Layer> {
+        None
+    }
+    fn shadow_of_layer(&mut self, _layer: &Layer, _grow: i32, _sigma: f64, _color: Color, _key: Option<(u64, u64)>) -> Option<Layer> {
+        None
+    }
+    fn layer_pixels(&mut self, _layer: &Layer) -> Option<Pixmap> {
         None
     }
 }
@@ -377,8 +435,6 @@ struct Builder<'a> {
 /// What a node's visible effects need of the GPU, if anything.
 enum Effects {
     None,
-    /// One layer blur: its radius in document units.
-    LayerBlur(f64),
     /// One background blur (uniform): its radius in document units.
     BackgroundBlur(f64),
     /// One glass pane.
@@ -386,13 +442,13 @@ enum Effects {
     /// Drop shadows a node casts straight into the scene: its silhouette is one rounded rect, so
     /// each shadow is vello's blurred rounded rect under the node, with no layer.
     Shadows(ShadowShape),
-    /// Drop shadows cast from a layer the GPU blurs and tints: its outline grown by the spread, or
-    /// its own pixels.
-    ShadowLayer,
-    /// Inner shadows: everything outside the shape at the shadow's offset, blurred and clipped to
-    /// the shape (drawn between the node's fills and its children).
+    /// Inner shadows only: everything outside the shape at the shadow's offset, blurred and
+    /// clipped to the shape (drawn between the node's fills and its children).
     InnerShadows,
-    /// Anything else (grain, several kinds of effect).
+    /// A layer of its own: a layer blur, grain or drop shadows (any mix, with inner shadows too),
+    /// in the CPU's order.
+    Layer,
+    /// Anything else (a texture, a progressive layer blur, a shadow beside a backdrop effect).
     Other,
 }
 
@@ -531,27 +587,35 @@ fn effects_of(doc: &Document, n: &Node) -> Effects {
             Backdrop::Glass(g) => Effects::Glass(g),
         };
     }
-    let mut visible = n.effects.iter().filter(|e| e.visible);
-    let Some(e) = visible.next() else { return Effects::None };
-    let single = visible.next().is_none();
-    if single
-        && let figcraft_doc::EffectKind::LayerBlur(b) = &e.kind
-        && !b.is_progressive()
-    {
-        return Effects::LayerBlur(b.sanitized().radius);
+    let visible = || n.effects.iter().filter(|e| e.visible);
+    if visible().next().is_none() {
+        return Effects::None;
     }
-    // One kind of effect at a time: drop shadows (straight into the scene when they are one rounded
-    // rect, else from a layer) or inner shadows.
-    let only = |wanted: fn(&figcraft_doc::EffectKind) -> bool| n.effects.iter().filter(|e| e.visible).all(|e| wanted(&e.kind));
+    let only = |wanted: fn(&figcraft_doc::EffectKind) -> bool| visible().all(|e| wanted(&e.kind));
+    // Drop shadows on one rounded rect: straight into the scene, no layer.
     if only(|k| matches!(k, figcraft_doc::EffectKind::DropShadow(_))) {
         return match shadow_shape(doc, n) {
             Some(shape) => Effects::Shadows(shape),
-            None => Effects::ShadowLayer,
+            None => Effects::Layer,
         };
     }
     if only(|k| matches!(k, figcraft_doc::EffectKind::InnerShadow(_))) {
         // A group's is cast from its pixels, not one outline: the CPU's for now.
         return if matches!(n.kind, NodeKind::Group | NodeKind::Page { .. }) { Effects::Other } else { Effects::InnerShadows };
+    }
+    // One layer of its own, in the CPU's order: inner shadows, the layer blur and grain, then the
+    // drop shadows cast from that result.
+    let known = |k: &figcraft_doc::EffectKind| {
+        matches!(
+            k,
+            figcraft_doc::EffectKind::DropShadow(_)
+                | figcraft_doc::EffectKind::InnerShadow(_)
+                | figcraft_doc::EffectKind::Noise(_)
+                | figcraft_doc::EffectKind::LayerBlur(_)
+        )
+    };
+    if visible().all(|e| known(&e.kind)) {
+        return Effects::Layer;
     }
     Effects::Other
 }
@@ -581,14 +645,13 @@ impl Builder<'_> {
         }
         match effects_of(self.doc, n) {
             Effects::None => {}
-            Effects::LayerBlur(radius) => return self.blurred_layer(n, parent_xf, depth, radius),
             Effects::BackgroundBlur(radius) => return self.backdrop_layer(n, depth, radius),
             Effects::Glass(glass) => return self.glass_layer(n, depth, &glass),
             Effects::Shadows(shape) => {
                 let xf = parent_xf * n.transform;
                 self.draw_shadows(n, &shape, xf);
             }
-            Effects::ShadowLayer => self.shadow_layers(n, depth)?,
+            Effects::Layer => return self.layer_pipeline(n, depth),
             // Drawn inside the content, between the fills and the children.
             Effects::InnerShadows => {}
             Effects::Other => return Err(Unsupported::Effect),
@@ -739,7 +802,7 @@ impl Builder<'_> {
     /// `n`'s backdrop effect pixels: its layer texture with its top-left at `at`, clipped to the
     /// node's shape when `clip` (a blurred layer is a rectangle; a pane carries its own coverage);
     /// then the node's content over them.
-    fn draw_backdrop_image(&mut self, n: &Node, depth: usize, image: &ImageData, ((x, y), clip): ((f64, f64), bool)) -> Result<(), Unsupported> {
+    fn draw_backdrop_image(&mut self, n: &Node, depth: usize, image: &Layer, ((x, y), clip): ((f64, f64), bool)) -> Result<(), Unsupported> {
         let view = self.view.clone();
         let parent = n.parent.map(|p| self.doc.world_transform(p)).unwrap_or(Affine::IDENTITY);
         let xf = view.transform() * parent * n.transform;
@@ -748,6 +811,7 @@ impl Builder<'_> {
             self.push_layer(n);
         }
         let sampler = ImageSampler { x_extend: Extend::Pad, y_extend: Extend::Pad, quality: ImageQuality::Low, alpha: 1.0 };
+        let image = &image.image;
         if clip {
             if let Some((path, rule)) = node_outline(self.doc, n)
                 && let Some(s) = &mut self.scene
@@ -760,31 +824,6 @@ impl Builder<'_> {
             s.draw_image(ImageBrush { image, sampler }, KAffine::translate((x, y)));
         }
         self.content(n, xf, depth)?;
-        if isolated && let Some(s) = &mut self.scene {
-            s.pop_layer();
-        }
-        Ok(())
-    }
-
-    /// A node with one layer blur: its content is drawn into a layer of its own, blurred on the
-    /// GPU, and composited with its opacity and blend mode (as the CPU renderer isolates it).
-    fn blurred_layer(&mut self, n: &Node, _parent_xf: Affine, depth: usize, radius: f64) -> Result<(), Unsupported> {
-        if n.blend == BlendMode::PlusDarker {
-            return Err(Unsupported::Structure);
-        }
-        let Some((x0, y0, w, h)) = self.layer_rect(n)? else { return Ok(()) };
-        let sub_scene = self.content_scene(n, (x0, y0, w, h), depth)?;
-        let view = self.view.clone();
-        let sigma = radius / 2.0 * view.scale;
-        let Some(image) = self.layers.blurred(&sub_scene, w, h, sigma) else { return Err(Unsupported::Effect) };
-        let isolated = n.opacity < 1.0 || !matches!(n.blend, BlendMode::PassThrough | BlendMode::Normal);
-        if isolated {
-            self.push_layer(n);
-        }
-        let sampler = ImageSampler { x_extend: Extend::Pad, y_extend: Extend::Pad, quality: ImageQuality::Low, alpha: 1.0 };
-        if let Some(s) = &mut self.scene {
-            s.draw_image(ImageBrush { image: &image, sampler }, KAffine::translate((x0, y0)));
-        }
         if isolated && let Some(s) = &mut self.scene {
             s.pop_layer();
         }
@@ -812,37 +851,71 @@ impl Builder<'_> {
         sub.scene.take().ok_or(Unsupported::Structure)
     }
 
-    /// Drop shadows the GPU casts from a layer — a node the fast path can't draw straight into the
-    /// scene (an ellipse, a star, a vector, text, per-corner radii, a group): its silhouette grown
-    /// by the spread, or its own pixels, blurred and tinted, under the node.
-    fn shadow_layers(&mut self, n: &Node, depth: usize) -> Result<(), Unsupported> {
+    /// A node's own layer and the effects that read it, in the CPU's order: its content (and inner
+    /// shadows) → its layer blur and grain → the drop shadows cast from that result → the layer
+    /// over them. The shadows the rounded-rect fast path draws straight into the scene still are.
+    fn layer_pipeline(&mut self, n: &Node, depth: usize) -> Result<(), Unsupported> {
+        if n.blend == BlendMode::PlusDarker {
+            return Err(Unsupported::Structure);
+        }
         let Some((x0, y0, w, h)) = self.layer_rect(n)? else { return Ok(()) };
         let view = self.view.clone();
         let parent = n.parent.map(|p| self.doc.world_transform(p)).unwrap_or(Affine::IDENTITY);
         let xf = view.transform() * parent * n.transform;
         let layer_xf = Affine::translate((-x0, -y0)) * xf;
         let scale = view.scale;
-        let shadows: Vec<figcraft_doc::Shadow> = n
-            .effects
+        let effects: Vec<&figcraft_doc::Effect> = n.effects.iter().filter(|e| e.visible).collect();
+        let shadows: Vec<figcraft_doc::Shadow> = effects
             .iter()
-            .filter(|e| e.visible)
             .filter_map(|e| match &e.kind {
                 figcraft_doc::EffectKind::DropShadow(s) => Some(s.clone()),
                 _ => None,
             })
             .collect();
-        if shadows.is_empty() {
-            return Err(Unsupported::Effect);
-        }
-        let silhouette = figcraft_render::shadow::silhouette(self.doc, n);
-        let outside = figcraft_render::shadow::cover(self.doc, n).map(|c| outside(&c));
-        // The node's own pixels, drawn once however many shadows it casts.
-        let mut content: Option<Scene> = None;
-        let bounds = KRect::new(x0, y0, x0 + f64::from(w), y0 + f64::from(h));
-        for (index, s) in shadows.iter().enumerate() {
+        for s in &shadows {
             if !(s.offset.0.is_finite() && s.offset.1.is_finite() && s.radius.is_finite() && s.spread.is_finite()) {
                 return Err(Unsupported::Effect);
             }
+        }
+        let reads_pixels: Vec<&figcraft_doc::Effect> =
+            effects.iter().copied().filter(|e| matches!(e.kind, figcraft_doc::EffectKind::LayerBlur(_) | figcraft_doc::EffectKind::Noise(_))).collect();
+        let silhouette = figcraft_render::shadow::silhouette(self.doc, n);
+        let outside = figcraft_render::shadow::cover(self.doc, n).map(|c| outside(&c));
+        let pixel_shadows = shadows.iter().any(|s| !casts_from_outline(&silhouette, s));
+        let bounds = KRect::new(x0, y0, x0 + f64::from(w), y0 + f64::from(h));
+        // The node's own pixels: its content with its inner shadows, then its layer effects.
+        let mut content: Option<Layer> = None;
+        if pixel_shadows || !reads_pixels.is_empty() {
+            let key = self.shadow_key(n, u64::MAX, xf);
+            content = self.layers.kept_shadow(key);
+            if content.is_none() {
+                let scene = self.content_scene(n, (x0, y0, w, h), depth)?;
+                let mut made = self.layers.layer(&scene, w, h, None).ok_or(Unsupported::Effect)?;
+                for (i, e) in reads_pixels.iter().enumerate() {
+                    // The last stage keeps its result: the layer is a function of the node.
+                    let keep = (i + 1 == reads_pixels.len()).then_some(key);
+                    made = match &e.kind {
+                        figcraft_doc::EffectKind::LayerBlur(b) => {
+                            let b = b.sanitized();
+                            let (s0, s1) = (b.start_radius / 2.0 * scale, b.radius / 2.0 * scale);
+                            if b.is_progressive() {
+                                let at = |u: (f64, f64)| {
+                                    let p = layer_xf * Point::new(u.0 * n.width, u.1 * n.height);
+                                    (p.x, p.y)
+                                };
+                                self.layers.progressive(&made, s0, s1, at(b.start), at(b.end), keep).ok_or(Unsupported::Effect)?
+                            } else {
+                                self.layers.blur_layer(&made, s1, keep).ok_or(Unsupported::Effect)?
+                            }
+                        }
+                        figcraft_doc::EffectKind::Noise(nz) => self.grain_layer(&made, nz, layer_xf, n.id.0 as u32, keep)?,
+                        _ => return Err(Unsupported::Effect),
+                    };
+                }
+                content = Some(made);
+            }
+        }
+        for (index, s) in shadows.iter().enumerate() {
             let (dx, dy) = (s.offset.0 * scale, s.offset.1 * scale);
             let spread = s.spread;
             // The shadow is drawn at the node's opacity (as the CPU composites it), so its colour's
@@ -856,24 +929,21 @@ impl Builder<'_> {
             let key = self.shadow_key(n, index as u64, xf);
             let (image, at) = match self.layers.kept_shadow(key) {
                 Some(image) => (Some(image), shadow_place(&silhouette, spread, (x0, y0), (dx, dy))),
-                None => match &silhouette {
-                    Some(sil) if spread != 0.0 => {
+                None => {
+                    if casts_from_outline(&silhouette, s) {
+                        let Some(sil) = &silhouette else { return Err(Unsupported::Effect) };
                         let mut scene = Scene::new();
                         silhouette_scene(&mut scene, sil, spread, layer_xf, (dx, dy), KRect::new(0.0, 0.0, f64::from(w), f64::from(h)));
                         (self.layers.shadow(&scene, w, h, sigma, color, Some(key)), (x0, y0))
-                    }
-                    _ => {
-                        if content.is_none() {
-                            content = Some(self.content_scene(n, (x0, y0, w, h), depth)?);
-                        }
-                        let Some(scene) = content.as_ref() else { return Err(Unsupported::Structure) };
+                    } else {
+                        let Some(layer) = content.as_ref() else { return Err(Unsupported::Structure) };
                         let grow = whole_px(spread * scale);
                         (
-                            self.layers.shadow_of_pixels(scene, w, h, grow, sigma, color, Some(key)),
+                            self.layers.shadow_of_layer(layer, grow, sigma, color, Some(key)),
                             (x0 + f64::from(whole_px(dx)), y0 + f64::from(whole_px(dy))),
                         )
                     }
-                },
+                }
             };
             let Some(image) = image else { return Err(Unsupported::Effect) };
             // A shadow that hides behind the paints is cut where they cover (the CPU masks it by
@@ -881,12 +951,60 @@ impl Builder<'_> {
             let hole = if s.show_behind { None } else { outside.as_ref() };
             self.draw_shadow_image(&image, at, Some(&bounds), hole, s.blend, xf);
         }
+        // The node over its shadows: the layer the effects made, or its content drawn straight
+        // into the scene when nothing had to read it.
+        let isolated = n.opacity < 1.0 || !matches!(n.blend, BlendMode::PassThrough | BlendMode::Normal);
+        if isolated {
+            self.push_layer(n);
+        }
+        match &content {
+            Some(layer) => {
+                let sampler = ImageSampler { x_extend: Extend::Pad, y_extend: Extend::Pad, quality: ImageQuality::Low, alpha: 1.0 };
+                if let Some(s) = &mut self.scene {
+                    s.draw_image(ImageBrush { image: &layer.image, sampler }, KAffine::translate((x0, y0)));
+                }
+            }
+            None => self.content(n, xf, depth)?,
+        }
+        if isolated {
+            self.pop_layer();
+        }
         Ok(())
+    }
+
+    /// The layer's grain: the renderer's own noise from its pixels, over it, in the noise's blend
+    /// mode. The grains are the CPU's own (a read-back of the layer), so they land where they do in
+    /// an export.
+    fn grain_layer(
+        &mut self,
+        layer: &Layer,
+        nz: &figcraft_doc::Noise,
+        layer_xf: Affine,
+        seed: u32,
+        key: Option<(u64, u64)>,
+    ) -> Result<Layer, Unsupported> {
+        let Some(pixels) = self.layers.layer_pixels(layer) else { return Err(Unsupported::Effect) };
+        let Some(grains) = figcraft_render::grain::grains(&pixels, nz, layer_xf, seed) else { return Ok(layer.clone()) };
+        let grains = image_data(&Arc::new(grains));
+        let sampler = ImageSampler { x_extend: Extend::Pad, y_extend: Extend::Pad, quality: ImageQuality::Low, alpha: 1.0 };
+        let mut scene = Scene::new();
+        scene.draw_image(ImageBrush { image: &layer.image, sampler }, KAffine::IDENTITY);
+        let blended = nz.blend != BlendMode::Normal && nz.blend != BlendMode::PassThrough;
+        if blended {
+            let target = KRect::new(0.0, 0.0, f64::from(layer.size.0), f64::from(layer.size.1));
+            scene.push_layer(Fill::NonZero, blend(nz.blend), 1.0, KAffine::IDENTITY, &target);
+        }
+        scene.draw_image(ImageBrush { image: &grains, sampler }, KAffine::IDENTITY);
+        if blended {
+            scene.pop_layer();
+        }
+        self.layers.layer(&scene, layer.size.0, layer.size.1, key).ok_or(Unsupported::Effect)
     }
 
     /// Draw a shadow's pixels at `at` (device pixels), cut to `bounds` (the CPU crops it to the
     /// layer), outside `hole` (the node's paints) when given, in the shadow's own blend mode.
-    fn draw_shadow_image(&mut self, image: &ImageData, at: (f64, f64), bounds: Option<&KRect>, hole: Option<&figcraft_geom::BezPath>, mode: BlendMode, xf: Affine) {
+    fn draw_shadow_image(&mut self, image: &Layer, at: (f64, f64), bounds: Option<&KRect>, hole: Option<&figcraft_geom::BezPath>, mode: BlendMode, xf: Affine) {
+        let image = &image.image;
         let Some(s) = &mut self.scene else { return };
         let blended = mode != BlendMode::Normal && mode != BlendMode::PassThrough;
         let target = KRect::new(0.0, 0.0, 32_768.0, 32_768.0);
@@ -951,7 +1069,7 @@ impl Builder<'_> {
             let Some(scene) = &mut self.scene else { continue };
             let sampler = ImageSampler { x_extend: Extend::Pad, y_extend: Extend::Pad, quality: ImageQuality::Low, alpha: 1.0 };
             scene.push_clip_layer(fill_rule(rule), k_affine(xf), &shape);
-            scene.draw_image(ImageBrush { image: &image, sampler }, KAffine::translate(at));
+            scene.draw_image(ImageBrush { image: &image.image, sampler }, KAffine::translate(at));
             scene.pop_layer();
         }
         Ok(())
@@ -968,7 +1086,7 @@ impl Builder<'_> {
         scale: f64,
         s: &figcraft_doc::Shadow,
         key: (u64, u64),
-    ) -> Result<(ImageData, (f64, f64)), Unsupported> {
+    ) -> Result<(Layer, (f64, f64)), Unsupported> {
         let (dx, dy) = (s.offset.0 * scale, s.offset.1 * scale);
         let spread = s.spread;
         // Everything outside the shape casts shadow inwards, from every edge: the buffer reaches as
@@ -1400,6 +1518,12 @@ fn shadow_place(silhouette: &Option<Vec<figcraft_render::shadow::Outline>>, spre
         Some(_) if spread != 0.0 => at,
         _ => (at.0 + f64::from(whole_px(dx)), at.1 + f64::from(whole_px(dy))),
     }
+}
+
+/// Whether a shadow is cast from the node's outline grown by its spread rather than its pixels —
+/// the CPU's `Caster` rule.
+fn casts_from_outline(silhouette: &Option<Vec<figcraft_render::shadow::Outline>>, s: &figcraft_doc::Shadow) -> bool {
+    silhouette.is_some() && s.spread != 0.0
 }
 
 /// The identity of a node and everything under it: nodes are shared `Arc`s, so a changed node is a
