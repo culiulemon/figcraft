@@ -279,6 +279,15 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
   Still on the CPU for content: a **paint's plus-darker** and a **plus-darker layer under a
   backdrop effect**; the editor's outline modes, skipped layers, soft proof and Display P3 stay
   there by design.
+- **Landed (2026-10-26), a real drag:** dragging the same card with a real mouse (714 px/s over a
+  maximized 2560 × 1440 window, canvas 2280 × 1624 device px) rebuilt the blurred layer on every
+  frame (~35–50 ms each, 73 rebuilds in a 0.5 s drag) and could even show a **stale** frame: the
+  cache keys were node *addresses*, and a drag frees the previous document, so the allocator reused
+  the address (ABA) and the card froze at an earlier position. Keys are now hashed by value
+  (`scene::node_hash`), and the layer key is the layer-local transform, so a whole-pixel drag keeps
+  the blurred layer: 0 rebuilds, `plan 0.0, build 0.1, render 6.5–8.3 ms` a frame, and screen
+  captures put the card within 7 px of the cursor (~10 ms behind). Tests: `a_dragged_card_keeps_its_blur`,
+  `a_whole_pixel_move_keeps_the_layer_key`.
 - **Landed (2026-10-26), blur cost:** a box pass is O(1) a pixel and one dispatch (a workgroup
   scans 256 pixels of a line and their halo in shared memory), and each progressive level is
   blurred only where the ramp uses it (its band plus the blur's reach), so a blur's radius costs

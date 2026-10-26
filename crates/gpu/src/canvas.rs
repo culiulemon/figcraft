@@ -62,6 +62,9 @@ pub struct CanvasGpu {
     /// Look-ups that found a kept scene (tests: a drag re-encodes only what moved).
     #[cfg(test)]
     node_hits: u64,
+    /// Look-ups that found a kept shadow or layer (tests: a drag reuses the blurred layer).
+    #[cfg(test)]
+    shadow_hits: u64,
     /// Bumped on every look-up and keep: the least recently used shadow or scene goes first.
     tick: u64,
 }
@@ -146,6 +149,8 @@ impl CanvasGpu {
             nodes: HashMap::new(),
             #[cfg(test)]
             node_hits: 0,
+            #[cfg(test)]
+            shadow_hits: 0,
             tick: 0,
         })
     }
@@ -390,7 +395,17 @@ impl CanvasGpu {
         kept.used = tick;
         let layer = kept.layer.clone();
         self.renderer.mark_override_image_dirty(&layer.image);
+        #[cfg(test)]
+        {
+            self.shadow_hits += 1;
+        }
         Some(layer)
+    }
+
+    /// Look-ups that found a kept shadow or layer (tests).
+    #[cfg(test)]
+    pub(crate) fn kept_shadow_hits(&self) -> u64 {
+        self.shadow_hits
     }
 
     /// Keep `layer` as the shadow made from `key`, dropping the least recently used while the

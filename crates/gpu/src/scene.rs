@@ -183,12 +183,13 @@ pub fn plan(doc: &Document, page: NodeId) -> Result<Vec<Step>, Unsupported> {
 
 /// The key of a step's own pixels (`Step::Nodes`): its nodes and everything under them, the view
 /// and the zoom — plus the document's shape and text layout, as a shadow's key — so a drag re-draws
-/// only the steps it changed.
+/// only the steps it changed. The nodes' own placements are part of it: a step's pixels move with
+/// them (a layer's *texture* may not, see [`content_hash`]).
 pub fn step_key(doc: &Document, view: &View, ids: &[NodeId]) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     for id in ids {
         if let Some(n) = doc.node(*id) {
-            subtree_hash(doc, n, 0).hash(&mut h);
+            node_hash(doc, n, 0, true).hash(&mut h);
         }
     }
     (doc.next_id(), doc.node_count()).hash(&mut h);
@@ -1160,7 +1161,11 @@ impl Builder<'_> {
         // The node's own pixels: its content with its inner shadows, then its layer effects.
         let mut content: Option<Layer> = None;
         if pixel_shadows || !reads_pixels.is_empty() || !group_inner.is_empty() {
-            let key = self.shadow_key(n, u64::MAX, xf);
+            // A layer's pixels are drawn in the layer's own space (its top-left at its own
+            // origin): moving the node moves the layer's place, not what it holds, so the key is
+            // the layer's own transform — a drag reuses the blurred layer instead of blurring it
+            // again.
+            let key = self.shadow_key(n, u64::MAX, layer_xf);
             content = self.layers.kept_shadow(key);
             if content.is_none() {
                 let scene = self.content_scene(n, (x0, y0, w, h), depth)?;
@@ -1204,7 +1209,9 @@ impl Builder<'_> {
                 continue;
             }
             let sigma = s.radius / 2.0 * scale;
-            let key = self.shadow_key(n, index as u64, xf);
+            // The shadow's pixels are built in the layer's own space too: the node's place on the
+            // page is its separate placement, so a drag keeps the cast shadow.
+            let key = self.shadow_key(n, index as u64, layer_xf);
             let (image, at) = match self.layers.kept_shadow(key) {
                 Some(image) => (Some(image), shadow_place(&silhouette, spread, (x0, y0), (dx, dy))),
                 None => {
@@ -1373,7 +1380,7 @@ impl Builder<'_> {
             if !(s.offset.0.is_finite() && s.offset.1.is_finite() && s.radius.is_finite() && s.spread.is_finite()) {
                 return Err(Unsupported::Effect);
             }
-            let key = self.shadow_key(n, 1u64 << 32 | index as u64, xf);
+            let key = self.shadow_key(n, 1u64 << 32 | index as u64, layer_xf);
             let (image, at) = match self.layers.kept_shadow(key) {
                 Some(image) => {
                     let (dx, dy) = (s.offset.0 * scale, s.offset.1 * scale);
@@ -1439,24 +1446,13 @@ impl Builder<'_> {
         Ok((image, (x0 - f64::from(pad), y0 - f64::from(pad))))
     }
 
-    /// A key for one of `n`'s shadows: the node and everything under it (a node is a shared `Arc`,
-    /// so an edit is a new address), the view, the zoom and the shadow's place in the list — plus
-    /// the document's shape (ids, node count), so another file's nodes at the same addresses can't
-    /// match.
+    /// A key for one of `n`'s shadows or layers: what the node draws (see [`content_hash`] — its
+    /// own placement left out, so a drag keeps its pixels), `xf` (the layer's own placement in its
+    /// layer: whole-pixel moves leave it, fractional ones change it), the shadow's place in the
+    /// list — plus the document's shape (ids, node count), so another file's nodes at the same
+    /// addresses can't match.
     fn shadow_key(&self, n: &Node, index: u64, xf: Affine) -> (u64, u64) {
-        let mut first = std::collections::hash_map::DefaultHasher::new();
-        subtree_hash(self.doc, n, 0).hash(&mut first);
-        index.hash(&mut first);
-        self.doc.pages.hash(&mut first);
-        (self.doc.next_id(), self.doc.node_count()).hash(&mut first);
-        (n.width.to_bits(), n.height.to_bits()).hash(&mut first);
-        figcraft_text::layout_generation().hash(&mut first);
-        self.doc.color_profile.hash(&mut first);
-        let mut second = std::collections::hash_map::DefaultHasher::new();
-        for v in xf.as_coeffs().map(f64::to_bits) {
-            v.hash(&mut second);
-        }
-        (first.finish(), second.finish())
+        layer_key(self.doc, n, index, xf)
     }
 
     /// A layer for the node's opacity and blend mode, clipped to what the scene can see: the whole
@@ -1950,20 +1946,76 @@ fn casts_from_outline(silhouette: &Option<Vec<figcraft_render::shadow::Outline>>
     silhouette.is_some() && s.spread != 0.0
 }
 
-/// The identity of a node and everything under it: nodes are shared `Arc`s, so a changed node is a
-/// new address, and a changed child shows here as a changed address too (the renderer's
-/// `layers::subtree`).
-fn subtree_hash(doc: &Document, n: &Node, depth: usize) -> u64 {
+/// What `n` draws, as one hash: its data with its own placement left out, and its children by
+/// value (a child holds its own placement, which moves its pixels). A drag changes only the node's
+/// translation — which the canvas applies where it draws the layer — so an effect layer keyed on
+/// this stays valid across it, while any edit to what it draws changes the hash.
+fn content_hash(doc: &Document, n: &Node, depth: usize) -> u64 {
+    node_hash(doc, n, depth, false)
+}
+
+/// A node and everything under it, hashed by value (what it draws, not where it lives): two nodes
+/// that draw the same thing hash the same, and an address the allocator hands out again cannot
+/// pass for an unchanged node — what keying nodes by their `Arc` address got wrong once a drag
+/// freed the last document. `own_transform` says whether the node's own placement is part of it.
+fn node_hash(doc: &Document, n: &Node, depth: usize, own_transform: bool) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (n as *const Node as usize).hash(&mut h);
+    let mut copy = n.clone();
+    if !own_transform {
+        copy.transform = Affine::IDENTITY;
+    }
+    if serde_json::to_writer(HashSink(&mut h), &copy).is_err() {
+        // Unserialisable is as good as changed: make the key unique.
+        (n as *const Node as usize).hash(&mut h);
+    }
     if depth < MAX_DEPTH {
         for c in &n.children {
             if let Some(cn) = doc.node(*c) {
-                subtree_hash(doc, cn, depth + 1).hash(&mut h);
+                node_hash(doc, cn, depth + 1, true).hash(&mut h);
             }
         }
     }
     h.finish()
+}
+
+/// [`Builder::shadow_key`]: what `n` draws, its layer's placement, and the document's shape.
+pub(crate) fn layer_key_for(doc: &Document, n: &Node, index: u64, xf: Affine) -> (u64, u64) {
+    layer_key(doc, n, index, xf)
+}
+
+/// `id`'s layer rectangle (tests: the layer's own placement).
+#[cfg(test)]
+pub(crate) fn layer_rect_for(doc: &Document, id: NodeId, view: &View) -> Option<(f64, f64, u32, u32)> {
+    layer_rect_impl(doc, doc.node(id)?, view).ok().flatten()
+}
+
+fn layer_key(doc: &Document, n: &Node, index: u64, xf: Affine) -> (u64, u64) {
+    let mut first = std::collections::hash_map::DefaultHasher::new();
+    content_hash(doc, n, 0).hash(&mut first);
+    index.hash(&mut first);
+    doc.pages.hash(&mut first);
+    (doc.next_id(), doc.node_count()).hash(&mut first);
+    (n.width.to_bits(), n.height.to_bits()).hash(&mut first);
+    figcraft_text::layout_generation().hash(&mut first);
+    doc.color_profile.hash(&mut first);
+    let mut second = std::collections::hash_map::DefaultHasher::new();
+    for v in xf.as_coeffs().map(f64::to_bits) {
+        v.hash(&mut second);
+    }
+    (first.finish(), second.finish())
+}
+
+/// A writer that feeds serialized bytes to a hasher (no allocation).
+struct HashSink<'a>(&'a mut std::collections::hash_map::DefaultHasher);
+
+impl std::io::Write for HashSink<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.write(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn fill_rule(r: FillRule) -> Fill {

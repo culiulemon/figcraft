@@ -567,7 +567,7 @@ Run in `cargo xtask ci` unless marked *timing* (release, `--ignored --nocapture`
 |---|---|---|
 | 1 | `the_gpu_canvas_matches_the_cpu_render` | pixel parity per feature: shapes, radii, gradients, text, opacity, blend, strokes |
 | 1b | `the_gpu_text_matches_the_cpu_render` | text is pixel-identical (measured: 0 differing bytes) |
-| 1c | `the_gpu_layer_blur_matches_the_cpu_render`, `the_gpu_drop_shadow_matches_the_cpu_render`, `the_gpu_draws_the_shadow_variations`, `the_gpu_draws_a_progressive_blur`, `the_gpu_draws_a_sideways_progressive_blur` | effects: mean 0.011, 0.044 and 0.512/255 (the last with spread, two shadows, a stroke, a gradient card, a clipped frame and a rotation); a 0 → 300 progressive blur over a 1100 × 1200 layer, down the card and across it (bands of crops): mean 0.135/255, worst 30 |
+| 1c | `the_gpu_layer_blur_matches_the_cpu_render`, `the_gpu_drop_shadow_matches_the_cpu_render`, `the_gpu_draws_the_shadow_variations`, `the_gpu_draws_a_progressive_blur`, `the_gpu_draws_a_sideways_progressive_blur`, `a_dragged_card_keeps_its_blur`, `a_whole_pixel_move_keeps_the_layer_key` | effects: mean 0.011, 0.044 and 0.512/255 (the last with spread, two shadows, a stroke, a gradient card, a clipped frame and a rotation); a 0 → 300 progressive blur over a 1100 × 1200 layer, down the card and across it (bands of crops): mean 0.135/255, worst 30; a dragged card: the blur kept on every 1 px move (7/7) and the moved frame matched at mean 0.136/255 |
 | 1d | `the_segmented_page_matches_the_cpu_with_one_glass_pane`, `..._one_background_blur`, `the_gpu_page_matches_with_several_backdrop_layers` | backdrop effects in the accumulated renderer: mean 0.061, 0.049 and 0.725/255 |
 | 1e | `the_gpu_draws_the_paint_variations` | paints: a photo 1:1, fitted, cropped, tiled, rotated, filtered and translucent, a pattern fill, a diamond gradient, multiplied and screened paints (mean 0.066/255, worst 10) |
 | 1f | `the_gpu_draws_shadows_of_any_shape`, `the_gpu_draws_the_texture_effect` | shadows of any shape: an ellipse, a star, a polygon, a per-corner card, text, a group, a frame with an overflowing child, inner shadows on shapes and a group's — with and without spread, and kept between frames (mean 0.130/255, worst 50); texture: a rough card, one clipped to its shape, one in a list with a blur and a shadow (mean 0.126/255, worst 92 on antialiased edges) |
@@ -810,12 +810,35 @@ stays on the fallback list.
   across the card, where the levels' bands are columns and the crops start differently along x. A
   progressive blur whose layer is past 6 M pixels stays on the CPU (eight levels would cost
   hundreds of MB of device memory; some drivers abort on the allocation).
+- 2026-10-26: **a real drag no longer re-blurs the card (and no longer freezes it).** With a real
+  mouse (the OS cursor moving at 714 px/s over a maximized 2560 × 1440 window, canvas 2280 × 1624
+  device px at 100%) a drag rebuilt the blurred layer on **every** frame — 73 rebuilds in a 0.5 s
+  drag, ~35–50 ms a frame — and, worse, the step cache could serve a **stale** scene: the keys were
+  node *addresses*, and a drag frees the previous document, so the allocator handed the next node
+  the same address (ABA) and the card froze at an earlier position. After the fix the same drag
+  rebuilds the blur **zero** times and every frame is `plan 0.0, build 0.1, render 6.5–8.3 ms`;
+  screen captures put the card within 7 px of the cursor (~10 ms behind). Two changes:
+  - **Keys are values, not addresses** (`scene::node_hash`): a node and everything under it
+    serialized into the hasher. `step_key` keeps the node's own placement (a step's pixels move
+    with it); `content_hash` leaves it out (a layer's *texture* does not depend on where the node
+    sits).
+  - **The layer key is the layer-local transform** (`layer_xf`, `translate(-x0, -y0) · xf`): whole
+    device-pixel moves leave it unchanged, so the kept blurred layer is drawn at its new place;
+    subpixel moves and any edit to what the node draws still rebuild. Tests:
+    `a_whole_pixel_move_keeps_the_layer_key` (same key for four 1 px moves; a repaint or a half-pixel
+    move changes it) and `a_dragged_card_keeps_its_blur` (seven 1 px moves find the kept layer 7/7,
+    and the moved frame matches the CPU at mean 0.136/255, worst 30).
+  The earlier scripted measurements missed this: they walked the same positions back and forth, so
+  the cache hit by luck. Every number below that came from `ui.pointer` was re-checked with a real
+  drag; the drag path is now measured with one.
 - 2026-10-26: **a dragged blurred card reaches 50–60 fps in the app.** The acceptance case
   (200 × 300 card, progressive 0 → 300, 100% zoom, release app driven through the control channel)
   went from **8 fps** to **116–141 canvas frames in about 2.3 s** while the pointer moved 154 pixels
-  a second (the render thread skips to the newest job, so this is what the window shows) — and a
-  settled drag of the same card rebuilds nothing at all (133 frames in 2.19 s, the kept layer drawn
-  at each new place). A rebuilding frame is now 24–60 ms of building plus 5–25 ms of drawing (it
+  a second (the render thread skips to the newest job, so this is what the window shows). (Its
+  "settled drag rebuilds nothing" reading — 133 frames, 0 rebuilds — was an artefact of the script
+  repeating the same positions: a real drag rebuilt the layer every frame until the layer key was
+  made translation-free, see the entry above.) A rebuilding frame is now 24–60 ms of building plus
+  5–25 ms of drawing (it
   was 76–124 ms, and 250–370 ms before the pools), of which the blur's encode is 0.4 ms and the
   device 8–18 ms; a frame that keeps the layer is 3–7 ms. Three changes, in order of what they
   bought:

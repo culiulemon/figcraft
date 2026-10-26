@@ -15,6 +15,8 @@ figcraft-geom = { workspace = true }
 figcraft-render = { workspace = true }
 figcraft-text = { workspace = true }
 log = { workspace = true }
+# A layer's content, hashed without its own placement (see `scene::content_hash`).
+serde_json = { workspace = true }
 # The renderer's own pixmaps (decoded images, pattern cells, gradient tiles) are what the image
 # brush draws: the same `tiny-skia` the renderer uses.
 tiny-skia = { workspace = true }
