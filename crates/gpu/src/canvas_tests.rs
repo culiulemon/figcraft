@@ -1,4 +1,4 @@
-//! The GPU canvas against the CPU renderer: pixel parity, the fallback predicate, read-back and
+﻿//! The GPU canvas against the CPU renderer: pixel parity, the fallback predicate, read-back and
 //! frame timings (see `docs/gpu-rasterizer.md`).
 
 use std::sync::Arc;
@@ -351,6 +351,68 @@ fn the_gpu_drop_shadow_matches_the_cpu_render() {
     println!("drop shadow parity: worst {worst} at {at:?}, mean {mean:.3}, {over} pixels differ by more than 8");
     assert!(worst <= 128, "a channel differs by {worst} (mean {mean:.3})");
     assert!(mean <= 2.0, "the mean difference is {mean:.3}");
+}
+
+/// Cards whose edges are scattered by a texture effect, one of them inside a longer effect list.
+fn texture_doc() -> Document {
+    let mut d = Document::new("gpu texture");
+    let p = d.first_page().unwrap();
+    let hex = |s: &str| Color::from_hex(s).unwrap_or(Color::WHITE);
+    let ground = d.create(p, NodeKind::Rectangle, "ground", 40.0, 30.0, 520.0, 240.0).unwrap();
+    d.get_mut(ground).unwrap().fills = vec![Paint::solid(hex("E8E8E8"))];
+    let texture = |radius: f64, size: f64, clip: bool| Effect {
+        kind: EffectKind::Texture(figcraft_doc::Texture { radius, size, clip_to_shape: clip, ..figcraft_doc::Texture::default() }),
+        visible: true,
+    };
+    let card = d.create(p, NodeKind::Rectangle, "rough", 80.0, 70.0, 160.0, 140.0).unwrap();
+    {
+        let n = d.get_mut(card).unwrap();
+        n.corners.radii = [12.0; 4];
+        n.fills = vec![Paint::solid(hex("E03030"))];
+        n.effects = vec![texture(10.0, 0.8, false)];
+    }
+    let clipped = d.create(p, NodeKind::Rectangle, "clipped", 300.0, 70.0, 140.0, 140.0).unwrap();
+    {
+        let n = d.get_mut(clipped).unwrap();
+        n.corners.radii = [24.0; 4];
+        n.fills = vec![Paint::solid(hex("20C060"))];
+        n.effects = vec![texture(9.0, 0.5, true)];
+    }
+    // In a list: the blur, then the scatter, then the shadow cast from that result.
+    let list = d.create(p, NodeKind::Rectangle, "blur, texture and shadow", 470.0, 80.0, 120.0, 120.0).unwrap();
+    {
+        let n = d.get_mut(list).unwrap();
+        n.corners.radii = [16.0; 4];
+        n.fills = vec![Paint::solid(hex("2040E0"))];
+        n.effects = vec![Effect::layer_blur(), texture(8.0, 0.6, false), Effect::drop_shadow()];
+    }
+    d
+}
+
+#[test]
+fn the_gpu_draws_the_texture_effect() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let d = texture_doc();
+    let p = d.first_page().unwrap();
+    assert_eq!(scene::supported(&d, p), Ok(()), "a texture effect stays on the GPU");
+    let (w, h) = PARITY;
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+    let cpu = render_view(&d, p, &view, &Options::default()).unwrap();
+    let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+    let built = {
+        let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+        scene::build_with(&d, p, &view, &mut layers)
+    };
+    let built = built.expect("the GPU draws the texture effect");
+    assert!(canvas.render(&device, &queue, &built, scene::background(&d, p)).is_some());
+    let gpu = canvas.read(&device, &queue).unwrap();
+    let (worst, mean, at, over) = diff(&cpu, &gpu);
+    println!("texture parity: worst {worst} at {at:?}, mean {mean:.3}, {over} pixels differ by more than 8");
+    assert!(worst <= 128, "a channel differs by {worst} (mean {mean:.3})");
+    assert!(mean <= 1.0, "the mean difference is {mean:.3}");
 }
 
 /// Text in one style: the renderer's layout turns it into glyph outlines.

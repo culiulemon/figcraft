@@ -580,10 +580,10 @@ enum Effects {
     /// Inner shadows only: everything outside the shape at the shadow's offset, blurred and
     /// clipped to the shape (drawn between the node's fills and its children).
     InnerShadows,
-    /// A layer of its own: a layer blur, grain or drop shadows (any mix, with inner shadows too),
-    /// in the CPU's order.
+    /// A layer of its own: a layer blur, grain, texture or drop shadows (any mix, with inner
+    /// shadows too), in the CPU's order.
     Layer,
-    /// Anything else (a texture, a progressive layer blur, a shadow beside a backdrop effect).
+    /// Anything else (a shadow beside a backdrop effect).
     Other,
 }
 
@@ -738,8 +738,8 @@ fn effects_of(doc: &Document, n: &Node) -> Effects {
         // A group's is cast from its pixels: it needs the node's layer, like the other effects.
         return if matches!(n.kind, NodeKind::Group | NodeKind::Page { .. }) { Effects::Layer } else { Effects::InnerShadows };
     }
-    // One layer of its own, in the CPU's order: inner shadows, the layer blur and grain, then the
-    // drop shadows cast from that result.
+    // One layer of its own, in the CPU's order: inner shadows, the layer blur, grain and texture,
+    // then the drop shadows cast from that result.
     let known = |k: &figcraft_doc::EffectKind| {
         matches!(
             k,
@@ -747,6 +747,7 @@ fn effects_of(doc: &Document, n: &Node) -> Effects {
                 | figcraft_doc::EffectKind::InnerShadow(_)
                 | figcraft_doc::EffectKind::Noise(_)
                 | figcraft_doc::EffectKind::LayerBlur(_)
+                | figcraft_doc::EffectKind::Texture(_)
         )
     };
     if visible().all(|e| known(&e.kind)) {
@@ -1130,7 +1131,9 @@ impl Builder<'_> {
         let reads_pixels: Vec<&figcraft_doc::Effect> = effects
             .iter()
             .copied()
-            .filter(|e| matches!(e.kind, figcraft_doc::EffectKind::LayerBlur(_) | figcraft_doc::EffectKind::Noise(_)))
+            .filter(|e| {
+                matches!(e.kind, figcraft_doc::EffectKind::LayerBlur(_) | figcraft_doc::EffectKind::Noise(_) | figcraft_doc::EffectKind::Texture(_))
+            })
             .collect();
         // A group has no outline of its own: its inner shadows are cast from around what its
         // children draw together (the renderer's own `inner_shadow_of`).
@@ -1183,6 +1186,7 @@ impl Builder<'_> {
                             }
                         }
                         figcraft_doc::EffectKind::Noise(nz) => self.grain_layer(&made, nz, layer_xf, n.id.0 as u32, keep)?,
+                        figcraft_doc::EffectKind::Texture(t) => self.texture_layer(&made, t, layer_xf, n.id.0 as u32, keep)?,
                         _ => return Err(Unsupported::Effect),
                     };
                 }
@@ -1258,6 +1262,25 @@ impl Builder<'_> {
         scene.draw_image(ImageBrush { image: &layer.image, sampler }, KAffine::IDENTITY);
         scene.draw_image(ImageBrush { image: &shadow, sampler }, KAffine::IDENTITY);
         self.layers.layer(&scene, layer.size.0, layer.size.1, None).ok_or(Unsupported::Effect)
+    }
+
+    /// The layer's texture effect: the renderer's own scatter of its pixels (read back once), so
+    /// edges land where an export's do.
+    fn texture_layer(
+        &mut self,
+        layer: &Layer,
+        t: &figcraft_doc::Texture,
+        layer_xf: Affine,
+        seed: u32,
+        key: Option<(u64, u64)>,
+    ) -> Result<Layer, Unsupported> {
+        let Some(mut pixels) = self.layers.layer_pixels(layer) else { return Err(Unsupported::Effect) };
+        figcraft_render::grain::texture(&mut pixels, t, layer_xf, self.view.scale, seed);
+        let image = image_data(&Arc::new(pixels));
+        let sampler = ImageSampler { x_extend: Extend::Pad, y_extend: Extend::Pad, quality: ImageQuality::Low, alpha: 1.0 };
+        let mut scene = Scene::new();
+        scene.draw_image(ImageBrush { image: &image, sampler }, KAffine::IDENTITY);
+        self.layers.layer(&scene, layer.size.0, layer.size.1, key).ok_or(Unsupported::Effect)
     }
 
     /// The layer's grain: the renderer's own noise from its pixels, over it, in the noise's blend

@@ -325,8 +325,8 @@ and (since P7) a group's inner shadow draw on the GPU.
 The CPU applies a node's effects in list order: inner shadows, then the layer blur, grain and
 texture, then drop shadows, over the backdrop read. A node with two kinds used to fall back whole.
 
-**Landed.** A node whose effects are any mix of inner shadows, a layer blur, grain and drop shadows
-is drawn as one layer, in that order (`Builder::layer_pipeline`):
+**Landed.** A node whose effects are any mix of inner shadows, a layer blur, grain, texture and
+drop shadows is drawn as one layer, in that order (`Builder::layer_pipeline`):
 
 - The content (with its inner shadows, drawn in `content`) goes into a layer of its own.
 - Each **layer blur** in the list is applied in order: a uniform one is the GPU's box blur, a
@@ -336,6 +336,9 @@ is drawn as one layer, in that order (`Builder::layer_pipeline`):
 - **Grain** is the renderer's own noise: the layer's pixels are read back once, `grain::grains`
   works them out on the CPU (the grains are a hash of the cell and the node, so they land exactly
   where an export's do), and the pass draws them over the layer in the noise's blend mode.
+- **Texture** is the renderer's own scatter: the layer's pixels are read back once and
+  `grain::texture` moves each grain's pixel by its hashed jitter, so the rough edge lands where an
+  export's does; the result replaces the layer.
 - The **drop shadows** are cast from that result — the outline grown by the spread, or the layer's
   pixels (`shadow_of_layer`) — and drawn under it, then the layer over them, at the node's opacity
   and blend mode.
@@ -345,15 +348,19 @@ is drawn as one layer, in that order (`Builder::layer_pipeline`):
 - Everything is keyed on the node's subtree, the view and the zoom: a drag rebuilds only the layers
   of the nodes that moved.
 
-Still on the CPU: **texture** (a per-pixel scatter of the layer's pixels, not a blur: it needs a
-pass of its own), and a backdrop effect beside another effect.
+Still on the CPU: a backdrop effect beside another effect (its pixels would have to be read from
+the page and then fed through this layer).
 
 Tests: parity for a blur and a shadow, an inner shadow and a shadow, a blur with grain and a shadow,
 a group's inner shadow, and a progressive blur with a shadow, beside the P6 shapes
 (`the_gpu_draws_shadows_of_any_shape`):
 mean 0.130/255, worst 50 on antialiased shape edges, 0.47% of pixels off by more than 8 — the
-progressive card's outermost pixel row is the one place the ramp and the blur disagree.
-Exit: any single node's effect list draws on the GPU — met apart from the two exclusions above.
+progressive card's outermost pixel row is the one place the ramp and the blur disagree. Texture has
+its own page (`the_gpu_draws_the_texture_effect`: a rough card, one clipped to its shape, and one
+in a list with a blur and a shadow): mean 0.126/255, worst 92, 0.6% of pixels off by more than 8,
+all on the cards' antialiased edges (vello's coverage against tiny-skia's, scattered with the
+pixels).
+Exit: any single node's effect list draws on the GPU — met apart from the one exclusion above.
 
 ### P8 — masks and plus-darker
 
@@ -435,7 +442,8 @@ documents. `render_worker::gpu_job` keeps them on the CPU: they are editor views
 not content, and the colour-managed ones need a colour-managed surface (the canvas is sRGB).
 
 Exit: the fallback predicate answers `Ok` for every page the canvas can be asked to draw with a
-device, apart from the editor's own modes — met, with texture still named under P7.
+device, apart from the editor's own modes — met apart from a paint's plus-darker and a plus-darker
+layer under a backdrop effect (P8).
 
 ### P11 — performance: cross-frame retention
 
@@ -507,9 +515,9 @@ are appended from the cache.
 
 ### What is left on the CPU
 
-Content, after P5–P10: **texture**, a **paint's plus-darker blend** and a **plus-darker layer under
-a backdrop effect**. Each is a pass or a pixel walk of its own, named where it is planned above
-(P7, P8). A content file with one of those still re-renders whole on the CPU.
+Content, after P5–P10: a **paint's plus-darker blend** and a **plus-darker layer under a backdrop
+effect**. Each is a pass of its own, named where it is planned above (P8). A content file with one
+of those still re-renders whole on the CPU.
 
 Performance, after P11: **damage-tracked assembly** on backdrop pages (4–6 h) — the GPU assembles a
 segmented page every frame; the CPU repaints only the damaged rectangle, so a drag there is 2–3×
@@ -531,7 +539,7 @@ Run in `cargo xtask ci` unless marked *timing* (release, `--ignored --nocapture`
 | 1c | `the_gpu_layer_blur_matches_the_cpu_render`, `the_gpu_drop_shadow_matches_the_cpu_render`, `the_gpu_draws_the_shadow_variations` | effects: mean 0.011, 0.044 and 0.512/255 (the last with spread, two shadows, a stroke, a gradient card, a clipped frame and a rotation) |
 | 1d | `the_segmented_page_matches_the_cpu_with_one_glass_pane`, `..._one_background_blur`, `the_gpu_page_matches_with_several_backdrop_layers` | backdrop effects in the accumulated renderer: mean 0.061, 0.049 and 0.725/255 |
 | 1e | `the_gpu_draws_the_paint_variations` | paints: a photo 1:1, fitted, cropped, tiled, rotated, filtered and translucent, a pattern fill, a diamond gradient, multiplied and screened paints (mean 0.066/255, worst 10) |
-| 1f | `the_gpu_draws_shadows_of_any_shape` | shadows of any shape: an ellipse, a star, a polygon, a per-corner card, text, a group, a frame with an overflowing child, inner shadows on shapes and a group's — with and without spread, and kept between frames (mean 0.130/255, worst 50) |
+| 1f | `the_gpu_draws_shadows_of_any_shape`, `the_gpu_draws_the_texture_effect` | shadows of any shape: an ellipse, a star, a polygon, a per-corner card, text, a group, a frame with an overflowing child, inner shadows on shapes and a group's — with and without spread, and kept between frames (mean 0.130/255, worst 50); texture: a rough card, one clipped to its shape, one in a list with a blur and a shadow (mean 0.126/255, worst 92 on antialiased edges) |
 | 1g | `the_gpu_draws_styled_text`, `the_gpu_draws_masks`, `the_gpu_draws_a_plus_darker_layer`, `the_gpu_draws_nested_backdrops` | styled runs and stroked text (pixel-identical), alpha, vector and luminance masks (mean 0.052/255; a luminance mask's ends within 2/255), a plus-darker layer (mean 0.004/255, worst 6), nested backdrops (pixel-identical) |
 | 1h | `the_gpu_keeps_an_unchanged_step_between_frames`, `the_gpu_keeps_a_step_while_a_later_backdrop_moves`, `a_step_that_reads_the_page_is_drawn_every_frame`, `a_drag_reuses_the_encoded_scenes_of_the_layers_it_did_not_move`, `a_container_with_a_backdrop_effect_is_not_kept` | a kept step's or node's pixels, an edit giving it a new key, a step that reads the page never being kept, and a drag re-encoding only the layers it moved (the frame matches a canvas that drew it fresh) |
 | 2 | `unsupported_pages_fall_back` | the predicate rejects exactly the features not yet ported |
@@ -745,6 +753,12 @@ stays on the fallback list.
 - 2026-10-26: **a group's inner shadow landed.** A group has no outline of its own, so its inner
   shadows are cast from its layer's pixels: the renderer's `inner_shadow_of` on a read-back of the
   layer, drawn over it before the layer effects (the layer path P7 built). The group in
-  `the_gpu_draws_shadows_of_any_shape` matches the CPU at mean 0.001/255, worst 1; texture is the
-  last effect still on the CPU.
+  `the_gpu_draws_shadows_of_any_shape` matches the CPU at mean 0.001/255, worst 1.
+- 2026-10-26: **texture landed.** A texture effect is the renderer's own pixel scatter: the layer's
+  pixels are read back once, `grain::texture` moves each grain's pixel by its hashed jitter, and the
+  result replaces the layer before the drop shadows are cast from it.
+  `the_gpu_draws_the_texture_effect` (a rough card, one clipped to its shape, one in a list with a
+  blur and a shadow): mean 0.126/255, worst 92, 0.6% of pixels off by more than 8, all on the cards'
+  antialiased edges. A paint's plus-darker and a plus-darker layer under a backdrop effect are what
+  content still leaves on the CPU.
 
