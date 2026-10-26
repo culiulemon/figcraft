@@ -1257,6 +1257,64 @@ fn shadow_layer_timings() {
     }
 }
 
+/// Text with a styled run (its own fill) and text with a stroke.
+fn styled_text_doc() -> Document {
+    let mut d = Document::new("gpu styled text");
+    let p = d.first_page().unwrap();
+    let hex = |s: &str| Color::from_hex(s).unwrap_or(Color::WHITE);
+    let mut td = TextData::new("plain and coloured words");
+    td.style.font_size = 28.0;
+    td.runs = vec![figcraft_doc::StyleRun {
+        start: 10,
+        end: 18,
+        style: figcraft_doc::TextStyle { fills: Some(vec![Paint::solid(hex("E03030"))]), ..td.style.clone() },
+    }];
+    let run = d.create(p, NodeKind::Text(td), "runs", 24.0, 40.0, 460.0, 80.0).unwrap();
+    d.get_mut(run).unwrap().fills = vec![Paint::solid(hex("202020"))];
+
+    let mut stroked = TextData::new("Outlined");
+    stroked.style.font_size = 44.0;
+    let id = d.create(p, NodeKind::Text(stroked), "stroked", 24.0, 150.0, 400.0, 90.0).unwrap();
+    {
+        let n = d.get_mut(id).unwrap();
+        n.fills = vec![Paint::solid(hex("F0C830"))];
+        n.strokes = vec![Paint::solid(hex("2040E0"))];
+        n.stroke.weight = 3.0;
+        n.stroke.align = StrokeAlign::Outside;
+    }
+    d
+}
+
+#[test]
+fn the_gpu_draws_styled_text() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let d = styled_text_doc();
+    let p = d.first_page().unwrap();
+    assert_eq!(scene::supported(&d, p), Ok(()), "styled runs and stroked text stay on the GPU");
+    let (w, h) = PARITY;
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+    let cpu = render_view(&d, p, &view, &Options::default()).unwrap();
+    let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+    let built = scene::build_with(&d, p, &view, &mut scene::NoLayers).expect("the GPU draws the text");
+    assert!(canvas.render(&device, &queue, &built, scene::background(&d, p)).is_some());
+    let gpu = canvas.read(&device, &queue).unwrap();
+    let (worst, mean, at, over) = diff(&cpu, &gpu);
+    let px = |p: &Pixmap, (x, y): (u32, u32)| {
+        let i = ((y as usize * p.width() as usize) + x as usize) * 4;
+        p.data().get(i..i + 4).map(<[u8]>::to_vec)
+    };
+    println!(
+        "styled text parity: worst {worst} at {at:?} (CPU {:?}, GPU {:?}), mean {mean:.3}, {over} pixels differ by more than 8",
+        px(&cpu, at),
+        px(&gpu, at)
+    );
+    assert!(worst <= 160, "a channel differs by {worst} (mean {mean:.3})");
+    assert!(mean <= 1.0, "the mean difference is {mean:.3}");
+}
+
 #[test]
 fn the_gpu_canvas_reads_back() {
     let Some((device, queue)) = device() else {

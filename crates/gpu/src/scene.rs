@@ -32,10 +32,8 @@ pub enum Unsupported {
     Paint,
     /// A stroke shape it doesn't draw yet (inside/outside, dashes, variable width, brushes, arrows).
     Stroke,
-    /// A mask, or a text run with its own fills or colour glyphs.
+    /// A mask (its pixels, or how it covers its siblings).
     Mask,
-    /// Text whose glyphs can't be reduced to one outline.
-    Text,
     /// Clipping, opacity or blend in a place the builder doesn't handle.
     Structure,
 }
@@ -47,8 +45,7 @@ impl Unsupported {
             Unsupported::Effect => "an effect",
             Unsupported::Paint => "a paint",
             Unsupported::Stroke => "a stroke",
-            Unsupported::Mask => "a mask or styled text",
-            Unsupported::Text => "text",
+            Unsupported::Mask => "a mask",
             Unsupported::Structure => "a structure",
         }
     }
@@ -1169,9 +1166,8 @@ impl Builder<'_> {
         if matches!(n.kind, NodeKind::Page { .. } | NodeKind::Group) {
             return self.children(n.id, xf, depth + 1);
         }
-        let text = matches!(n.kind, NodeKind::Text(_));
-        if text {
-            self.check_text(n)?;
+        if matches!(n.kind, NodeKind::Text(_)) {
+            return self.text(n, xf);
         }
         // The outline fills, clips children to rounded corners and strokes booleans.
         let outline = node_outline(self.doc, n);
@@ -1205,23 +1201,103 @@ impl Builder<'_> {
             && !self.no_strokes.contains(&n.id)
             && let Some((path, _)) = &outline
         {
-            self.strokes(n, path, (n.width, n.height), xf, text)?;
+            self.strokes(n, path, (n.width, n.height), xf, false)?;
         }
         Ok(())
     }
 
-    /// Text paints its glyph outlines with one set of fills: runs with their own fills and colour
-    /// glyphs stay on the CPU for now.
-    fn check_text(&self, n: &Node) -> Result<(), Unsupported> {
-        let Some((layout, _)) = figcraft_text::layout_node(n) else { return Ok(()) };
-        if layout.styles.iter().any(|s| s.fills.as_ref().is_some_and(|f| !f.is_empty())) {
-            return Err(Unsupported::Text);
+    /// A text node: one outline per run (a run with its own fills paints with them), the colour
+    /// glyphs' own ink, the inner shadows over them, then the strokes — the renderer's order.
+    fn text(&mut self, n: &Node, xf: Affine) -> Result<(), Unsupported> {
+        let Some((layout, dy)) = figcraft_text::layout_node(n) else { return Ok(()) };
+        let gxf = xf * Affine::translate((0.0, dy));
+        let scale = gxf.determinant().abs().sqrt();
+        let mut runs: std::collections::BTreeMap<usize, figcraft_geom::BezPath> = std::collections::BTreeMap::new();
+        // Colour glyphs (emoji) carry their own ink, which draws instead of their outline.
+        let mut ink: Vec<(usize, Ink)> = Vec::new();
+        for g in &layout.glyphs {
+            match g.color(scale) {
+                Some(figcraft_text::ColorInk::Bitmap(bitmap, place)) => ink.push((g.style, Ink::Bitmap(bitmap, place))),
+                Some(figcraft_text::ColorInk::Layers(layers)) => {
+                    for layer in layers.iter() {
+                        ink.push((g.style, Ink::Layer(g.layer_path(layer.gid), layer.rgba)));
+                    }
+                }
+                None => runs.entry(g.style).or_default().extend(g.path().elements().iter().copied()),
+            }
         }
-        let scale = 1.0;
-        if layout.glyphs.iter().any(|g| g.color(scale).is_some()) {
-            return Err(Unsupported::Text);
+        for d in &layout.decorations {
+            runs.entry(d.style).or_default().extend(d.path().elements().iter().copied());
+        }
+        let size = (n.width, n.height);
+        // Every run's fills (its ink included), in order: a run with ink and no outline draws only
+        // that (a bitmap-only font).
+        let mut styles: Vec<usize> = runs.keys().copied().chain(ink.iter().map(|(style, _)| *style)).collect();
+        styles.sort_unstable();
+        styles.dedup();
+        for style in &styles {
+            let fills = layout.styles.get(*style).and_then(|s| s.fills.as_ref()).unwrap_or(&n.fills);
+            if let Some(path) = runs.get(style) {
+                for p in fills {
+                    self.fill(p, path, FillRule::Winding, size, gxf)?;
+                }
+            }
+            for (_, item) in ink.iter().filter(|(s, _)| s == style) {
+                match item {
+                    Ink::Bitmap(bitmap, place) => self.glyph_bitmap(bitmap, gxf * *place),
+                    Ink::Layer(path, rgba) => {
+                        let c = Color::new(
+                            f32::from(rgba[0]) / 255.0,
+                            f32::from(rgba[1]) / 255.0,
+                            f32::from(rgba[2]) / 255.0,
+                            f32::from(rgba[3]) / 255.0,
+                        );
+                        self.fill(&Paint::solid(c), path, FillRule::Winding, size, gxf)?;
+                    }
+                }
+            }
+        }
+        if n.effects.iter().any(|e| e.visible && matches!(e.kind, figcraft_doc::EffectKind::InnerShadow(_))) {
+            self.inner_shadows(n, xf)?;
+        }
+        if n.has_visible_stroke() && !self.no_strokes.contains(&n.id) {
+            // Glyph outlines are closed: inside and outside strokes clip to them.
+            let rule = figcraft_render::stroke_rule(n, true);
+            for path in runs.values() {
+                let band = figcraft_render::stroke_area(n, path, true);
+                for p in &n.strokes {
+                    self.fill(p, band.as_ref(), rule, size, gxf)?;
+                }
+            }
         }
         Ok(())
+    }
+
+    /// A colour glyph's embedded bitmap (premultiplied RGBA) through `place`.
+    fn glyph_bitmap(&mut self, bitmap: &Arc<figcraft_text::ColorBitmap>, place: Affine) {
+        let (w, h) = (bitmap.width, bitmap.height);
+        if w == 0 || h == 0 || bitmap.rgba.len() != (w as usize * h as usize * 4) {
+            return;
+        }
+        // The layout caches the bitmaps, so the same one comes back every frame: its pixels are
+        // handed to vello once.
+        let key = (Arc::as_ptr(bitmap) as usize, w, h);
+        let mut cache = glyph_images().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= MAX_IMAGES && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        let image = cache.entry(key).or_insert_with(|| ImageData {
+            data: Blob::new(Arc::new(bitmap.rgba.clone())),
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::AlphaPremultiplied,
+            width: w,
+            height: h,
+        });
+        let sampler = ImageSampler { x_extend: Extend::Pad, y_extend: Extend::Pad, quality: ImageQuality::Medium, alpha: 1.0 };
+        let image: &ImageData = image;
+        if let Some(s) = &mut self.scene {
+            s.draw_image(ImageBrush { image, sampler }, k_affine(place));
+        }
     }
 
     fn fill(&mut self, paint: &Paint, path: &figcraft_geom::BezPath, rule: FillRule, size: (f64, f64), xf: Affine) -> Result<(), Unsupported> {
@@ -1333,6 +1409,13 @@ impl Builder<'_> {
     }
 }
 
+/// A colour glyph's own ink: an embedded bitmap and where it goes, or one COLR layer (its outline
+/// and colour).
+enum Ink {
+    Bitmap(Arc<figcraft_text::ColorBitmap>, Affine),
+    Layer(figcraft_geom::BezPath, [u8; 4]),
+}
+
 /// A paint's brush. Owned because an image's data lives in the cache, past the paint's life.
 enum BrushSpec {
     Solid(PColor),
@@ -1378,6 +1461,13 @@ fn images() -> &'static Mutex<HashMap<(usize, u32, u32), (Arc<Pixmap>, ImageData
 
 /// The most images kept (a page with more re-uploads them next frame: still correct, only slower).
 const MAX_IMAGES: usize = 256;
+
+/// Colour glyphs' bitmaps handed to vello, by the layout's own cached bitmap: kept so their `Blob`
+/// outlives the frame (a new one would be uploaded again).
+fn glyph_images() -> &'static Mutex<HashMap<(usize, u32, u32), ImageData>> {
+    static GLYPHS: OnceLock<Mutex<HashMap<(usize, u32, u32), ImageData>>> = OnceLock::new();
+    GLYPHS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// `pm` as a vello image, cached by the pixmap's own identity (the renderer caches decoded images,
 /// so a photo's pixmap is the same one every frame).

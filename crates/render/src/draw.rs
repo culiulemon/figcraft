@@ -258,7 +258,7 @@ pub fn stroke_fill(doc: &Document, n: &Node) -> Option<(Arc<BezPath>, FillRule)>
 }
 
 /// Even-odd ring paths need the even-odd rule; everything else non-zero.
-pub(crate) fn stroke_rule(n: &Node, closed: bool) -> FillRule {
+pub fn stroke_rule(n: &Node, closed: bool) -> FillRule {
     if n.stroke.sides.is_some() || (n.stroke.dashes.is_empty() && closed && n.stroke.align != StrokeAlign::Center) {
         FillRule::EvenOdd
     } else {

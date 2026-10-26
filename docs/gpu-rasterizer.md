@@ -366,16 +366,19 @@ paint. Exit: masked pages draw on the GPU.
 
 ### P9 — the text tail
 
-Text in one style already matches byte for byte. What still falls back: runs with their own fills
-and colours, colour glyphs (emoji), text with a stroke, and text as a mask.
+Text in one style already matched byte for byte. What used to fall back: runs with their own fills
+and colours, colour glyphs (emoji), and text with a stroke.
 
-- **Styled runs**: layout gives each run its glyphs; build one outline per run and fill it with that
-  run's paints, in order.
-- **Colour glyphs**: the layout's embedded colour bitmaps go through the P5 image path.
-- **Text strokes**: the renderer's stroke band for glyph outlines (`stroke_fill` for text), filled
-  as any other band.
+**Landed.** Text is one outline per run: the layout's glyphs are grouped by their style index (the
+decorations with them), each run is filled with its own `fills` or, without any, the node's, its
+colour glyphs draw their own ink (a COLR layer's outline and colour, or the embedded bitmap as a
+vello image — kept per layout bitmap, so it is handed over once), the inner shadows go over the
+fills, and the strokes are the renderer's own bands: `stroke_area` and `stroke_rule` around each
+run's outline, so inside and outside strokes clip to the glyphs.
 
-Tests: parity for a paragraph with per-run colours, an emoji, stroked text. Exit: no text falls back.
+`the_gpu_draws_styled_text`: a paragraph with a coloured run and an outlined (stroked) heading —
+**pixel-identical** to the CPU (worst 0, mean 0.000, 0 pixels off by more than 8).
+Exit: no text falls back — met.
 
 ### P10 — structure: nested backdrops, outline mode
 
@@ -580,4 +583,11 @@ stays on the fallback list.
     worst 50, 0.47% of pixels off by more than 8 (the progressive card's outermost row).
   - Still on the CPU: texture, a group's inner shadow, and a backdrop effect beside another effect
     (named in P7 and P10).
+- 2026-10-25: **P9 landed — the text tail.** A text node is one outline per run, filled with the
+  run's own paints, its colour glyphs' ink drawn where they are (COLR paths, or the embedded bitmap
+  as an image), its inner shadows over the fills, and its strokes from the renderer's glyph bands
+  (inside and outside clip to the glyphs).
+  - `the_gpu_draws_styled_text`: a coloured run and a stroked heading — pixel-identical to the CPU.
+  - No text falls back any more; what is left is `Unsupported::Mask` (a text node masked, P8), and
+    soft proof / Display P3 (P10).
 

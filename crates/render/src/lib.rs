@@ -22,7 +22,7 @@ pub mod pattern;
 pub mod retained;
 pub mod shadow;
 
-pub use draw::{layer_bounds, node_outline, paint_bounds, stroke_fill, subtree_outline, ts_path};
+pub use draw::{layer_bounds, node_outline, paint_bounds, stroke_area, stroke_fill, stroke_rule, subtree_outline, ts_path};
 pub use export_depth::{ExportDepthError, MAX_EXPORT_DEPTH, check_export_depth};
 pub use fx::{Accelerator, GlassPaint, set_accelerator};
 pub use retained::{Retained, Work};
