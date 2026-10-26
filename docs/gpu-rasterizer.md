@@ -463,6 +463,11 @@ on backdrop pages.** Closing it needs damage-tracked assembly: keep the last fra
 only the damage rectangle, compose the steps that meet it and redo only the effects whose pane it
 touches (4–6 h).
 
+In the app (release, control channel, eight stripes with a glass pane over them at 904 × 860):
+`canvas.rasterizer` stays `gpu` with no refusal, twelve one-pixel edits of a stripe render in
+2.4–3.3 ms a frame after the first four (11–16 ms: the pipelines and the first frames), and the
+screenshot shows the pane over the stripes.
+
 ### What is left on the CPU
 
 Content, after P5–P10: **texture**, a **group's inner shadow**, **`PlusDarker`** (a layer's and a
