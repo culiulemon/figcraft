@@ -196,16 +196,21 @@ impl CanvasGpu {
         layer_texture(device, label, width, height)
     }
 
-    /// Keep `texture` for a later frame's layers (its passes are done: a queue runs in order).
+    /// Keep `texture` for a later frame's layers (its passes are done: a queue runs in order). The
+    /// oldest go first when the pool is full: clearing it would make the next frame allocate them
+    /// all again.
     fn give_layer(&mut self, texture: Texture) {
         const POOL_BYTES: u64 = 128 << 20;
         let bytes = |t: &Texture| u64::from(t.width()) * u64::from(t.height()) * 4;
-        let used: u64 = self.layers_pool.iter().map(bytes).sum();
-        if used.saturating_add(bytes(&texture)) > POOL_BYTES {
-            self.layers_pool.clear();
-            return;
+        let mut used: u64 = self.layers_pool.iter().map(bytes).sum();
+        let want = bytes(&texture);
+        while used.saturating_add(want) > POOL_BYTES && !self.layers_pool.is_empty() {
+            let old = self.layers_pool.remove(0);
+            used = used.saturating_sub(bytes(&old));
         }
-        self.layers_pool.push(texture);
+        if used.saturating_add(want) <= POOL_BYTES {
+            self.layers_pool.push(texture);
+        }
     }
 
     /// Draw `scene` over `background` into the next target; returns its texture view.

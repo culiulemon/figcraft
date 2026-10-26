@@ -785,10 +785,11 @@ stays on the fallback list.
   churn**: a progressive blur made and dropped a dozen full-size textures a frame (its levels, the
   content layer, the mixed result), and frames alternated between 2 ms and 100–370 ms — the stall
   was inside `build_with`, in the allocations, not in the passes. Blur scratch textures and layer
-  textures now come from pools that a frame gives back (128 MB of layers, 64 MB of blur boxes), so
-  a steady drag frame is 0.5 ms of building, 0.3 ms of rendering and 0.5 ms of wait. The
-  progressive blur's device-memory ceiling is 6 M pixels, so the same card stays on the GPU at
-  200% zoom (~220 MB of levels).
+  textures now come from pools a frame gives back (128 MB each, the oldest evicted: clearing a
+  pool on overflow put the churn straight back), so a steady drag frame is 0.5 ms of building,
+  0.3 ms of rendering and 0.5 ms of wait; only the first frame of a new canvas pays its pipelines
+  (110–170 ms). The progressive blur's device-memory ceiling is 6 M pixels, so the same card stays
+  on the GPU at 200% zoom (~220 MB of levels).
 - 2026-10-26: **the box passes are O(1) a pixel.** A 200 × 300 card with a progressive blur from 0
   to 300 (the radius the acceptance pass found laggy) dragged at 2400 × 1600 costs 0.83 ms a frame
   where a full CPU render takes 252; 0 → 600 costs 1.07 ms against 1042 — the radius no longer

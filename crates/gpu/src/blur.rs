@@ -39,8 +39,9 @@ pub(crate) struct Blur {
     pool: std::sync::Mutex<Vec<Texture>>,
 }
 
-/// Most bytes the pool keeps: a blur's textures are full-size, so a couple of runs' worth.
-const POOL_BYTES: u64 = 64 << 20;
+/// Most bytes the pool keeps: a blur's textures are full-size, and a progressive blur needs about
+/// ten of them at once (its levels, the two a box pass ping-pongs between).
+const POOL_BYTES: u64 = 128 << 20;
 
 impl Blur {
     pub(crate) fn new(device: &Device) -> Option<Self> {
@@ -152,16 +153,21 @@ impl Blur {
         texture(device, label, (w, h), format, usage)
     }
 
-    /// Keep `texture` for the next run (its passes are done: a queue runs in order).
+    /// Keep `texture` for the next run (its passes are done: a queue runs in order). The oldest
+    /// textures go first when the pool is full: clearing it would make the next run allocate them
+    /// all again, which is exactly the churn the pool is there to avoid.
     pub(crate) fn give_back(&self, texture: Texture) {
         let mut pool = self.pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let bytes = |t: &Texture| u64::from(t.width()) * u64::from(t.height()) * 4;
-        let used: u64 = pool.iter().map(bytes).sum();
-        if used.saturating_add(bytes(&texture)) > POOL_BYTES {
-            pool.clear();
-            return;
+        let mut used: u64 = pool.iter().map(bytes).sum();
+        let want = bytes(&texture);
+        while used.saturating_add(want) > POOL_BYTES && !pool.is_empty() {
+            let old = pool.remove(0);
+            used = used.saturating_sub(bytes(&old));
         }
-        pool.push(texture);
+        if used.saturating_add(want) <= POOL_BYTES {
+            pool.push(texture);
+        }
     }
 }
 
