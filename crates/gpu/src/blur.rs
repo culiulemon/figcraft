@@ -8,11 +8,11 @@
 use figcraft_render::Pixmap;
 use wgpu::{
     BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BlendState, BufferDescriptor,
-    BufferUsages, ColorTargetState, ColorWrites, CommandEncoderDescriptor, ComputePassDescriptor, ComputePipeline, ComputePipelineDescriptor, Device,
-    Extent3d, FragmentState, LoadOp, Operations, PipelineCompilationOptions, PipelineLayoutDescriptor, Queue, RenderPassColorAttachment,
-    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, TexelCopyBufferInfo,
-    TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
-    TextureViewDescriptor, VertexState,
+    BufferUsages, ColorTargetState, ColorWrites, CommandEncoder, CommandEncoderDescriptor, ComputePassDescriptor, ComputePipeline,
+    ComputePipelineDescriptor, Device, Extent3d, FragmentState, LoadOp, Operations, PipelineCompilationOptions, PipelineLayoutDescriptor, Queue,
+    RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages,
+    StoreOp, TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureDescriptor, TextureDimension, TextureFormat,
+    TextureUsages, TextureView, TextureViewDescriptor, VertexState,
 };
 
 /// Blurs smaller than this many bytes stay on the CPU (a read-back costs more than they save).
@@ -185,10 +185,20 @@ fn texture(device: &Device, label: &str, (w, h): (u32, u32), format: TextureForm
     })
 }
 
-/// The blur's box passes over `src`, leaving the result in a texture of its own (`None` when the
-/// device can't). The scan runs a strip of lines at a time, so its sums stay small whatever the
-/// layer's size.
-fn boxes(device: &Device, queue: &Queue, blur: &Blur, src: &TextureView, (w, h): (u32, u32), sigma: f64) -> Option<Texture> {
+/// The blur's box passes over `src` into `encoder` (`None` when the device can't): the result
+/// texture, and the scratch to hand back to the pool once the caller has submitted it. A
+/// progressive blur's levels and its blend then reach the device in one submission — a submit a
+/// box pass made the canvas queue a dozen of them a frame, each waiting behind the window's.
+/// The scan runs a strip of lines at a time, so its sums stay small whatever the layer's size.
+fn boxes(
+    device: &Device,
+    queue: &Queue,
+    blur: &Blur,
+    encoder: &mut CommandEncoder,
+    src: &TextureView,
+    (w, h): (u32, u32),
+    sigma: f64,
+) -> Option<(Texture, Vec<Texture>)> {
     if w == 0 || h == 0 {
         return None;
     }
@@ -209,7 +219,6 @@ fn boxes(device: &Device, queue: &Queue, blur: &Blur, src: &TextureView, (w, h):
         (None, None)
     };
     let mut read = src.clone();
-    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("figcraft blur") });
     for r in figcraft_render::fx::box_radii(sigma) {
         for vertical in [false, true] {
             let target = other.create_view(&TextureViewDescriptor::default());
@@ -329,22 +338,42 @@ fn boxes(device: &Device, queue: &Queue, blur: &Blur, src: &TextureView, (w, h):
             read = current.create_view(&TextureViewDescriptor::default());
         }
     }
-    queue.submit([encoder.finish()]);
-    // After the last pass the freshly written texture is `current`.
-    blur.give_back(other);
+    // After the last pass the freshly written texture is `current`; the rest goes back after the
+    // caller submits.
+    let mut scratch = vec![other];
     if let Some(s) = sums_across {
-        blur.give_back(s);
+        scratch.push(s);
     }
     if let Some(s) = sums_down {
-        blur.give_back(s);
+        scratch.push(s);
     }
-    Some(current)
+    Some((current, scratch))
 }
 
 /// Blur the pixels of `src` into a new texture, the same three box passes as [`blur`] (`None`
 /// when the device can't): the result never leaves the GPU.
 pub(crate) fn blur_texture(device: &Device, queue: &Queue, blur: &Blur, src: &TextureView, (w, h): (u32, u32), sigma: f64) -> Option<Texture> {
-    boxes(device, queue, blur, src, (w, h), sigma)
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("figcraft blur") });
+    let (out, scratch) = boxes(device, queue, blur, &mut encoder, src, (w, h), sigma)?;
+    queue.submit([encoder.finish()]);
+    for t in scratch {
+        blur.give_back(t);
+    }
+    Some(out)
+}
+
+/// [`blur_texture`] into `encoder`: the result, and the scratch to hand back once the caller has
+/// submitted it. A progressive blur's levels and its mix then go in one submission.
+pub(crate) fn blur_texture_in(
+    device: &Device,
+    queue: &Queue,
+    blur: &Blur,
+    encoder: &mut CommandEncoder,
+    src: &TextureView,
+    (w, h): (u32, u32),
+    sigma: f64,
+) -> Option<(Texture, Vec<Texture>)> {
+    boxes(device, queue, blur, encoder, src, (w, h), sigma)
 }
 
 /// Blur `p` in place on the GPU; false when the device can't (the CPU blurs it instead).
@@ -362,7 +391,8 @@ pub(crate) fn blur(device: &Device, queue: &Queue, blur: &Blur, p: &mut Pixmap, 
         size,
     );
     let source = upload.create_view(&TextureViewDescriptor::default());
-    let Some(done) = boxes(device, queue, blur, &source, (w, h), sigma) else { return false };
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("figcraft blur") });
+    let Some((done, scratch)) = boxes(device, queue, blur, &mut encoder, &source, (w, h), sigma) else { return false };
     // Rows of a read-back buffer must be a multiple of 256 bytes.
     let row = ((w as usize * 4).div_ceil(256)) * 256;
     let readback = device.create_buffer(&BufferDescriptor {
@@ -371,7 +401,6 @@ pub(crate) fn blur(device: &Device, queue: &Queue, blur: &Blur, p: &mut Pixmap, 
         usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("figcraft blur read-back") });
     encoder.copy_texture_to_buffer(
         TexelCopyTextureInfo { texture: &done, mip_level: 0, origin: Default::default(), aspect: Default::default() },
         TexelCopyBufferInfo {
@@ -382,6 +411,9 @@ pub(crate) fn blur(device: &Device, queue: &Queue, blur: &Blur, p: &mut Pixmap, 
     );
     queue.submit(Some(encoder.finish()));
     blur.give_back(upload);
+    for t in scratch {
+        blur.give_back(t);
+    }
     blur.give_back(done);
     let slice = readback.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();

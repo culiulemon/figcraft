@@ -3,10 +3,10 @@
 
 use wgpu::{
     BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BufferDescriptor,
-    BufferUsages, ColorTargetState, ColorWrites, CommandEncoderDescriptor, Device, Extent3d, FragmentState, LoadOp, Operations,
-    PipelineCompilationOptions, PipelineLayoutDescriptor, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline,
-    RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, Texture, TextureDescriptor, TextureDimension,
-    TextureFormat, TextureUsages, TextureViewDescriptor, VertexState,
+    BufferUsages, ColorTargetState, ColorWrites, CommandEncoder, Device, Extent3d, FragmentState, LoadOp, Operations, PipelineCompilationOptions,
+    PipelineLayoutDescriptor, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor,
+    ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, Texture, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
+    TextureViewDescriptor, VertexState,
 };
 
 /// The most blur levels a progressive blur draws (the renderer's own cap).
@@ -71,12 +71,14 @@ impl Mix {
     }
 
     /// The blend of `levels` (their standard deviations, nearest first) at a ramp from `s0` at the
-    /// pixel point `a` to `s1` at `b`; every level texture is the layer blurred by its deviation.
+    /// pixel point `a` to `s1` at `b` into `encoder`: the caller submits, with the levels' own
+    /// passes, so a progressive blur reaches the device in one submission.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn mix(
+    pub(crate) fn encode(
         &self,
         device: &Device,
         queue: &Queue,
+        encoder: &mut CommandEncoder,
         levels: &[Texture],
         deviations: &[f64],
         (s0, s1, a, b): (f64, f64, (f64, f64), (f64, f64)),
@@ -127,7 +129,6 @@ impl Mix {
             view_formats: &[],
         });
         let target = out.create_view(&TextureViewDescriptor::default());
-        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("figcraft progressive blur") });
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("figcraft progressive blur"),
@@ -146,7 +147,6 @@ impl Mix {
             pass.set_bind_group(0, &bind, &[]);
             pass.draw(0..3, 0..1);
         }
-        queue.submit([encoder.finish()]);
         Some(out)
     }
 }

@@ -587,14 +587,29 @@ impl crate::scene::Layers for GpuLayers<'_> {
         }
         let deviations = figcraft_render::blur::levels(s0.min(s1), s0.max(s1));
         let size = layer.size;
-        let mut levels = Vec::with_capacity(deviations.len());
+        // The levels and their blend reach the device in one submission (with their scratch kept
+        // until it lands): a submit a pass made the canvas queue a dozen of them a frame, and in
+        // the app each of those waited behind the window's own submits.
+        let source = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("figcraft progressive blur") });
+        let mut levels: Vec<Texture> = Vec::with_capacity(deviations.len());
+        let mut after: Vec<Texture> = Vec::new();
         for d in &deviations {
-            levels.push(self.blur_texture_only(&texture, *d)?);
+            if !d.is_finite() || *d <= 0.3 {
+                // The renderer leaves a blur this small out: the layer itself is the level.
+                levels.push(texture.clone());
+            } else {
+                let (level, scratch) = crate::blur::blur_texture_in(self.device, self.queue, &self.canvas.blur, &mut encoder, &source, size, *d)?;
+                levels.push(level.clone());
+                after.push(level);
+                after.extend(scratch);
+            }
         }
-        let out = self.canvas.mix.mix(self.device, self.queue, &levels, &deviations, (s0, s1, a, b), size)?;
-        // The levels are made again next frame: keep their textures for it.
-        for level in levels {
-            self.canvas.blur.give_back(level);
+        let out = self.canvas.mix.encode(self.device, self.queue, &mut encoder, &levels, &deviations, (s0, s1, a, b), size)?;
+        self.queue.submit([encoder.finish()]);
+        // The levels and scratch are made again next frame: keep their textures for it.
+        for texture in after {
+            self.canvas.blur.give_back(texture);
         }
         let made = self.canvas.as_layer(out);
         self.keep(key, &made);
