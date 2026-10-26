@@ -136,6 +136,9 @@ pub enum Step {
     Nodes(Vec<NodeId>),
     /// A glass pane or a background-blurred layer.
     Backdrop(NodeId),
+    /// A node whose blend is plus-darker: its own pixels, composited by a pass of their own (vello
+    /// has no such blend mode).
+    PlusDarker(NodeId),
 }
 
 /// How to draw `page` in segments: its top-level children in order, with backdrop nodes as steps
@@ -157,6 +160,12 @@ pub fn plan(doc: &Document, page: NodeId) -> Result<Vec<Step>, Unsupported> {
                 steps.push(Step::Nodes(std::mem::take(&mut run)));
             }
             steps.push(Step::Backdrop(*c));
+        } else if n.blend == BlendMode::PlusDarker {
+            // Its pixels are composited by a pass of their own (vello has no plus-darker).
+            if !run.is_empty() {
+                steps.push(Step::Nodes(std::mem::take(&mut run)));
+            }
+            steps.push(Step::PlusDarker(*c));
         } else if nests_backdrop(doc, n, 0) {
             if !run.is_empty() {
                 steps.push(Step::Nodes(std::mem::take(&mut run)));
@@ -211,14 +220,29 @@ pub fn step_is_self_contained(doc: &Document, ids: &[NodeId]) -> bool {
 /// encoded scene is kept between frames under its key, so a drag re-encodes only what it changed.
 pub fn draw_into(doc: &Document, page: NodeId, view: &View, layers: &mut dyn Layers, ids: &[NodeId], out: &mut Scene) -> Result<(), Unsupported> {
     for id in ids {
-        draw_top(doc, page, view, layers, *id, out)?;
+        draw_top(doc, page, view, layers, *id, out, false)?;
     }
     Ok(())
 }
 
+/// Draw a plus-darker node's own pixels into `out`, its blend left for the canvas to apply (vello
+/// has no plus-darker): the step is composited with a pass of its own.
+pub fn draw_plus_into(doc: &Document, page: NodeId, view: &View, layers: &mut dyn Layers, id: NodeId, out: &mut Scene) -> Result<(), Unsupported> {
+    draw_top(doc, page, view, layers, id, out, true)
+}
+
 /// Draw one child of `page` into `out` — its kept encoded scene when `layers` has it under the
-/// node's key, else encoded now and kept.
-fn draw_top(doc: &Document, page: NodeId, view: &View, layers: &mut dyn Layers, id: NodeId, out: &mut Scene) -> Result<(), Unsupported> {
+/// node's key, else encoded now and kept. `as_normal` draws a plus-darker node's pixels without
+/// its blend: the canvas composites them in a pass of its own ([`draw_plus_into`]).
+fn draw_top(
+    doc: &Document,
+    page: NodeId,
+    view: &View,
+    layers: &mut dyn Layers,
+    id: NodeId,
+    out: &mut Scene,
+    as_normal: bool,
+) -> Result<(), Unsupported> {
     let key = node_scene_key(doc, view, id);
     if let Some(key) = key
         && let Some(kept) = layers.cached_node(key)
@@ -235,6 +259,7 @@ fn draw_top(doc: &Document, page: NodeId, view: &View, layers: &mut dyn Layers, 
         hidden: Vec::new(),
         no_strokes: Vec::new(),
         as_content: Vec::new(),
+        blend_as_normal: if as_normal { vec![id] } else { Vec::new() },
     };
     b.node(id, view.transform(), 0)?;
     let Some(scene) = b.scene.take() else { return Ok(()) };
@@ -291,6 +316,7 @@ pub fn draw_backdrop_into(
         hidden: Vec::new(),
         no_strokes: Vec::new(),
         as_content: Vec::new(),
+        blend_as_normal: Vec::new(),
     };
     // A blur's pixels are its padded layer (a rectangle, so the shape clips them); a pane's pixels
     // are its layer, with the shape's own coverage in the alpha.
@@ -491,7 +517,17 @@ impl Layers for NoLayers {
 pub fn supported(doc: &Document, page: NodeId) -> Result<(), Unsupported> {
     let mut probe = Probe;
     let view = View { origin: (0.0, 0.0), scale: 1.0, width: 1, height: 1 };
-    let mut b = Builder { doc, scene: None, layers: &mut probe, view, page, hidden: Vec::new(), no_strokes: Vec::new(), as_content: Vec::new() };
+    let mut b = Builder {
+        doc,
+        scene: None,
+        layers: &mut probe,
+        view,
+        page,
+        hidden: Vec::new(),
+        no_strokes: Vec::new(),
+        as_content: Vec::new(),
+        blend_as_normal: Vec::new(),
+    };
     b.children(page, Affine::IDENTITY, 0)
 }
 
@@ -507,7 +543,7 @@ pub fn build_with(doc: &Document, page: NodeId, view: &View, layers: &mut dyn La
     let mut out = Scene::new();
     let Some(p) = doc.node(page) else { return Ok(out) };
     for c in &p.children {
-        draw_top(doc, page, view, layers, *c, &mut out)?;
+        draw_top(doc, page, view, layers, *c, &mut out, false)?;
     }
     Ok(out)
 }
@@ -526,6 +562,9 @@ struct Builder<'a> {
     no_strokes: Vec<NodeId>,
     /// Mask nodes drawn as ordinary content (their coverage, for the siblings they clip).
     as_content: Vec<NodeId>,
+    /// Nodes whose plus-darker blend the canvas applies itself (a step of their own): drawn here
+    /// without it.
+    blend_as_normal: Vec<NodeId>,
 }
 
 /// What a node's visible effects need of the GPU, if anything.
@@ -830,6 +869,7 @@ impl Builder<'_> {
             hidden: self.hidden.clone(),
             no_strokes: self.no_strokes.clone(),
             as_content: self.as_content.clone(),
+            blend_as_normal: self.blend_as_normal.clone(),
         };
         f(&mut b)?;
         Ok(b.scene.unwrap_or_default())
@@ -862,8 +902,8 @@ impl Builder<'_> {
             Effects::InnerShadows => {}
             Effects::Other => return Err(Unsupported::Effect),
         }
-        // vello has no plus-darker composition: the CPU draws it.
-        if n.blend == BlendMode::PlusDarker {
+        // vello has no plus-darker composition: the CPU draws it, or a step of its own does.
+        if n.blend == BlendMode::PlusDarker && !self.blend_as_normal.contains(&n.id) {
             return Err(Unsupported::Structure);
         }
         let xf = parent_xf * n.transform;
@@ -953,6 +993,7 @@ impl Builder<'_> {
             hidden: above.hidden,
             no_strokes: above.strokes,
             as_content: Vec::new(),
+            blend_as_normal: Vec::new(),
         };
         if let Some(s) = &mut below.scene {
             let bg = background(self.doc, page);
@@ -1053,6 +1094,7 @@ impl Builder<'_> {
             hidden: self.hidden.clone(),
             no_strokes: self.no_strokes.clone(),
             as_content: self.as_content.clone(),
+            blend_as_normal: self.blend_as_normal.clone(),
         };
         // The content only: the node's opacity and blend mode apply to the result, not inside it.
         sub.content(n, layer.transform() * parent * n.transform, depth)?;
@@ -1063,7 +1105,7 @@ impl Builder<'_> {
     /// shadows) → its layer blur and grain → the drop shadows cast from that result → the layer
     /// over them. The shadows the rounded-rect fast path draws straight into the scene still are.
     fn layer_pipeline(&mut self, n: &Node, depth: usize) -> Result<(), Unsupported> {
-        if n.blend == BlendMode::PlusDarker {
+        if n.blend == BlendMode::PlusDarker && !self.blend_as_normal.contains(&n.id) {
             return Err(Unsupported::Structure);
         }
         let Some((x0, y0, w, h)) = self.layer_rect(n)? else { return Ok(()) };

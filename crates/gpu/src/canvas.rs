@@ -31,6 +31,8 @@ pub struct CanvasGpu {
     mix: crate::mix::Mix,
     /// Lays a page segment over the accumulation.
     compose: crate::compose::Compose,
+    /// Plus-darker onto the page (through a copy of it).
+    plus: crate::plus::Plus,
     targets: [Target; 2],
     /// The target the next frame is drawn into.
     next: usize,
@@ -44,6 +46,8 @@ pub struct CanvasGpu {
     page: Option<Scratch>,
     /// One segment on its way onto the page.
     segment: Option<Scratch>,
+    /// A copy of the page, for a pass that reads it as it writes it (plus-darker).
+    under: Option<Scratch>,
     /// The plan steps' own segments, with the key of what each holds, kept between frames.
     steps: Vec<Option<(u64, Scratch)>>,
     /// Shadow images kept between frames, by what they were made from: while one layer moves, the
@@ -116,6 +120,7 @@ impl CanvasGpu {
         let shadow = crate::shadow::Shadow::new(device)?;
         let mix = crate::mix::Mix::new(device)?;
         let compose = crate::compose::Compose::new(device)?;
+        let plus = crate::plus::Plus::new(device)?;
         Some(Self {
             renderer,
             blur,
@@ -123,12 +128,14 @@ impl CanvasGpu {
             shadow,
             mix,
             compose,
+            plus,
             targets: [target(device, width, height), target(device, width, height)],
             next: 0,
             last: 0,
             generation: 1,
             page: None,
             segment: None,
+            under: None,
             steps: Vec::new(),
             shadows: HashMap::new(),
             shadows_bytes: 0,
@@ -274,6 +281,23 @@ impl CanvasGpu {
     /// Lay `src` over `dst` (both canvas-sized).
     pub(crate) fn compose_over(&self, device: &Device, queue: &Queue, dst: &TextureView, src: &TextureView) {
         self.compose.over(device, queue, dst, src);
+    }
+
+    /// `src` (a step's pixels, straight alpha from vello) plus-darker'd onto the page — the CPU's
+    /// `fx::plus_darker`, through a copy of the page (a pass can't read what it writes).
+    pub(crate) fn plus_darker(&mut self, device: &Device, queue: &Queue, page: &Texture, page_view: &TextureView, src: &TextureView) -> Option<()> {
+        let (w, h) = self.size();
+        let (under, _) = keep(&mut self.under, device, (w, h), "figcraft under")?;
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("figcraft under copy") });
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo { texture: page, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: &under, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        queue.submit([encoder.finish()]);
+        let under_view = under.create_view(&wgpu::TextureViewDescriptor::default());
+        self.plus.run(device, queue, page_view, &under_view, src);
+        Some(())
     }
 
     /// Put the accumulated page on screen (into the next buffer).
@@ -874,9 +898,9 @@ pub fn present(doc: &Document, page: NodeId, view: &View) -> Option<Frame> {
         Ok(plan) => plan,
         Err(e) => return refusal(e.reason()),
     };
-    // A page with a backdrop node is drawn in segments (a container with one nested inside it is
-    // a step of its own there too, so the layers before it are kept between frames).
-    let segmented = plan.iter().any(|s| matches!(s, crate::scene::Step::Backdrop(_)));
+    // A page with a backdrop node or a plus-darker layer is drawn in segments (a container with a
+    // nested backdrop is a step of its own there too, so the layers before it are kept).
+    let segmented = plan.iter().any(|s| matches!(s, crate::scene::Step::Backdrop(_) | crate::scene::Step::PlusDarker(_)));
     let texture = if segmented {
         match segmented_frame(&backend.device, &backend.queue, canvas, doc, page, view, &plan, background) {
             Some(texture) => texture,
@@ -958,6 +982,36 @@ pub(crate) fn segmented_frame(
                 };
                 drawn.ok()?;
                 lay_over(device, queue, canvas, &acc_view, &scene)?;
+            }
+            crate::scene::Step::PlusDarker(id) => {
+                // Its own pixels (blend left to the pass), then plus-darker onto the page.
+                let ids = [*id];
+                let key = crate::scene::step_is_self_contained(doc, &ids).then(|| crate::scene::step_key(doc, view, &ids));
+                let target = if let Some(key) = key
+                    && let Some(kept) = canvas.step_kept(i, key)
+                {
+                    kept
+                } else {
+                    let mut scene = Scene::new();
+                    let drawn = {
+                        let mut layers = GpuLayers { canvas, device, queue };
+                        crate::scene::draw_plus_into(doc, page, view, &mut layers, *id, &mut scene)
+                    };
+                    drawn.ok()?;
+                    match key.and_then(|key| canvas.step_layer(device, i).map(|view| (view, key))) {
+                        Some((target, key)) => {
+                            canvas.draw_into(device, queue, &scene, &target).then_some(())?;
+                            canvas.keep_step(i, key);
+                            target
+                        }
+                        None => {
+                            let target = canvas.segment_layer(device)?;
+                            canvas.draw_into(device, queue, &scene, &target).then_some(())?;
+                            target
+                        }
+                    }
+                };
+                canvas.plus_darker(device, queue, &acc, &acc_view, &target)?;
             }
         }
     }

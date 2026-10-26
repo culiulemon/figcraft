@@ -13,6 +13,7 @@ pub mod canvas;
 mod compose;
 mod glass;
 mod mix;
+mod plus;
 pub mod scene;
 mod shadow;
 

@@ -276,9 +276,9 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
   strokes (pixel-identical); **masks** — alpha, vector and luminance — are the mask's coverage cut
   into the run it clips (0.052/255);
   and a **backdrop effect nested in a group or frame** no longer refuses the page (pixel-identical).
-  Still on the CPU for content: **texture**, a **group's inner shadow** and **plus-darker** (a
-  layer's and a paint's); the editor's outline modes, skipped layers, soft proof and Display P3 stay
-  there by design.
+  Still on the CPU for content: **texture**, a **group's inner shadow**, a **paint's plus-darker**
+  and a **plus-darker layer under a backdrop effect**; the editor's outline modes, skipped layers,
+  soft proof and Display P3 stay there by design.
 - **Landed (2026-10-25), P11:** a segmented page keeps each ordinary step in a canvas-sized texture
   between frames (keyed on its subtrees, the view and the zoom), each page node's encoded scene is
   kept too (so a drag encodes only the layers it changed), and a step or node that reads the page
@@ -300,8 +300,9 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
   Heavy effects (glass, background blur, noise) and 4K/5K canvases at 2x are where CPU time grows.
 - **Impact:** large files and effect-heavy designs; battery on laptops.
 - **Estimate:** 4–6 h left ([`gpu-rasterizer.md`](gpu-rasterizer.md) P11): damage-tracked assembly
-  for pages with backdrop effects. P5–P11 landed 2026-10-25; the content left on the CPU is texture,
-  a group's inner shadow, plus-darker and luminance masks, each a pass or a pixel walk of its own.
+  for pages with backdrop effects. P5–P11 landed 2026-10-25; a page-level plus-darker layer landed
+  2026-10-26; the content left on the CPU is texture, a group's inner shadow, a paint's plus-darker
+  and a plus-darker layer under a backdrop effect, each a pass or a pixel walk of its own.
 
 ### 8. Platform QA: Linux and the browser left
 - **Missing:** regular runs on Linux and the browser; real screen readers; a repeat of the Windows

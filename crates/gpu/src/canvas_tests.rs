@@ -535,7 +535,7 @@ fn pane_and_nested_glass_doc() -> Document {
 fn first_step(plan: &[scene::Step]) -> Option<Vec<figcraft_doc::NodeId>> {
     plan.iter().find_map(|s| match s {
         scene::Step::Nodes(ids) => Some(ids.clone()),
-        scene::Step::Backdrop(_) => None,
+        scene::Step::Backdrop(_) | scene::Step::PlusDarker(_) => None,
     })
 }
 
@@ -637,7 +637,7 @@ fn a_step_that_reads_the_page_is_drawn_every_frame() {
         .iter()
         .filter_map(|s| match s {
             scene::Step::Nodes(ids) => Some(ids.clone()),
-            scene::Step::Backdrop(_) => None,
+            scene::Step::Backdrop(_) | scene::Step::PlusDarker(_) => None,
         })
         .nth(1)
         .expect("the group is a step of its own");
@@ -708,6 +708,43 @@ fn a_container_with_a_backdrop_effect_is_not_kept() {
     let group = children.iter().copied().find(|id| d.node(*id).is_some_and(|n| n.name == "card group")).expect("the group");
     assert!(scene::node_scene_key(&d, &view, stripes).is_some(), "a stripe is its own");
     assert!(scene::node_scene_key(&d, &view, group).is_none(), "the group's glass reads the page under it");
+}
+
+/// Coloured stripes under a translucent card that darkens them (plus-darker), shadow and all.
+fn plus_darker_doc() -> Document {
+    let mut d = Document::new("gpu plus-darker");
+    let p = d.first_page().unwrap();
+    let colours = ["E03030", "2040E0", "20C060", "F0C830", "A040E0", "20B0D0"];
+    for (i, c) in colours.iter().enumerate() {
+        let x = f64::from(u32::try_from(i).unwrap_or(0)) * 60.0 + 20.0;
+        let id = d.create(p, NodeKind::Rectangle, "stripe", x, 20.0, 60.0, 260.0).unwrap();
+        d.get_mut(id).unwrap().fills = vec![Paint::solid(Color::from_hex(c).unwrap_or(Color::WHITE))];
+    }
+    let card = d.create(p, NodeKind::Rectangle, "plus card", 50.0, 50.0, 260.0, 160.0).unwrap();
+    {
+        let n = d.get_mut(card).unwrap();
+        n.corners.radii = [24.0; 4];
+        n.fills = vec![Paint::solid(Color { a: 0.55, ..Color::from_hex("C8C8C8").unwrap_or(Color::WHITE) })];
+        n.blend = BlendMode::PlusDarker;
+        n.effects = vec![Effect::drop_shadow()];
+    }
+    d
+}
+
+#[test]
+fn the_gpu_draws_a_plus_darker_layer() {
+    if device().is_none() {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    }
+    let d = plus_darker_doc();
+    let p = d.first_page().unwrap();
+    let plan = scene::plan(&d, p).expect("the page is drawn in segments");
+    assert!(plan.iter().any(|s| matches!(s, scene::Step::PlusDarker(_))), "the plus-darker card is a step of its own");
+    let Some((worst, mean, over)) = segmented_parity(&d, "plus-darker") else { return };
+    assert!(worst <= 128, "a channel differs by {worst} (mean {mean:.3})");
+    assert!(mean <= 2.0, "the mean difference is {mean:.3}");
+    assert!(over < (PARITY.0 * PARITY.1) as usize / 20, "{over} pixels differ by more than 8");
 }
 
 #[test]
