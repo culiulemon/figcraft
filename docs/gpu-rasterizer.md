@@ -810,14 +810,14 @@ stays on the fallback list.
   across the card, where the levels' bands are columns and the crops start differently along x. A
   progressive blur whose layer is past 6 M pixels stays on the CPU (eight levels would cost
   hundreds of MB of device memory; some drivers abort on the allocation).
-- 2026-10-26: **a dragged blurred card reaches 60 fps in the app.** The acceptance case (200 × 300
-  card, progressive 0 → 300, 100% zoom, release app driven through the control channel) went from
-  **8 fps** to about **60**: 141 canvas frames in 2.31 s while the pointer moved 154 pixels a
-  second (the render thread skips to the newest job, so this is what the window shows), with only
-  six of them rebuilding the blur — the rest drew the kept layer at its new place. A rebuilding
-  frame is now 24–60 ms (it was 76–124 ms, and 250–370 ms before the pools), of which the blur's
-  encode is 0.4 ms, the command buffer's recording 1–30 ms and the vello draw 3–7 ms. Three
-  changes, in order of what they bought:
+- 2026-10-26: **a dragged blurred card reaches 50–60 fps in the app.** The acceptance case
+  (200 × 300 card, progressive 0 → 300, 100% zoom, release app driven through the control channel)
+  went from **8 fps** to **116–141 canvas frames in about 2.3 s** (two runs) while the pointer moved
+  154 pixels a second (the render thread skips to the newest job, so this is what the window
+  shows), with only six of them rebuilding the blur — the rest drew the kept layer at its new
+  place. A rebuilding frame is now 24–60 ms of building plus 5–25 ms of drawing (it was 76–124 ms,
+  and 250–370 ms before the pools), of which the blur's encode is 0.4 ms and the device 8–18 ms;
+  a frame that keeps the layer is 3–7 ms. Three changes, in order of what they bought:
   - **Only the pixels a level is used in are blurred** (`canvas::level_crop`): the ramp's bands,
     plus 3σ + 3 of reach, cropped per level. 1.5 M pixels of crops against 10.6 M before; the
     parity above is unchanged, and `a_progressive_level_blurs_only_its_band` pins the crop.
