@@ -34,7 +34,13 @@ pub(crate) struct Blur {
     average: Option<RenderPipeline>,
     /// The window read directly, for a device without the scan.
     direct: Option<RenderPipeline>,
+    /// The textures a run reads and writes, kept between runs: a progressive blur would otherwise
+    /// make (and drop) a dozen full-size textures a frame, and that churn shows as judder.
+    pool: std::sync::Mutex<Vec<Texture>>,
 }
+
+/// Most bytes the pool keeps: a blur's textures are full-size, so a couple of runs' worth.
+const POOL_BYTES: u64 = 64 << 20;
 
 impl Blur {
     pub(crate) fn new(device: &Device) -> Option<Self> {
@@ -133,7 +139,29 @@ impl Blur {
             (None, None, None)
         };
         let direct = Some(pass("figcraft blur", "fs", &layout));
-        Some(Self { direct, layout, scan_layout, scan, average })
+        Some(Self { direct, layout, scan_layout, scan, average, pool: std::sync::Mutex::new(Vec::new()) })
+    }
+
+    /// A texture of `size`, `format` and `usage` for a run: one kept from an earlier run when its
+    /// shape matches, else a new one.
+    fn take(&self, device: &Device, label: &str, (w, h): (u32, u32), format: TextureFormat, usage: TextureUsages) -> Texture {
+        let mut pool = self.pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(i) = pool.iter().position(|t| t.width() == w && t.height() == h && t.format() == format && t.usage() == usage) {
+            return pool.swap_remove(i);
+        }
+        texture(device, label, (w, h), format, usage)
+    }
+
+    /// Keep `texture` for the next run (its passes are done: a queue runs in order).
+    fn give_back(&self, texture: Texture) {
+        let mut pool = self.pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bytes = |t: &Texture| u64::from(t.width()) * u64::from(t.height()) * 4;
+        let used: u64 = pool.iter().map(bytes).sum();
+        if used.saturating_add(bytes(&texture)) > POOL_BYTES {
+            pool.clear();
+            return;
+        }
+        pool.push(texture);
     }
 }
 
@@ -162,14 +190,14 @@ fn boxes(device: &Device, queue: &Queue, blur: &Blur, src: &TextureView, (w, h):
         return None;
     }
     let io = TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_DST | TextureUsages::COPY_SRC;
-    let mut current = texture(device, "figcraft blur a", (w, h), TextureFormat::Rgba8Unorm, io);
-    let mut other = texture(device, "figcraft blur b", (w, h), TextureFormat::Rgba8Unorm, io);
+    let mut current = blur.take(device, "figcraft blur a", (w, h), TextureFormat::Rgba8Unorm, io);
+    let mut other = blur.take(device, "figcraft blur b", (w, h), TextureFormat::Rgba8Unorm, io);
     // A box pass's running sums: a strip of rows across, or of columns down.
     let sums_io = TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
     let (sums_across, sums_down) = if blur.scan.is_some() {
         (
-            Some(texture(device, "figcraft blur sums", (w, STRIP.min(h)), TextureFormat::Rgba32Float, sums_io)),
-            Some(texture(device, "figcraft blur sums", (STRIP.min(w), h), TextureFormat::Rgba32Float, sums_io)),
+            Some(blur.take(device, "figcraft blur sums", (w, STRIP.min(h)), TextureFormat::Rgba32Float, sums_io)),
+            Some(blur.take(device, "figcraft blur sums", (STRIP.min(w), h), TextureFormat::Rgba32Float, sums_io)),
         )
     } else {
         (None, None)
@@ -297,6 +325,13 @@ fn boxes(device: &Device, queue: &Queue, blur: &Blur, src: &TextureView, (w, h):
     }
     queue.submit([encoder.finish()]);
     // After the last pass the freshly written texture is `current`.
+    blur.give_back(other);
+    if let Some(s) = sums_across {
+        blur.give_back(s);
+    }
+    if let Some(s) = sums_down {
+        blur.give_back(s);
+    }
     Some(current)
 }
 
@@ -313,7 +348,7 @@ pub(crate) fn blur(device: &Device, queue: &Queue, blur: &Blur, p: &mut Pixmap, 
         return false;
     }
     let size = Extent3d { width: w, height: h, depth_or_array_layers: 1 };
-    let upload = texture(device, "figcraft blur in", (w, h), TextureFormat::Rgba8Unorm, TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST);
+    let upload = blur.take(device, "figcraft blur in", (w, h), TextureFormat::Rgba8Unorm, TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST);
     queue.write_texture(
         TexelCopyTextureInfo { texture: &upload, mip_level: 0, origin: Default::default(), aspect: Default::default() },
         p.data(),
@@ -340,6 +375,8 @@ pub(crate) fn blur(device: &Device, queue: &Queue, blur: &Blur, p: &mut Pixmap, 
         size,
     );
     queue.submit(Some(encoder.finish()));
+    blur.give_back(upload);
+    blur.give_back(done);
     let slice = readback.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |result| {

@@ -382,9 +382,9 @@ same doc):
 Doubling the ramp barely moves the GPU frame (the layer's own pixels grow, not the window's taps);
 the CPU's four-box-per-level cost doubles. `the_gpu_draws_a_progressive_blur` checks the 0 → 300
 case (a 1100 × 1200 layer, five strips of the scan each way) against the CPU: mean 0.135/255, worst
-30, 212 pixels off by more than 8. A progressive blur whose layer is past 4.5 M pixels (0 → 1000 on
-that card, 3200 × 3300) stays on the CPU: its eight full-size levels would cost hundreds of
-megabytes of device memory, and some drivers refuse the allocation.
+30, 212 pixels off by more than 8. A progressive blur whose layer is past 6 M pixels (0 → 1250 on
+that card, or the same blur at 300% zoom) stays on the CPU: its eight full-size levels would cost
+hundreds of megabytes of device memory, and some drivers refuse the allocation.
 
 ### P8 — masks and plus-darker
 
@@ -778,6 +778,13 @@ stays on the fallback list.
   shadows are cast from its layer's pixels: the renderer's `inner_shadow_of` on a read-back of the
   layer, drawn over it before the layer effects (the layer path P7 built). The group in
   `the_gpu_draws_shadows_of_any_shape` matches the CPU at mean 0.001/255, worst 1.
+- 2026-10-26: **in the app, a blurred card's drag frame is 1.3 ms.** Re-measured through the
+  control channel on the release app (`ui.pointer`, a real drag of the 0 → 300 card at 100%):
+  `canvas.renderMs` 1.29 ms a frame, 60.5 ms for the first frame after the effect is added
+  (pipelines, the layer's first upload), 6–8 ms a control round trip. Blur scratch textures are now
+  **kept between runs** (a progressive blur otherwise makes and drops a dozen full-size textures a
+  frame), and the progressive blur's device-memory ceiling is 6 M pixels, so the same card stays on
+  the GPU at 200% zoom (~220 MB of levels).
 - 2026-10-26: **the box passes are O(1) a pixel.** A 200 × 300 card with a progressive blur from 0
   to 300 (the radius the acceptance pass found laggy) dragged at 2400 × 1600 costs 0.83 ms a frame
   where a full CPU render takes 252; 0 → 600 costs 1.07 ms against 1042 — the radius no longer

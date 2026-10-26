@@ -282,8 +282,10 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
 - **Landed (2026-10-26), blur cost:** a box pass is O(1) a pixel (a compute scan's running sums,
   a strip of 256 lines a dispatch), so a blur's radius costs the GPU nothing: a 200 × 300 card
   with a progressive blur of 0 → 300 dragged at 2400 × 1600 is 0.83 ms a frame against a full CPU
-  render's 252 ms (0 → 600: 1.07 against 1042; `progressive_drag_timings`). A progressive blur
-  whose layer is past 4.5 M pixels stays on the CPU (eight full-size levels of device memory).
+  render's 252 ms (0 → 600: 1.07 against 1042; `progressive_drag_timings`), and in the real app the
+  same card's drag frame is 1.3 ms (`canvas.renderMs`, first frame after adding the effect 60 ms).
+  Blur scratch textures are kept between runs (no per-frame texture churn). A progressive blur
+  whose layer is past 6 M pixels stays on the CPU (eight full-size levels of device memory).
 - **Landed (2026-10-25), P11:** a segmented page keeps each ordinary step in a canvas-sized texture
   between frames (keyed on its subtrees, the view and the zoom), each page node's encoded scene is
   kept too (so a drag encodes only the layers it changed), and a step or node that reads the page
