@@ -207,8 +207,25 @@ pub fn step_is_self_contained(doc: &Document, ids: &[NodeId]) -> bool {
     !ids.iter().filter_map(|id| doc.node(*id)).any(|n| n.visible && nests_backdrop(doc, n, 0))
 }
 
-/// Draw `ids` (children of `page`, in order) into `out`.
+/// Draw `ids` (children of `page`, in order) into `out`, a page-level node at a time: each node's
+/// encoded scene is kept between frames under its key, so a drag re-encodes only what it changed.
 pub fn draw_into(doc: &Document, page: NodeId, view: &View, layers: &mut dyn Layers, ids: &[NodeId], out: &mut Scene) -> Result<(), Unsupported> {
+    for id in ids {
+        draw_top(doc, page, view, layers, *id, out)?;
+    }
+    Ok(())
+}
+
+/// Draw one child of `page` into `out` — its kept encoded scene when `layers` has it under the
+/// node's key, else encoded now and kept.
+fn draw_top(doc: &Document, page: NodeId, view: &View, layers: &mut dyn Layers, id: NodeId, out: &mut Scene) -> Result<(), Unsupported> {
+    let key = node_scene_key(doc, view, id);
+    if let Some(key) = key
+        && let Some(kept) = layers.cached_node(key)
+    {
+        out.append(&kept, None);
+        return Ok(());
+    }
     let mut b = Builder {
         doc,
         scene: Some(Scene::new()),
@@ -219,13 +236,32 @@ pub fn draw_into(doc: &Document, page: NodeId, view: &View, layers: &mut dyn Lay
         no_strokes: Vec::new(),
         as_content: Vec::new(),
     };
-    for id in ids {
-        b.node(*id, view.transform(), 0)?;
-    }
-    if let Some(s) = b.scene.take() {
-        out.append(&s, None);
+    b.node(id, view.transform(), 0)?;
+    let Some(scene) = b.scene.take() else { return Ok(()) };
+    if let Some(key) = key {
+        let scene = Arc::new(scene);
+        layers.keep_node(key, Arc::clone(&scene));
+        out.append(&scene, None);
+    } else {
+        out.append(&scene, None);
     }
     Ok(())
+}
+
+/// The key of a page-level node's encoded scene: its subtree, the view and the zoom — or `None`
+/// when its pixels are not its own (a backdrop effect reads the page under it, which may change
+/// without the node changing).
+pub(crate) fn node_scene_key(doc: &Document, view: &View, id: NodeId) -> Option<u64> {
+    let n = doc.node(id)?;
+    if !n.visible || n.opacity <= 0.0 || n.is_mask || reads_backdrop(doc, n) {
+        return None;
+    }
+    Some(step_key(doc, view, &[id]))
+}
+
+/// Whether `n`'s pixels depend on the page under it: its own backdrop effect, or one nested in it.
+fn reads_backdrop(doc: &Document, n: &Node) -> bool {
+    (n.visible && backdrop_of(n).is_some()) || nests_backdrop(doc, n, 0)
 }
 
 /// Draw a backdrop node over its effect pixels (`image`, made from the page drawn under it).
@@ -336,6 +372,14 @@ pub trait Layers {
     fn kept_shadow(&mut self, _key: (u64, u64)) -> Option<Layer> {
         None
     }
+    /// A page-level node's encoded scene from an earlier frame under `key` (its subtree, the view
+    /// and the zoom): what a drag reuses instead of encoding the node again.
+    fn cached_node(&mut self, _key: u64) -> Option<Arc<Scene>> {
+        None
+    }
+    /// Keep `scene` as the encoded scene for `key` (the GPU canvas does; exports and the probe
+    /// build every frame).
+    fn keep_node(&mut self, _key: u64, _scene: Arc<Scene>) {}
 }
 
 /// Accepts effect layers without drawing them (the feature check).
@@ -449,24 +493,15 @@ pub fn build(doc: &Document, page: NodeId, view: &View) -> Result<Scene, Unsuppo
 }
 
 /// Draw page `page` of `doc` as seen through `view` into a vello scene, drawing effect layers
-/// through `layers` (the GPU canvas).
+/// through `layers` (the GPU canvas): a page-level node at a time, each reused from `layers` when
+/// it did not change.
 pub fn build_with(doc: &Document, page: NodeId, view: &View, layers: &mut dyn Layers) -> Result<Scene, Unsupported> {
-    let mut b = Builder {
-        doc,
-        scene: Some(Scene::new()),
-        layers,
-        view: view.clone(),
-        page,
-        hidden: Vec::new(),
-        no_strokes: Vec::new(),
-        as_content: Vec::new(),
-    };
-    let xf = view.transform();
-    let Some(p) = doc.node(page) else { return Ok(Scene::new()) };
+    let mut out = Scene::new();
+    let Some(p) = doc.node(page) else { return Ok(out) };
     for c in &p.children {
-        b.node(*c, xf, 0)?;
+        draw_top(doc, page, view, layers, *c, &mut out)?;
     }
-    Ok(b.scene.unwrap_or_default())
+    Ok(out)
 }
 
 struct Builder<'a> {

@@ -279,8 +279,9 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
   and a paint's) and **luminance masks**; the editor's outline modes, skipped layers, soft proof and
   Display P3 stay there by design.
 - **Landed (2026-10-25), P11:** a segmented page keeps each ordinary step in a canvas-sized texture
-  between frames (keyed on its subtrees, the view and the zoom), and a step that reads the page under
-  it is never kept; on such a page a container with a nested backdrop gets a step of its own. A
+  between frames (keyed on its subtrees, the view and the zoom), each page node's encoded scene is
+  kept too (so a drag encodes only the layers it changed), and a step or node that reads the page
+  under it is never kept; on such a page a container with a nested backdrop gets a step of its own. A
   single-layer drag on the corpus pages (release, medians of ten frames, CPU `Retained` on the same
   frames; ranges over three runs, the GPU's throughput moving 2–3× with what else runs):
   - 904 × 860 — plain 1.1–1.4 ms against 2.7–3.3, layer blur 0.9–1.1 against 0.2–0.3, one glass

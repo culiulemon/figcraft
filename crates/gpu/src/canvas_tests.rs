@@ -653,6 +653,63 @@ fn a_step_that_reads_the_page_is_drawn_every_frame() {
     assert_eq!(changed.data(), expected.data(), "a step that reads the page is not kept");
 }
 
+/// Draw `d`'s first page as the single-scene path does (what `canvas::present` uses when the page
+/// has no top-level backdrop node) and read it back.
+fn single_scene_pixels(canvas: &mut CanvasGpu, device: &Device, queue: &Queue, d: &Document, view: &View) -> Option<Pixmap> {
+    let p = d.first_page()?;
+    let built = {
+        let mut layers = crate::canvas::GpuLayers { canvas, device, queue };
+        scene::build_with(d, p, view, &mut layers).ok()?
+    };
+    canvas.render(device, queue, &built, scene::background(d, p))?;
+    canvas.read(device, queue)
+}
+
+#[test]
+fn a_drag_reuses_the_encoded_scenes_of_the_layers_it_did_not_move() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let d = shadow_cards(12);
+    let p = d.first_page().unwrap();
+    let (w, h) = PARITY;
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+    let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+    let first = single_scene_pixels(&mut canvas, &device, &queue, &d, &view).expect("drawn");
+    assert_eq!(canvas.kept_node_scenes(), 12, "every layer's scene is kept");
+    assert_eq!(canvas.node_hits(), 0, "the first frame encodes them all");
+    let again = single_scene_pixels(&mut canvas, &device, &queue, &d, &view).expect("drawn");
+    assert_eq!(again.data(), first.data(), "a kept scene draws the same pixels");
+    assert_eq!(canvas.node_hits(), 12, "an unchanged frame re-encodes nothing");
+    // One card moves: only its scene is encoded again, and the frame matches a fresh canvas's.
+    let card = d.node(p).and_then(|p| p.children.get(5).copied()).expect("a card");
+    let by = figcraft_geom::Affine::translate((7.0, 0.0));
+    let mut moved = d.clone();
+    let was = moved.get(card).map(|n| n.transform).unwrap_or(figcraft_geom::Affine::IDENTITY);
+    if let Ok(n) = moved.get_mut(card) {
+        n.transform = by * was;
+    }
+    let changed = single_scene_pixels(&mut canvas, &device, &queue, &moved, &view).expect("drawn");
+    assert_eq!(canvas.node_hits(), 12 + 11, "eleven scenes were kept, the moved card's was encoded");
+    let mut fresh = CanvasGpu::new(&device, w, h).unwrap();
+    let expected = single_scene_pixels(&mut fresh, &device, &queue, &moved, &view).expect("drawn");
+    assert_eq!(changed.data(), expected.data(), "the moved card is drawn from the document, not a kept scene");
+}
+
+#[test]
+fn a_container_with_a_backdrop_effect_is_not_kept() {
+    let d = nested_backdrop_doc();
+    let p = d.first_page().unwrap();
+    let (w, h) = PARITY;
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+    let children = d.node(p).map(|p| p.children.clone()).unwrap_or_default();
+    let stripes = children.first().copied().expect("a stripe");
+    let group = children.iter().copied().find(|id| d.node(*id).is_some_and(|n| n.name == "card group")).expect("the group");
+    assert!(scene::node_scene_key(&d, &view, stripes).is_some(), "a stripe is its own");
+    assert!(scene::node_scene_key(&d, &view, group).is_none(), "the group's glass reads the page under it");
+}
+
 #[test]
 fn the_gpu_glass_matches_the_cpu_canvas() {
     let Some((device, queue)) = device() else {

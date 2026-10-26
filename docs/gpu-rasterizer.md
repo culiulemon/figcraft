@@ -424,6 +424,10 @@ A segmented page no longer re-encodes itself whole every frame:
   kept layers). A step whose key still matches is laid over the page again instead of being drawn
   again. The segments are bounded: as many canvas-sized textures as `STEP_BYTES` (128 MB) affords
   (`CanvasGpu::step_slots`); a page with more steps than that draws the rest into the shared one.
+- Each page-level node's **encoded scene** is kept too (the same key), so a drag re-encodes only the
+  layers it changed: `build_with` and `draw_into` draw a node at a time, reuse its kept scene, and
+  keep the scene they encoded (`CanvasGpu::keep_node_scene`, 2048 scenes, least recently used first).
+  A node whose pixels are not its own (a backdrop effect, its own or nested) is never kept.
 - A step whose pixels are not its own — a container with a backdrop effect nested inside it — is
   never kept (`scene::step_is_self_contained`): it reads the page under it, which may have changed.
 - A top-level container with a backdrop effect nested in it gets a segment of its own
@@ -434,13 +438,16 @@ A segmented page no longer re-encodes itself whole every frame:
 Tests: `the_gpu_keeps_an_unchanged_step_between_frames` (a kept segment draws the same pixels; an
 edit gives the step a new key and the frame matches one from a canvas that never drew it),
 `the_gpu_keeps_a_step_while_a_later_backdrop_moves`, `a_step_that_reads_the_page_is_drawn_every_frame`
-(a nested pane's step is drawn again when the stripes under it change), and the *timing*
-`segmented_drag_timings`.
+(a nested pane's step is drawn again when the stripes under it change),
+`a_drag_reuses_the_encoded_scenes_of_the_layers_it_did_not_move` (twelve scenes on the first frame,
+eleven reused and one encoded when a card moves, and the frame matches a fresh canvas's),
+`a_container_with_a_backdrop_effect_is_not_kept`, and the *timing* `segmented_drag_timings`.
 
 Measured (`segmented_drag_timings`, release, medians of ten frames with a wait after each, one card
 dragged a pixel a frame; the CPU is `figcraft_render::Retained` — damaged pixels and kept effect
 layers — on the same frames; owner's machine, 2026-10-25, three runs shown as ranges because the
-GPU's throughput moves 2–3× with what else is running):
+GPU's throughput moves 2–3× with what else is running; the step cache alone — per-node scene
+caching, which came after, is measured below):
 
 | page | canvas | CPU retained | GPU drag | GPU, nothing changed |
 |---|---|---|---|---|
@@ -467,6 +474,12 @@ In the app (release, control channel, eight stripes with a glass pane over them 
 `canvas.rasterizer` stays `gpu` with no refusal, twelve one-pixel edits of a stripe render in
 2.4–3.3 ms a frame after the first four (11–16 ms: the pipelines and the first frames), and the
 screenshot shows the pane over the stripes.
+
+With each node's encoded scene kept as well, a frame with *nothing* changed costs 0.65–1.35 ms on
+the plain page, 1.3–2.5 ms on the glass page and 4.6–5.6 ms on the heavy page (runs on 2026-10-26;
+a drag stays inside the table's ranges — the run-to-run variance there is larger than the saving).
+The first frame encodes every node; after that each node that changes is encoded again and the rest
+are appended from the cache.
 
 ### What is left on the CPU
 
@@ -496,7 +509,7 @@ Run in `cargo xtask ci` unless marked *timing* (release, `--ignored --nocapture`
 | 1e | `the_gpu_draws_the_paint_variations` | paints: a photo 1:1, fitted, cropped, tiled, rotated, filtered and translucent, a pattern fill, a diamond gradient, multiplied and screened paints (mean 0.066/255, worst 10) |
 | 1f | `the_gpu_draws_shadows_of_any_shape` | shadows of any shape: an ellipse, a star, a polygon, a per-corner card, text, a group, a frame with an overflowing child, inner shadows — with and without spread, and kept between frames (mean 0.066/255, worst 50) |
 | 1g | `the_gpu_draws_styled_text`, `the_gpu_draws_masks`, `the_gpu_draws_nested_backdrops` | styled runs and stroked text (pixel-identical), masks (mean 0.052/255), nested backdrops (pixel-identical) |
-| 1h | `the_gpu_keeps_an_unchanged_step_between_frames`, `the_gpu_keeps_a_step_while_a_later_backdrop_moves`, `a_step_that_reads_the_page_is_drawn_every_frame` | a kept step's pixels, an edit giving it a new key, and a step that reads the page never being kept (the frame matches a canvas that drew it fresh) |
+| 1h | `the_gpu_keeps_an_unchanged_step_between_frames`, `the_gpu_keeps_a_step_while_a_later_backdrop_moves`, `a_step_that_reads_the_page_is_drawn_every_frame`, `a_drag_reuses_the_encoded_scenes_of_the_layers_it_did_not_move`, `a_container_with_a_backdrop_effect_is_not_kept` | a kept step's or node's pixels, an edit giving it a new key, a step that reads the page never being kept, and a drag re-encoding only the layers it moved (the frame matches a canvas that drew it fresh) |
 | 2 | `unsupported_pages_fall_back` | the predicate rejects exactly the features not yet ported |
 | 3 | `the_gpu_canvas_reads_back` | screenshot/export path: texture → `Pixmap`, premultiplied, same size |
 | 4 | *timing* `canvas_frame_timings`, `segmented_timings` | CPU vs GPU frame at 2320 × 1440 (plain and heavy) and 2400 × 1600 (backdrop pages) |
@@ -682,13 +695,16 @@ stays on the fallback list.
 - 2026-10-25: **P11 landed — cross-frame retention for segmented pages, and nested backdrops get a
   segment of their own.** Each ordinary step is drawn once and kept in a canvas-sized texture under
   the key of its subtrees, the view and the zoom; unchanged steps are laid over the page again
-  without being drawn again. A step that reads the page (a container with a nested backdrop effect)
-  is never kept, and on a segmented page such a container forms a step of its own. A single-layer
-  drag on the corpus pages is 0.9–10.9 ms against the CPU's retained renderer's 0.2–10.3: at or
-  under it on the plain, shadow and effect-heavy pages, still 2–3× on backdrop pages, which the GPU
-  re-assembles whole each frame (`segmented_drag_timings`). Damage-tracked assembly is what is left
-  of P11 (4–6 h).
+  without being drawn again. Each page-level node's **encoded scene** is kept too, so a drag
+  re-encodes only the layers it changed (eleven of twelve scenes reused when one card moves); a
+  step or node that reads the page is never kept. On a segmented page a container with a nested
+  backdrop forms a step of its own. A single-layer drag on the corpus pages is 0.9–10.9 ms against
+  the CPU's retained renderer's 0.2–10.3: at or under it on the plain, shadow and effect-heavy
+  pages, still 2–3× on backdrop pages, which the GPU re-assembles whole each frame
+  (`segmented_drag_timings`). Damage-tracked assembly is what is left of P11 (4–6 h).
   - `the_gpu_keeps_an_unchanged_step_between_frames`, `the_gpu_keeps_a_step_while_a_later_backdrop_moves`,
-    `a_step_that_reads_the_page_is_drawn_every_frame`: a kept step draws the same pixels, an edit
-    gives it a new key, and a step that reads the page is redrawn when what lies under it changes.
+    `a_step_that_reads_the_page_is_drawn_every_frame`,
+    `a_drag_reuses_the_encoded_scenes_of_the_layers_it_did_not_move`,
+    `a_container_with_a_backdrop_effect_is_not_kept`: a kept step or scene draws the same pixels, an
+    edit gives it a new key, and what reads the page is redrawn when what lies under it changes.
 

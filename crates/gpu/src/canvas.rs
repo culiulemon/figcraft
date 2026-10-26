@@ -50,9 +50,23 @@ pub struct CanvasGpu {
     /// shadows of the others are drawn again as they are instead of being rebuilt.
     shadows: HashMap<(u64, u64), Kept>,
     shadows_bytes: usize,
-    /// Bumped on every look-up and keep: the least recently used shadow goes first.
+    /// Page-level nodes' encoded scenes, by their key: a drag re-encodes only what it changed.
+    nodes: HashMap<u64, CachedScene>,
+    /// Look-ups that found a kept scene (tests: a drag re-encodes only what moved).
+    #[cfg(test)]
+    node_hits: u64,
+    /// Bumped on every look-up and keep: the least recently used shadow or scene goes first.
     tick: u64,
 }
+
+/// An encoded page node's scene, kept between frames by what it encodes.
+struct CachedScene {
+    scene: Arc<Scene>,
+    used: u64,
+}
+
+/// The most encoded node scenes kept: each is kilobytes, so a page's layers fit many times over.
+const MAX_NODE_SCENES: usize = 2048;
 
 /// A kept shadow: its image, the device bytes it takes, and when it was last used.
 struct Kept {
@@ -118,6 +132,9 @@ impl CanvasGpu {
             steps: Vec::new(),
             shadows: HashMap::new(),
             shadows_bytes: 0,
+            nodes: HashMap::new(),
+            #[cfg(test)]
+            node_hits: 0,
             tick: 0,
         })
     }
@@ -153,8 +170,10 @@ impl CanvasGpu {
         self.next = 0;
         self.last = 0;
         self.generation = self.generation.wrapping_add(1);
-        // A kept step's texture is re-made at the new size: what it held is gone.
+        // A kept step's texture is re-made at the new size: what it held is gone. Node scenes are
+        // keyed on the view, so they would miss anyway; drop them rather than hold them.
         self.steps.clear();
+        self.nodes.clear();
     }
 
     /// Draw `scene` over `background` into the next target; returns its texture view.
@@ -345,6 +364,48 @@ impl CanvasGpu {
     pub(crate) fn kept_shadows(&self) -> usize {
         self.shadows.len()
     }
+
+    /// A page-level node's encoded scene from an earlier frame, if `key` still holds what it
+    /// encodes (its subtree, the view and the zoom).
+    pub(crate) fn node_scene(&mut self, key: u64) -> Option<Arc<Scene>> {
+        self.tick += 1;
+        let tick = self.tick;
+        let scene = {
+            let kept = self.nodes.get_mut(&key)?;
+            kept.used = tick;
+            Arc::clone(&kept.scene)
+        };
+        #[cfg(test)]
+        {
+            self.node_hits += 1;
+        }
+        Some(scene)
+    }
+
+    /// Keep `scene` as the encoded scene for `key`, dropping the least recently used past the cap.
+    pub(crate) fn keep_node_scene(&mut self, key: u64, scene: Arc<Scene>) {
+        self.tick += 1;
+        let tick = self.tick;
+        if !self.nodes.contains_key(&key)
+            && self.nodes.len() >= MAX_NODE_SCENES
+            && let Some(oldest) = self.nodes.iter().min_by_key(|(_, s)| s.used).map(|(k, _)| *k)
+        {
+            self.nodes.remove(&oldest);
+        }
+        self.nodes.insert(key, CachedScene { scene, used: tick });
+    }
+
+    /// How many page nodes' scenes are kept (tests: a drag keeps the ones that did not move).
+    #[cfg(test)]
+    pub(crate) fn kept_node_scenes(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Look-ups that found a kept scene (tests: a drag re-encodes only what moved).
+    #[cfg(test)]
+    pub(crate) fn node_hits(&self) -> u64 {
+        self.node_hits
+    }
 }
 
 /// An image with no bytes of its own: vello reads a registered texture instead.
@@ -470,6 +531,14 @@ impl crate::scene::Layers for GpuLayers<'_> {
 
     fn kept_shadow(&mut self, key: (u64, u64)) -> Option<Layer> {
         self.canvas.kept_shadow(key)
+    }
+
+    fn cached_node(&mut self, key: u64) -> Option<Arc<Scene>> {
+        self.canvas.node_scene(key)
+    }
+
+    fn keep_node(&mut self, key: u64, scene: Arc<Scene>) {
+        self.canvas.keep_node_scene(key, scene);
     }
 }
 
