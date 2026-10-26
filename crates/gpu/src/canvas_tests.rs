@@ -261,14 +261,14 @@ fn unsupported_pages_are_refused() {
     assert_eq!(scene::supported(&d, p), Ok(()));
     d.get_mut(id).unwrap().fills[0].blend = BlendMode::PlusDarker;
     assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Paint));
-    // An inner shadow of a shape is one blurred buffer clipped to it; a group's is the CPU's (it
-    // is cast from the group's pixels).
+    // An inner shadow of a shape is one blurred buffer clipped to it; a group's is cast from its
+    // own pixels, in a layer of the group.
     let inner = figcraft_doc::Shadow { radius: 10.0, ..Default::default() };
     d.get_mut(id).unwrap().fills = vec![Paint::solid(Color::WHITE)];
     d.get_mut(id).unwrap().effects = vec![Effect { kind: EffectKind::InnerShadow(inner), visible: true }];
     assert_eq!(scene::supported(&d, p), Ok(()));
     d.get_mut(id).unwrap().kind = NodeKind::Group;
-    assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Effect));
+    assert_eq!(scene::supported(&d, p), Ok(()), "a group's inner shadow is cast from its pixels");
 }
 
 /// Two cards, the upper one rounded and blurred as a layer.
@@ -1217,6 +1217,14 @@ fn shadow_shape_doc() -> Document {
     );
     d.get_mut(inner_ellipse).unwrap().effects = vec![inner(8.0, 0.0, (2.0, 2.0))];
 
+    // A group's inner shadow: cast from around what its children draw together, over them.
+    let inner_group = d.create(p, NodeKind::Group, "inner group", 540.0, 380.0, 150.0, 120.0).unwrap();
+    d.get_mut(inner_group).unwrap().effects = vec![inner(12.0, 0.0, (3.0, 4.0))];
+    for (name, at, size, colour) in [("a", (0.0, 0.0), (100.0, 80.0), "A040E0"), ("b", (50.0, 40.0), (100.0, 80.0), "20B0D0")] {
+        let c = d.create(inner_group, NodeKind::Rectangle, name, at.0, at.1, size.0, size.1).unwrap();
+        d.get_mut(c).unwrap().fills = vec![Paint::solid(hex(colour))];
+    }
+
     // Effects together, in the CPU's order: inner shadows, the layer blur and grain, the shadows
     // cast from that result.
     let blurred = add(&mut d, NodeKind::Rectangle, "blur and shadow", (20.0, 530.0), (150.0, 110.0), "F0C830");
@@ -1302,6 +1310,7 @@ fn the_gpu_draws_shadows_of_any_shape() {
             ("inner card", (20, 380, 150, 120)),
             ("inner spread", (200, 380, 150, 120)),
             ("inner ellipse", (380, 380, 150, 120)),
+            ("inner group", (540, 380, 150, 120)),
             ("blur and shadow", (20, 530, 150, 110)),
             ("inner and shadow", (200, 530, 150, 110)),
             ("blur, grain", (380, 530, 150, 110)),

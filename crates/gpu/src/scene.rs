@@ -735,8 +735,8 @@ fn effects_of(doc: &Document, n: &Node) -> Effects {
         };
     }
     if only(|k| matches!(k, figcraft_doc::EffectKind::InnerShadow(_))) {
-        // A group's is cast from its pixels, not one outline: the CPU's for now.
-        return if matches!(n.kind, NodeKind::Group | NodeKind::Page { .. }) { Effects::Other } else { Effects::InnerShadows };
+        // A group's is cast from its pixels: it needs the node's layer, like the other effects.
+        return if matches!(n.kind, NodeKind::Group | NodeKind::Page { .. }) { Effects::Layer } else { Effects::InnerShadows };
     }
     // One layer of its own, in the CPU's order: inner shadows, the layer blur and grain, then the
     // drop shadows cast from that result.
@@ -1132,18 +1132,39 @@ impl Builder<'_> {
             .copied()
             .filter(|e| matches!(e.kind, figcraft_doc::EffectKind::LayerBlur(_) | figcraft_doc::EffectKind::Noise(_)))
             .collect();
+        // A group has no outline of its own: its inner shadows are cast from around what its
+        // children draw together (the renderer's own `inner_shadow_of`).
+        let group_inner: Vec<figcraft_doc::Shadow> = if matches!(n.kind, NodeKind::Group) {
+            effects
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    figcraft_doc::EffectKind::InnerShadow(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for s in &group_inner {
+            if !(s.offset.0.is_finite() && s.offset.1.is_finite() && s.radius.is_finite() && s.spread.is_finite()) {
+                return Err(Unsupported::Effect);
+            }
+        }
         let silhouette = figcraft_render::shadow::silhouette(self.doc, n);
         let outside = figcraft_render::shadow::cover(self.doc, n).map(|c| outside(&c));
         let pixel_shadows = shadows.iter().any(|s| !casts_from_outline(&silhouette, s));
         let bounds = KRect::new(x0, y0, x0 + f64::from(w), y0 + f64::from(h));
         // The node's own pixels: its content with its inner shadows, then its layer effects.
         let mut content: Option<Layer> = None;
-        if pixel_shadows || !reads_pixels.is_empty() {
+        if pixel_shadows || !reads_pixels.is_empty() || !group_inner.is_empty() {
             let key = self.shadow_key(n, u64::MAX, xf);
             content = self.layers.kept_shadow(key);
             if content.is_none() {
                 let scene = self.content_scene(n, (x0, y0, w, h), depth)?;
                 let mut made = self.layers.layer(&scene, w, h, None).ok_or(Unsupported::Effect)?;
+                for s in &group_inner {
+                    made = self.group_inner_shadow(&made, s, scale)?;
+                }
                 for (i, e) in reads_pixels.iter().enumerate() {
                     // The last stage keeps its result: the layer is a function of the node.
                     let keep = (i + 1 == reads_pixels.len()).then_some(key);
@@ -1223,6 +1244,20 @@ impl Builder<'_> {
             self.pop_layer();
         }
         Ok(())
+    }
+
+    /// A group's inner shadow: cast inwards from around what its pixels cover, over them. The
+    /// renderer's own `inner_shadow_of` works on the layer's pixels (read back once), so it lands
+    /// where an export's does.
+    fn group_inner_shadow(&mut self, layer: &Layer, s: &figcraft_doc::Shadow, scale: f64) -> Result<Layer, Unsupported> {
+        let Some(pixels) = self.layers.layer_pixels(layer) else { return Err(Unsupported::Effect) };
+        let Some(shadow) = figcraft_render::shadow::inner_shadow_of(&pixels, scale, s) else { return Ok(layer.clone()) };
+        let shadow = image_data(&Arc::new(shadow));
+        let sampler = ImageSampler { x_extend: Extend::Pad, y_extend: Extend::Pad, quality: ImageQuality::Low, alpha: 1.0 };
+        let mut scene = Scene::new();
+        scene.draw_image(ImageBrush { image: &layer.image, sampler }, KAffine::IDENTITY);
+        scene.draw_image(ImageBrush { image: &shadow, sampler }, KAffine::IDENTITY);
+        self.layers.layer(&scene, layer.size.0, layer.size.1, None).ok_or(Unsupported::Effect)
     }
 
     /// The layer's grain: the renderer's own noise from its pixels, over it, in the noise's blend
