@@ -2184,6 +2184,107 @@ fn segmented_drag_timings() {
     }
 }
 
+/// The 0 → 300 progressive blur against the CPU: its layer is 1100 × 1200, several strips of the
+/// scan each way, so the strip logic is checked end to end.
+#[test]
+fn the_gpu_draws_a_progressive_blur() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let d = progressive_card_doc(300.0);
+    let p = d.first_page().unwrap();
+    let (w, h) = (904u32, 860u32);
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+    let cpu = render_view(&d, p, &view, &Options::default()).unwrap();
+    let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+    let built = {
+        let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+        scene::build_with(&d, p, &view, &mut layers)
+    }
+    .expect("the GPU draws a progressive blur");
+    assert!(canvas.render(&device, &queue, &built, scene::background(&d, p)).is_some());
+    let gpu = canvas.read(&device, &queue).unwrap();
+    let (worst, mean, at, over) = diff(&cpu, &gpu);
+    println!("progressive blur parity: worst {worst} at {at:?}, mean {mean:.3}, {over} pixels differ by more than 8");
+    assert!(worst <= 96, "a channel differs by {worst} (mean {mean:.3})");
+    assert!(mean <= 1.5, "the mean difference is {mean:.3}");
+}
+
+/// A 200 × 300 card with a progressive blur from 0 to `radius`, over a plain ground.
+fn progressive_card_doc(radius: f64) -> Document {
+    let mut d = Document::new("gpu progressive card");
+    let p = d.first_page().unwrap();
+    let ground = d.create(p, NodeKind::Rectangle, "ground", 40.0, 30.0, 520.0, 640.0).unwrap();
+    d.get_mut(ground).unwrap().fills = vec![Paint::solid(Color::from_hex("E8E8E8").unwrap_or(Color::WHITE))];
+    let card = d.create(p, NodeKind::Rectangle, "ramp", 150.0, 100.0, 200.0, 300.0).unwrap();
+    {
+        let n = d.get_mut(card).unwrap();
+        n.corners.radii = [12.0; 4];
+        n.fills = vec![Paint::solid(Color::from_hex("2040E0").unwrap_or(Color::BLACK))];
+        n.effects = vec![Effect {
+            kind: EffectKind::LayerBlur(figcraft_doc::Blur {
+                radius,
+                blur_type: figcraft_doc::BlurType::Progressive,
+                start_radius: 0.0,
+                start: (0.5, 0.0),
+                end: (0.5, 1.0),
+            }),
+            visible: true,
+        }];
+    }
+    d
+}
+
+/// The card with the 0 → `radius` progressive blur dragged, for a radius the box passes cost the
+/// same at as any other.
+#[test]
+#[ignore = "timing: run in release with --ignored --nocapture"]
+fn progressive_drag_timings() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    for radius in [300.0, 600.0] {
+        let d = progressive_card_doc(radius);
+        let p = d.first_page().unwrap();
+        let card = d.node(p).and_then(|p| p.children.first().copied());
+        for (w, h) in [(904u32, 860u32), (2400, 1600)] {
+            let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+            let background = scene::background(&d, p);
+            let moved = |i: u32| {
+                let mut e = d.clone();
+                if let Some(id) = card {
+                    let by = figcraft_geom::Affine::translate((f64::from(i), 0.0));
+                    let was = e.get(id).map(|n| n.transform).unwrap_or(figcraft_geom::Affine::IDENTITY);
+                    if let Ok(n) = e.get_mut(id) {
+                        n.transform = by * was;
+                    }
+                }
+                e
+            };
+            let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+            for _ in 0..2 {
+                assert!(gpu_frame(&mut canvas, &device, &queue, &d, &view, background));
+            }
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let mut drag = Vec::new();
+            for i in 0..10 {
+                let t = std::time::Instant::now();
+                assert!(gpu_frame(&mut canvas, &device, &queue, &moved(i), &view, background));
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                drag.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            let cpu = frame_ms(|| render_view(&moved(1), p, &view, &Options::default()).is_some(), 3);
+            println!(
+                "progressive card 0 → {radius:.0} {w} × {h}: CPU full {cpu:5.2} ms | GPU drag {:5.2} ms (median), {:5.2} ms worst",
+                median(&mut drag),
+                drag.iter().copied().fold(0.0, f64::max)
+            );
+        }
+    }
+}
+
 #[test]
 #[ignore = "timing: run in release with --ignored --nocapture"]
 fn canvas_frame_timings() {

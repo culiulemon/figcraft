@@ -532,6 +532,13 @@ impl crate::scene::Layers for GpuLayers<'_> {
     }
 
     fn progressive(&mut self, layer: &Layer, s0: f64, s1: f64, a: (f64, f64), b: (f64, f64), key: Option<(u64, u64)>) -> Option<Layer> {
+        // A level is a full layer texture and there are up to eight of them: a layer past this
+        // many pixels would cost hundreds of megabytes on the device (some drivers refuse the
+        // allocation outright), so a blur that large stays on the CPU, which has the RAM.
+        const MAX_PIXELS: u64 = 4_500_000;
+        if u64::from(layer.size.0).saturating_mul(u64::from(layer.size.1)) > MAX_PIXELS {
+            return None;
+        }
         if let Some(key) = key
             && let Some(hit) = self.canvas.kept_shadow(key)
         {

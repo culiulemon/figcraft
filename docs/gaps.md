@@ -279,6 +279,11 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
   Still on the CPU for content: a **paint's plus-darker** and a **plus-darker layer under a
   backdrop effect**; the editor's outline modes, skipped layers, soft proof and Display P3 stay
   there by design.
+- **Landed (2026-10-26), blur cost:** a box pass is O(1) a pixel (a compute scan's running sums,
+  a strip of 256 lines a dispatch), so a blur's radius costs the GPU nothing: a 200 × 300 card
+  with a progressive blur of 0 → 300 dragged at 2400 × 1600 is 0.83 ms a frame against a full CPU
+  render's 252 ms (0 → 600: 1.07 against 1042; `progressive_drag_timings`). A progressive blur
+  whose layer is past 4.5 M pixels stays on the CPU (eight full-size levels of device memory).
 - **Landed (2026-10-25), P11:** a segmented page keeps each ordinary step in a canvas-sized texture
   between frames (keyed on its subtrees, the view and the zoom), each page node's encoded scene is
   kept too (so a drag encodes only the layers it changed), and a step or node that reads the page

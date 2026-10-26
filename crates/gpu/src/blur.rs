@@ -1,22 +1,39 @@
-//! The blur: three box passes each way (the CPU blur's radii), a full-screen pass at a time,
-//! then the pixels read back.
+//! The blur: three box passes each way (the CPU blur's radii), a full-screen pass at a time, then
+//! the pixels read back.
+//!
+//! A box pass is O(1) a pixel: a compute pass gives every pixel the running sum along its line, and
+//! a pass takes the window's average from two of those sums. (A device that can't run the scan
+//! falls back to reading the window directly, which costs what the radius costs.)
 
 use figcraft_render::Pixmap;
 use wgpu::{
     BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BlendState, BufferDescriptor,
-    BufferUsages, ColorTargetState, ColorWrites, CommandEncoderDescriptor, Device, Extent3d, FragmentState, LoadOp, Operations,
-    PipelineCompilationOptions, PipelineLayoutDescriptor, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline,
-    RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, TexelCopyBufferInfo, TexelCopyBufferLayout,
-    TexelCopyTextureInfo, Texture, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
-    VertexState,
+    BufferUsages, ColorTargetState, ColorWrites, CommandEncoderDescriptor, ComputePassDescriptor, ComputePipeline, ComputePipelineDescriptor, Device,
+    Extent3d, FragmentState, LoadOp, Operations, PipelineCompilationOptions, PipelineLayoutDescriptor, Queue, RenderPassColorAttachment,
+    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, TexelCopyBufferInfo,
+    TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
+    TextureViewDescriptor, VertexState,
 };
 
 /// Blurs smaller than this many bytes stay on the CPU (a read-back costs more than they save).
 pub(crate) const GPU_MIN_BYTES: usize = 200_000;
 
+/// The scan's workgroup size (one pixel a thread, a tile at a time).
+const SCAN_WORKGROUP: u32 = 256;
+/// The lines one scan pass covers: its running sums are only ever this many lines.
+const STRIP: u32 = 256;
+
 pub(crate) struct Blur {
-    pipeline: RenderPipeline,
+    /// The sampled texture and the pass's parameters.
     layout: BindGroupLayout,
+    /// The scan's layout: the same, plus the prefix sums it writes.
+    scan_layout: Option<BindGroupLayout>,
+    /// The running sums, a line a workgroup.
+    scan: Option<ComputePipeline>,
+    /// The window's average from those sums.
+    average: Option<RenderPipeline>,
+    /// The window read directly, for a device without the scan.
+    direct: Option<RenderPipeline>,
 }
 
 impl Blur {
@@ -25,130 +42,268 @@ impl Blur {
             label: Some("figcraft blur"),
             source: ShaderSource::Wgsl(include_str!("blur.wgsl").into()),
         });
-        let layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label: Some("figcraft blur"),
-            entries: &[
-                BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-            ],
-        });
-        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-            label: Some("figcraft blur"),
-            bind_group_layouts: &[Some(&layout)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("figcraft blur"),
-            layout: Some(&pipeline_layout),
-            vertex: VertexState {
-                module: &shader,
-                entry_point: Some("vs"),
-                compilation_options: PipelineCompilationOptions::default(),
-                buffers: &[],
+        let texture = |binding| BindGroupLayoutEntry {
+            binding,
+            // The compute pass reads the source too (its running sums).
+            visibility: ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
+            ty: BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
             },
-            fragment: Some(FragmentState {
+            count: None,
+        };
+        let uniform = BindGroupLayoutEntry {
+            binding: 1,
+            visibility: ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
+            ty: BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
+        let layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor { label: Some("figcraft blur"), entries: &[texture(0), uniform] });
+        let pass = |label: &str, entry: &'static str, layout: &BindGroupLayout| {
+            let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[Some(layout)],
+                immediate_size: 0,
+            });
+            device.create_render_pipeline(&RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                vertex: VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    compilation_options: PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                fragment: Some(FragmentState {
+                    module: &shader,
+                    entry_point: Some(entry),
+                    compilation_options: PipelineCompilationOptions::default(),
+                    targets: &[Some(ColorTargetState {
+                        format: TextureFormat::Rgba8Unorm,
+                        blend: Some(BlendState::REPLACE),
+                        write_mask: ColorWrites::ALL,
+                    })],
+                }),
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        // The scan needs a compute pass (`rgba32float` storage is core WebGPU, so every desktop
+        // backend the canvas runs on can write the sums).
+        let scan_supported =
+            device.limits().max_compute_workgroup_size_x >= SCAN_WORKGROUP && device.limits().max_compute_invocations_per_workgroup >= SCAN_WORKGROUP;
+        let (scan_layout, scan, average) = if scan_supported {
+            let sums = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: Some("figcraft blur scan"),
+                entries: &[
+                    texture(0),
+                    uniform,
+                    BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: ShaderStages::COMPUTE,
+                        ty: BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: TextureFormat::Rgba32Float,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+            let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: Some("figcraft blur scan"),
+                bind_group_layouts: &[Some(&sums)],
+                immediate_size: 0,
+            });
+            let scan = device.create_compute_pipeline(&ComputePipelineDescriptor {
+                label: Some("figcraft blur scan"),
+                layout: Some(&pipeline_layout),
                 module: &shader,
-                entry_point: Some("fs"),
+                entry_point: Some("scan"),
                 compilation_options: PipelineCompilationOptions::default(),
-                targets: &[Some(ColorTargetState {
-                    format: TextureFormat::Rgba8Unorm,
-                    blend: Some(BlendState::REPLACE),
-                    write_mask: ColorWrites::ALL,
-                })],
-            }),
-            primitive: Default::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-        Some(Self { pipeline, layout })
+                cache: None,
+            });
+            let average = pass("figcraft blur average", "fs_box", &layout);
+            (Some(sums), Some(scan), Some(average))
+        } else {
+            (None, None, None)
+        };
+        let direct = Some(pass("figcraft blur", "fs", &layout));
+        Some(Self { direct, layout, scan_layout, scan, average })
     }
 }
 
-/// Blur the pixels of `src` into a new texture, the same three box passes as [`blur`] (`None`
-/// when the device can't): the result never leaves the GPU.
-pub(crate) fn blur_texture(device: &Device, queue: &Queue, blur: &Blur, src: &TextureView, (w, h): (u32, u32), sigma: f64) -> Option<Texture> {
+/// The textures a blur reads and writes: one after one, a box pass a time.
+fn texture(device: &Device, label: &str, (w, h): (u32, u32), format: TextureFormat, usage: TextureUsages) -> Texture {
+    device.create_texture(&TextureDescriptor {
+        label: Some(label),
+        size: Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format,
+        usage,
+        view_formats: &[],
+    })
+}
+
+/// The blur's box passes over `src`, leaving the result in a texture of its own (`None` when the
+/// device can't). The scan runs a strip of lines at a time, so its sums stay small whatever the
+/// layer's size.
+fn boxes(device: &Device, queue: &Queue, blur: &Blur, src: &TextureView, (w, h): (u32, u32), sigma: f64) -> Option<Texture> {
     if w == 0 || h == 0 {
         return None;
     }
-    let size = Extent3d { width: w, height: h, depth_or_array_layers: 1 };
-    let make = |label: &str| {
-        device.create_texture(&TextureDescriptor {
-            label: Some(label),
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba8Unorm,
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_DST | TextureUsages::COPY_SRC,
-            view_formats: &[],
-        })
+    if blur.scan.is_none() && blur.direct.is_none() {
+        return None;
+    }
+    let io = TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_DST | TextureUsages::COPY_SRC;
+    let mut current = texture(device, "figcraft blur a", (w, h), TextureFormat::Rgba8Unorm, io);
+    let mut other = texture(device, "figcraft blur b", (w, h), TextureFormat::Rgba8Unorm, io);
+    // A box pass's running sums: a strip of rows across, or of columns down.
+    let sums_io = TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
+    let (sums_across, sums_down) = if blur.scan.is_some() {
+        (
+            Some(texture(device, "figcraft blur sums", (w, STRIP.min(h)), TextureFormat::Rgba32Float, sums_io)),
+            Some(texture(device, "figcraft blur sums", (STRIP.min(w), h), TextureFormat::Rgba32Float, sums_io)),
+        )
+    } else {
+        (None, None)
     };
-    let mut current = make("figcraft layer blur a");
-    let mut other = make("figcraft layer blur b");
-    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("figcraft layer blur") });
-    let mut first = true;
+    let mut read = src.clone();
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("figcraft blur") });
     for r in figcraft_render::fx::box_radii(sigma) {
         for vertical in [false, true] {
-            let mut params = [0u8; 16];
-            params[0..4].copy_from_slice(&(r as u32).to_le_bytes());
-            params[4..8].copy_from_slice(&u32::from(vertical).to_le_bytes());
-            let uniform = device.create_buffer(&BufferDescriptor {
-                label: Some("figcraft blur params"),
-                size: 16,
-                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            queue.write_buffer(&uniform, 0, &params);
-            let read = if first { src.clone() } else { current.create_view(&TextureViewDescriptor::default()) };
-            let bind = device.create_bind_group(&BindGroupDescriptor {
-                label: Some("figcraft layer blur"),
-                layout: &blur.layout,
-                entries: &[
-                    BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&read) },
-                    BindGroupEntry { binding: 1, resource: uniform.as_entire_binding() },
-                ],
-            });
             let target = other.create_view(&TextureViewDescriptor::default());
-            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("figcraft layer blur"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &target,
-                    resolve_target: None,
-                    ops: Operations { load: LoadOp::Clear(wgpu::Color::TRANSPARENT), store: StoreOp::Store },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&blur.pipeline);
-            pass.set_bind_group(0, &bind, &[]);
-            pass.draw(0..3, 0..1);
-            drop(pass);
+            let lines = if vertical { w } else { h };
+            let mut started = false;
+            if let (Some(scan), Some(average), Some(scan_layout)) = (&blur.scan, &blur.average, &blur.scan_layout)
+                && let Some(sums) = if vertical { &sums_down } else { &sums_across }
+            {
+                let written = sums.create_view(&TextureViewDescriptor::default());
+                let mut start = 0u32;
+                while start < lines {
+                    let count = STRIP.min(lines - start);
+                    let mut params = [0u8; 16];
+                    params[0..4].copy_from_slice(&(r as u32).to_le_bytes());
+                    params[4..8].copy_from_slice(&u32::from(vertical).to_le_bytes());
+                    params[8..12].copy_from_slice(&start.to_le_bytes());
+                    let uniform = device.create_buffer(&BufferDescriptor {
+                        label: Some("figcraft blur params"),
+                        size: 16,
+                        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    queue.write_buffer(&uniform, 0, &params);
+                    // The running sums along the strip's lines, then the window's average from them.
+                    let bind = device.create_bind_group(&BindGroupDescriptor {
+                        label: Some("figcraft blur scan"),
+                        layout: scan_layout,
+                        entries: &[
+                            BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&read) },
+                            BindGroupEntry { binding: 1, resource: uniform.as_entire_binding() },
+                            BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&written) },
+                        ],
+                    });
+                    {
+                        let mut pass =
+                            encoder.begin_compute_pass(&ComputePassDescriptor { label: Some("figcraft blur scan"), timestamp_writes: None });
+                        pass.set_pipeline(scan);
+                        pass.set_bind_group(0, &bind, &[]);
+                        pass.dispatch_workgroups(count, 1, 1);
+                    }
+                    let bind = device.create_bind_group(&BindGroupDescriptor {
+                        label: Some("figcraft blur average"),
+                        layout: &blur.layout,
+                        entries: &[
+                            BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&written) },
+                            BindGroupEntry { binding: 1, resource: uniform.as_entire_binding() },
+                        ],
+                    });
+                    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("figcraft blur average"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view: &target,
+                            resolve_target: None,
+                            // The first strip clears the whole target; the rest write their own.
+                            ops: Operations {
+                                load: if start == 0 { LoadOp::Clear(wgpu::Color::TRANSPARENT) } else { LoadOp::Load },
+                                store: StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    // Only the strip: the rest of the destination is another strip's.
+                    if vertical {
+                        pass.set_viewport(start as f32, 0.0, count as f32, h as f32, 0.0, 1.0);
+                    } else {
+                        pass.set_viewport(0.0, start as f32, w as f32, count as f32, 0.0, 1.0);
+                    }
+                    pass.set_pipeline(average);
+                    pass.set_bind_group(0, &bind, &[]);
+                    pass.draw(0..3, 0..1);
+                    start += count;
+                    started = true;
+                }
+            }
+            if !started {
+                let Some(direct) = &blur.direct else { return None };
+                let mut params = [0u8; 16];
+                params[0..4].copy_from_slice(&(r as u32).to_le_bytes());
+                params[4..8].copy_from_slice(&u32::from(vertical).to_le_bytes());
+                let uniform = device.create_buffer(&BufferDescriptor {
+                    label: Some("figcraft blur params"),
+                    size: 16,
+                    usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                queue.write_buffer(&uniform, 0, &params);
+                let bind = device.create_bind_group(&BindGroupDescriptor {
+                    label: Some("figcraft blur"),
+                    layout: &blur.layout,
+                    entries: &[
+                        BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&read) },
+                        BindGroupEntry { binding: 1, resource: uniform.as_entire_binding() },
+                    ],
+                });
+                let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("figcraft blur"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &target,
+                        resolve_target: None,
+                        ops: Operations { load: LoadOp::Clear(wgpu::Color::TRANSPARENT), store: StoreOp::Store },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(direct);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.draw(0..3, 0..1);
+            }
             std::mem::swap(&mut current, &mut other);
-            first = false;
+            read = current.create_view(&TextureViewDescriptor::default());
         }
     }
     queue.submit([encoder.finish()]);
     // After the last pass the freshly written texture is `current`.
     Some(current)
+}
+
+/// Blur the pixels of `src` into a new texture, the same three box passes as [`blur`] (`None`
+/// when the device can't): the result never leaves the GPU.
+pub(crate) fn blur_texture(device: &Device, queue: &Queue, blur: &Blur, src: &TextureView, (w, h): (u32, u32), sigma: f64) -> Option<Texture> {
+    boxes(device, queue, blur, src, (w, h), sigma)
 }
 
 /// Blur `p` in place on the GPU; false when the device can't (the CPU blurs it instead).
@@ -158,69 +313,15 @@ pub(crate) fn blur(device: &Device, queue: &Queue, blur: &Blur, p: &mut Pixmap, 
         return false;
     }
     let size = Extent3d { width: w, height: h, depth_or_array_layers: 1 };
-    let make = |label: &str| {
-        device.create_texture(&TextureDescriptor {
-            label: Some(label),
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba8Unorm,
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_DST | TextureUsages::COPY_SRC,
-            view_formats: &[],
-        })
-    };
-    let (a, b) = (make("figcraft blur a"), make("figcraft blur b"));
+    let upload = texture(device, "figcraft blur in", (w, h), TextureFormat::Rgba8Unorm, TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST);
     queue.write_texture(
-        TexelCopyTextureInfo { texture: &a, mip_level: 0, origin: Default::default(), aspect: Default::default() },
+        TexelCopyTextureInfo { texture: &upload, mip_level: 0, origin: Default::default(), aspect: Default::default() },
         p.data(),
         TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
         size,
     );
-    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("figcraft blur") });
-    let mut src: &Texture = &a;
-    let mut dst: &Texture = &b;
-    for r in figcraft_render::fx::box_radii(sigma) {
-        for vertical in [false, true] {
-            let mut params = [0u8; 16];
-            params[0..4].copy_from_slice(&(r as u32).to_le_bytes());
-            params[4..8].copy_from_slice(&u32::from(vertical).to_le_bytes());
-            let uniform = device.create_buffer(&BufferDescriptor {
-                label: Some("figcraft blur params"),
-                size: 16,
-                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            queue.write_buffer(&uniform, 0, &params);
-            let bind = device.create_bind_group(&BindGroupDescriptor {
-                label: Some("figcraft blur"),
-                layout: &blur.layout,
-                entries: &[
-                    BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src.create_view(&TextureViewDescriptor::default())) },
-                    BindGroupEntry { binding: 1, resource: uniform.as_entire_binding() },
-                ],
-            });
-            let target = dst.create_view(&TextureViewDescriptor::default());
-            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("figcraft blur"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &target,
-                    resolve_target: None,
-                    ops: Operations { load: LoadOp::Clear(wgpu::Color::TRANSPARENT), store: StoreOp::Store },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&blur.pipeline);
-            pass.set_bind_group(0, &bind, &[]);
-            pass.draw(0..3, 0..1);
-            drop(pass);
-            std::mem::swap(&mut src, &mut dst);
-        }
-    }
+    let source = upload.create_view(&TextureViewDescriptor::default());
+    let Some(done) = boxes(device, queue, blur, &source, (w, h), sigma) else { return false };
     // Rows of a read-back buffer must be a multiple of 256 bytes.
     let row = ((w as usize * 4).div_ceil(256)) * 256;
     let readback = device.create_buffer(&BufferDescriptor {
@@ -229,8 +330,9 @@ pub(crate) fn blur(device: &Device, queue: &Queue, blur: &Blur, p: &mut Pixmap, 
         usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("figcraft blur read-back") });
     encoder.copy_texture_to_buffer(
-        TexelCopyTextureInfo { texture: src, mip_level: 0, origin: Default::default(), aspect: Default::default() },
+        TexelCopyTextureInfo { texture: &done, mip_level: 0, origin: Default::default(), aspect: Default::default() },
         TexelCopyBufferInfo {
             buffer: &readback,
             layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row as u32), rows_per_image: Some(h) },
