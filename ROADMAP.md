@@ -25,7 +25,7 @@ start with [`docs/gaps.md`](docs/gaps.md).
 
 | Audience | Ready % | Opus 5.5 agent wall-clock hours to ~95% | Work that dominates |
 |---|---|---|---|
-| Full target (ready for real work) | ~53% | ~268–522 h | multiplayer (42–84), localization (29–51), plugins (8–26), the interaction pass (40–60), GPU canvas (35–60), AI (30–60), the `.fig` import's tail (5–10) |
+| Full target (ready for real work) | ~53% | ~238–470 h | multiplayer (42–84), localization (29–51), plugins (8–26), the interaction pass (40–60), GPU canvas (5–8, P11 retention; P5–P10 landed), AI (30–60), the `.fig` import's tail (5–10) |
 | Mainstream practitioner | ~50% | ~120–229 h | core editor depth incl. the `.fig` import's tail (49–98), the interaction pass (40–60), real-file corpus and platform QA (25–50), checking the rest of the experimental `.fig` export elsewhere: effects, images, prototypes, real files (5–15) |
 | Essentials user | ~59% | ~55–100 h | the `.fig` import's tail so the files people send open well (5–10), core tool polish (25–45), interaction pass on the core tools (15–25), stability QA (10–20) |
 

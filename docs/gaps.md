@@ -258,29 +258,36 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
   shadow is as faint as it paints and clipped away where the card covers), an opaque stroke (inside,
   centred or outside), rotated corners or children in a clipping frame; inside/outside, per-side,
   dashed, profiled and brush strokes are drawn from the renderer's band. A shadow cast by a group or
-  an ellipse, an inner shadow, grain and a shadow next to another
-  effect still put the page on the CPU, as does a linear gradient whose width handle is skewed
-  (imported files only). A page's
+  an ellipse, and an inner shadow, now go through a layer the GPU blurs with the CPU's own box passes
+  (parity mean 0.066/255 over ellipse, star, polygon, per-corner card, text, group, overflowing
+  frame and inner shadows); a linear gradient whose width handle is skewed (imported files only)
+  still puts the page on the CPU. A page's
   **background blur** reads the page under its node from a texture drawn there (parity 0.049/255).
   **Backdrop effects are drawn in segments** — the layers before a glass pane or blurred layer are
   accumulated in a texture that the effect then reads, so the page under two panes is drawn once:
   glass parity mean 0.061/255 with no pixel off by more than 8, a background blur 0.049/255, and
   the 30-shadowed-card + 3-pane + 2-blur page **6.2 ms a frame at 2400 × 1600** against the CPU's
-  53.6 ms. A segmented page is re-encoded whole each frame, so dragging one layer on it costs
-  12–19 ms against the CPU's 4.3–4.5 ms retained render (its canvas latency is still lower: 17.8
-  against 41 ms, as no pixels cross the bus); cross-frame retention for those pages is the next
-  slice. Spread and translucent shadows, inner shadows, grain, images, masks, a backdrop node
-  nested in a layer and some stroke/text shapes are still refused and stay on the CPU:
-  [`gpu-rasterizer.md`](gpu-rasterizer.md).
+  53.6 ms.
+- **Landed (2026-10-25), P5–P10:** images (every scale mode, rotation, crop, filters), pattern fills,
+  diamond gradients and per-paint blend modes draw from the renderer's own prepared pixmaps
+  (parity 0.066/255); a node's **effect list** — inner shadows, each layer blur (progressive
+  included) and grain, then the drop shadows cast from that result — is one layer on the GPU
+  (0.130/255); **text** is one outline per run with the run's own paints, colour glyphs and glyph
+  strokes (pixel-identical); **masks** are the mask's coverage cut into the run it clips (0.052/255);
+  and a **backdrop effect nested in a group or frame** no longer refuses the page (pixel-identical).
+  Still on the CPU for content: **texture**, a **group's inner shadow**, **plus-darker** (a layer's
+  and a paint's) and **luminance masks**; the editor's outline modes, skipped layers, soft proof and
+  Display P3 stay there by design. A segmented page is still re-encoded whole each frame, so dragging
+  one layer on it costs 12–19 ms against the CPU's 4.3–4.5 ms retained render (its canvas latency is
+  still lower: 17.8 against 41 ms, as no pixels cross the bus); **cross-frame retention for those
+  pages is the next slice** — [`gpu-rasterizer.md`](gpu-rasterizer.md).
 - **Evidence (measured, `cargo xtask bench`):** a 50k-layer page ~8 ms zoomed out with levels of
   detail, single-layer edits at 10k layers ~0.2 ms; full 1440×900 renders 7–15 ms at 10k layers.
   Heavy effects (glass, background blur, noise) and 4K/5K canvases at 2x are where CPU time grows.
 - **Impact:** large files and effect-heavy designs; battery on laptops.
-- **Estimate:** 35–60 h left, in the order the work pays off ([`gpu-rasterizer.md`](gpu-rasterizer.md)
-  P5–P11): image/pattern/diamond paints and per-paint blends (5–9), shadows and inner shadows of any
-  outline incl. groups and text (6–10), effect combinations with grain and progressive blur (6–10),
-  masks and plus-darker (5–8), the text tail (3–6), nested backdrops and outline mode (5–9), and
-  cross-frame retention (5–8).
+- **Estimate:** 5–8 h left ([`gpu-rasterizer.md`](gpu-rasterizer.md) P11): cross-frame retention.
+  P5–P10 landed 2026-10-25; the content left on the CPU is texture, a group's inner shadow,
+  plus-darker and luminance masks, each a pass or a pixel walk of its own.
 
 ### 8. Platform QA: Linux and the browser left
 - **Missing:** regular runs on Linux and the browser; real screen readers; a repeat of the Windows

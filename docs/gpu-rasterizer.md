@@ -413,19 +413,27 @@ named under P7.
 
 ### P11 — performance: cross-frame retention
 
-Coverage first, then speed. A segmented page is re-encoded whole every frame, so dragging one layer
-costs 12–19 ms against the CPU's retained 4–5 ms (its canvas latency is already lower). Keep the
-node's encoded scene and its effect pixels between frames, keyed on the document's subtrees, the
-view and the zoom, as `figcraft_render::layers` does; a drag then re-encodes only what moved, and
-the segments below it are reused.
+Coverage first, then speed. **Not started.** A segmented page is re-encoded whole every frame, so
+dragging one layer costs 12–19 ms against the CPU's retained 4–5 ms (its canvas latency is already
+lower). Keep the node's encoded scene and its effect pixels between frames, keyed on the document's
+subtrees, the view and the zoom, as `figcraft_render::layers` does; a drag then re-encodes only what
+moved, and the segments below it are reused. The shadow and mask caches are the first step of this
+(P6, P8) — what is missing is the *scene* per subtree and per segment.
 
 Tests: a drag benchmark that must beat the CPU's retained renderer on every page in the corpus
 (plain, layer blur, shadows, glass, blurs); a test that a kept segment is dropped when its content
 changes. Exit: the GPU is at or under the CPU's retained frame time everywhere, at full quality.
 
+### What is left on the CPU
+
+Content, after P5–P10: **texture**, a **group's inner shadow**, **`PlusDarker`** (a layer's and a
+paint's), and **luminance masks**. Each is a pass or a pixel walk of its own, named where it is
+planned above (P7, P8). A content file with one of those still re-renders whole on the CPU.
+
 Deliberate exceptions, documented rather than ported: exports (`svg`, `pdf`, `png`/`jpg`), the parity
-suite and the browser keep the CPU renderer; soft proof and Display P3 (above); a machine whose
-adapter cannot run vello (the canvas refuses and says why in `ui.inspect`).
+suite and the browser keep the CPU renderer; the editor's outline modes, skipped layers, soft proof
+and Display P3 (P10); a machine whose adapter cannot run vello (the canvas refuses and says why in
+`ui.inspect`).
 
 ## Test matrix
 
@@ -439,6 +447,7 @@ Run in `cargo xtask ci` unless marked *timing* (release, `--ignored --nocapture`
 | 1d | `the_segmented_page_matches_the_cpu_with_one_glass_pane`, `..._one_background_blur`, `the_gpu_page_matches_with_several_backdrop_layers` | backdrop effects in the accumulated renderer: mean 0.061, 0.049 and 0.725/255 |
 | 1e | `the_gpu_draws_the_paint_variations` | paints: a photo 1:1, fitted, cropped, tiled, rotated, filtered and translucent, a pattern fill, a diamond gradient, multiplied and screened paints (mean 0.066/255, worst 10) |
 | 1f | `the_gpu_draws_shadows_of_any_shape` | shadows of any shape: an ellipse, a star, a polygon, a per-corner card, text, a group, a frame with an overflowing child, inner shadows — with and without spread, and kept between frames (mean 0.066/255, worst 50) |
+| 1g | `the_gpu_draws_styled_text`, `the_gpu_draws_masks`, `the_gpu_draws_nested_backdrops` | styled runs and stroked text (pixel-identical), masks (mean 0.052/255), nested backdrops (pixel-identical) |
 | 2 | `unsupported_pages_fall_back` | the predicate rejects exactly the features not yet ported |
 | 3 | `the_gpu_canvas_reads_back` | screenshot/export path: texture → `Pixmap`, premultiplied, same size |
 | 4 | *timing* `canvas_frame_timings`, `segmented_timings` | CPU vs GPU frame at 2320 × 1440 (plain and heavy) and 2400 × 1600 (backdrop pages) |
