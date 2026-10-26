@@ -2184,8 +2184,8 @@ fn segmented_drag_timings() {
     }
 }
 
-/// The 0 → 300 progressive blur against the CPU: its layer is 1100 × 1200, several strips of the
-/// scan each way, so the strip logic is checked end to end.
+/// The 0 → 300 progressive blur against the CPU: its layer is 1100 × 1200, and each level is
+/// blurred in its own band, so the crops and their blend are checked end to end.
 #[test]
 fn the_gpu_draws_a_progressive_blur() {
     let Some((device, queue)) = device() else {
@@ -2209,6 +2209,64 @@ fn the_gpu_draws_a_progressive_blur() {
     println!("progressive blur parity: worst {worst} at {at:?}, mean {mean:.3}, {over} pixels differ by more than 8");
     assert!(worst <= 96, "a channel differs by {worst} (mean {mean:.3})");
     assert!(mean <= 1.5, "the mean difference is {mean:.3}");
+}
+
+/// The same ramp across the card instead of down it: the levels' bands are then columns, and the
+/// blend reads crops that start a different way across.
+#[test]
+fn the_gpu_draws_a_sideways_progressive_blur() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let mut d = progressive_card_doc(300.0);
+    let p = d.first_page().unwrap();
+    let card = d.node(p).and_then(|p| p.children.get(1).copied());
+    if let Some(id) = card
+        && let Ok(n) = d.get_mut(id)
+        && let Some(figcraft_doc::EffectKind::LayerBlur(b)) = n.effects.first_mut().map(|e| &mut e.kind)
+    {
+        (b.start, b.end) = ((0.0, 0.5), (1.0, 0.5));
+    }
+    let (w, h) = (904u32, 860u32);
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+    let cpu = render_view(&d, p, &view, &Options::default()).unwrap();
+    let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+    let built = {
+        let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+        scene::build_with(&d, p, &view, &mut layers)
+    }
+    .expect("the GPU draws a sideways progressive blur");
+    assert!(canvas.render(&device, &queue, &built, scene::background(&d, p)).is_some());
+    let gpu = canvas.read(&device, &queue).unwrap();
+    let (worst, mean, at, over) = diff(&cpu, &gpu);
+    println!("sideways progressive blur parity: worst {worst} at {at:?}, mean {mean:.3}, {over} pixels differ by more than 8");
+    assert!(worst <= 96, "a channel differs by {worst} (mean {mean:.3})");
+    assert!(mean <= 1.5, "the mean difference is {mean:.3}");
+}
+
+/// The progressive blur's levels are blurred only where their band is (plus their reach): a
+/// 0 → 300 ramp down a 200 × 300 card keeps most of its levels a fraction of the layer's height.
+#[test]
+fn a_progressive_level_blurs_only_its_band() {
+    let levels = figcraft_render::blur::levels(0.0, 150.0);
+    let (w, h) = (1100u32, 1200u32);
+    // The card's ramp in layer pixels: its top edge's middle to its bottom edge's.
+    let (a, b) = ((100.0, 0.0), (100.0, 300.0));
+    let mut total = 0u64;
+    for (k, d) in levels.iter().enumerate() {
+        let reach = (d * 3.0).ceil().clamp(0.0, 8192.0) as u32 + 3;
+        let (x, y, cw, ch) = crate::canvas::level_crop(&levels, k, 0.0, 150.0, a, b, (w, h), reach);
+        assert!(x + cw <= w && y + ch <= h, "level {k}'s crop {x},{y} {cw}×{ch} is inside the layer");
+        assert!(cw > 0 && ch > 0, "level {k} has an empty crop");
+        total += u64::from(cw) * u64::from(ch);
+    }
+    let whole = u64::from(w) * u64::from(h) * levels.len() as u64;
+    println!("progressive crops: {total} of {whole} pixels ({:.0}%)", 100.0 * total as f64 / whole as f64);
+    assert!(total * 3 < whole, "the bands cover {total} of {whole} pixels");
+    // A ramp with no direction keeps the whole layer (there is no band to crop).
+    let (x, y, cw, ch) = crate::canvas::level_crop(&levels, 3, 0.0, 150.0, (0.0, 0.0), (0.0, 0.0), (w, h), 10);
+    assert_eq!((x, y, cw, ch), (0, 0, w, h));
 }
 
 /// A 200 × 300 card with a progressive blur from 0 to `radius`, over a plain ground.

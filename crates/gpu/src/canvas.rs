@@ -587,26 +587,63 @@ impl crate::scene::Layers for GpuLayers<'_> {
         }
         let deviations = figcraft_render::blur::levels(s0.min(s1), s0.max(s1));
         let size = layer.size;
+        let t0 = std::time::Instant::now();
         // The levels and their blend reach the device in one submission (with their scratch kept
         // until it lands): a submit a pass made the canvas queue a dozen of them a frame, and in
         // the app each of those waited behind the window's own submits.
         let source = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("figcraft progressive blur") });
-        let mut levels: Vec<Texture> = Vec::with_capacity(deviations.len());
+        let mut levels: Vec<(Texture, (i32, i32))> = Vec::with_capacity(deviations.len());
         let mut after: Vec<Texture> = Vec::new();
-        for d in &deviations {
+        // One running-sums texture for every level: its passes run one after another, and eight of
+        // its size would be most of the pool (and of the memory a drag holds).
+        let sums = self.canvas.blur.take_sums(self.device, size);
+        for (k, d) in deviations.iter().enumerate() {
             if !d.is_finite() || *d <= 0.3 {
                 // The renderer leaves a blur this small out: the layer itself is the level.
-                levels.push(texture.clone());
+                levels.push((texture.clone(), (0, 0)));
             } else {
-                let (level, scratch) = crate::blur::blur_texture_in(self.device, self.queue, &self.canvas.blur, &mut encoder, &source, size, *d)?;
-                levels.push(level.clone());
+                // Only the pixels that use this level (plus its blur's reach) are blurred: an
+                // 0 → 300 ramp on a 200 × 300 card blurs a few hundred rows a level instead of the
+                // whole 1100 × 1200 layer eight times (the renderer crops the same way).
+                let reach = (d * 3.0).ceil().clamp(0.0, 8192.0) as u32 + 3;
+                let (x, y, w, h) = level_crop(&deviations, k, s0, s1, a, b, size, reach);
+                let (level, scratch) = crate::blur::blur_texture_in(
+                    self.device,
+                    self.queue,
+                    &self.canvas.blur,
+                    &mut encoder,
+                    &source,
+                    (x, y),
+                    (w, h),
+                    *d,
+                    sums.as_ref(),
+                )?;
+                levels.push((level.clone(), (x as i32, y as i32)));
                 after.push(level);
                 after.extend(scratch);
             }
         }
+        after.extend(sums);
         let out = self.canvas.mix.encode(self.device, self.queue, &mut encoder, &levels, &deviations, (s0, s1, a, b), size)?;
-        self.queue.submit([encoder.finish()]);
+        let encoded = t0.elapsed().as_secs_f64() * 1000.0;
+        let t1 = std::time::Instant::now();
+        let cb = encoder.finish();
+        let finish = t1.elapsed().as_secs_f64() * 1000.0;
+        let t2 = std::time::Instant::now();
+        self.queue.submit([cb]);
+        let submit = t2.elapsed().as_secs_f64() * 1000.0;
+        if std::env::var("FIGCRAFT_PRESENT_LOG").is_ok() {
+            // What the device takes for the chain the submission queued (a stall either way).
+            let t3 = std::time::Instant::now();
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            eprintln!(
+                "progressive {:?}: {} levels encoded {encoded:.1}, finish {finish:.1}, submit {submit:.1}, device {:.1} ms",
+                size,
+                levels.len(),
+                t3.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         // The levels and scratch are made again next frame: keep their textures for it.
         for texture in after {
             self.canvas.blur.give_back(texture);
@@ -722,6 +759,77 @@ impl GpuLayers<'_> {
         let glass = self.canvas.glass.paint_texture(self.device, self.queue, pane, &frosted_view)?;
         Some(self.canvas.as_layer(glass))
     }
+}
+
+/// The pixels of a progressive blur's `k`th level (its index in `levels`) that the blend can pick,
+/// plus `reach` for the blur's own reading, as `(x, y, w, h)` in the layer: level `k` is used
+/// where the ramp's standard deviation lies between its neighbours', which is a band across the
+/// ramp (`figcraft_render::blur::brackets`). A ramp with no direction (or a level the ramp never
+/// reaches) keeps the whole layer, which is always right.
+pub(crate) fn level_crop(
+    levels: &[f64],
+    k: usize,
+    s0: f64,
+    s1: f64,
+    a: (f64, f64),
+    b: (f64, f64),
+    (w, h): (u32, u32),
+    reach: u32,
+) -> (u32, u32, u32, u32) {
+    let full = (0, 0, w.max(1), h.max(1));
+    let lo = if k == 0 {
+        f64::NEG_INFINITY
+    } else {
+        match levels.get(k - 1) {
+            Some(v) => *v,
+            None => return full,
+        }
+    };
+    let hi = levels.get(k + 1).copied().unwrap_or(f64::INFINITY);
+    let d = s1 - s0;
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len2 = dx * dx + dy * dy;
+    let finite = [d, len2, a.0, a.1, b.0, b.1].iter().all(|v| v.is_finite());
+    if !finite || d.abs() < 1e-9 || len2 <= 1e-12 {
+        return full;
+    }
+    let (tx, ty) = (dx / len2, dy / len2);
+    // The ramp's `t` at a pixel, as the blend works it out (`mix.wgsl`).
+    let t0 = (0.5 - a.0) * tx + (0.5 - a.1) * ty + 0.5 * tx + 0.5 * ty;
+    // The band in `t` where the deviation is between the neighbours' (cut to the ramp's own range).
+    let (mut lt, mut ht) = ((lo - s0) / d, (hi - s0) / d);
+    if lt > ht {
+        std::mem::swap(&mut lt, &mut ht);
+    }
+    let (lt, ht) = (lt.max(0.0), ht.min(1.0));
+    if !(ht >= lt) {
+        // The ramp never reaches this level: nothing to blur (the blend never picks it).
+        return (0, 0, 1, 1);
+    }
+    let (wf, hf) = (f64::from(w.max(1) - 1), f64::from(h.max(1) - 1));
+    let (xf0, xf1) = (0.0f64.min(wf * tx), 0.0f64.max(wf * tx));
+    let (yf0, yf1) = (0.0f64.min(hf * ty), 0.0f64.max(hf * ty));
+    let xs = between(lt - t0 - yf1, ht - t0 - yf0, tx, wf);
+    let ys = between(lt - t0 - xf1, ht - t0 - xf0, ty, hf);
+    let pad = f64::from(reach);
+    let (x0, x1) = ((xs.0 - pad).floor().max(0.0), (xs.1 + pad).ceil().min(wf));
+    let (y0, y1) = ((ys.0 - pad).floor().max(0.0), (ys.1 + pad).ceil().min(hf));
+    let x0 = x0.min(wf);
+    let y0 = y0.min(hf);
+    let cw = (x1 - x0).max(0.0) as u32 + 1;
+    let ch = (y1 - y0).max(0.0) as u32 + 1;
+    (x0 as u32, y0 as u32, cw, ch)
+}
+
+/// The range of `x` where `x * t` lies between `lo` and `hi`, cut to `[0, limit]` (the whole
+/// range when the ramp has no component along the axis).
+fn between(lo: f64, hi: f64, t: f64, limit: f64) -> (f64, f64) {
+    if !t.is_finite() || t.abs() < 1e-12 {
+        return (0.0, limit);
+    }
+    let (u, v) = (lo / t, hi / t);
+    let (a, b) = if u <= v { (u, v) } else { (v, u) };
+    (a.max(0.0).min(limit), b.max(0.0).min(limit))
 }
 
 /// A `(w, h)` copy of `src` starting at `(x, y)`, transparent where it lies outside `src`.
@@ -937,6 +1045,8 @@ fn refusal(reason: &'static str) -> Option<Frame> {
 /// Draw page `page` of `doc` through `view` on the GPU, when the page is in the scene builder's
 /// feature set (see [`crate::scene::supported`]); `None` leaves the frame to the CPU renderer.
 pub fn present(doc: &Document, page: NodeId, view: &View) -> Option<Frame> {
+    let t0 = std::time::Instant::now();
+    let log = std::env::var("FIGCRAFT_PRESENT_LOG").is_ok();
     let Some(backend) = backend() else { return refusal("not installed") };
     // An animated image's frame changes under a document that did not: the CPU plays it.
     if figcraft_render::images::animation_clock(doc, page, 0.0).is_some() {
@@ -944,6 +1054,7 @@ pub fn present(doc: &Document, page: NodeId, view: &View) -> Option<Frame> {
     }
     let background = crate::scene::background(doc, page);
     let Ok(mut slot) = backend.canvas.lock() else { return refusal("canvas is busy") };
+    let locked = t0.elapsed().as_secs_f64() * 1000.0;
     if slot.is_none() {
         let Some(canvas) = CanvasGpu::new(&backend.device, view.width, view.height) else {
             return refusal("the GPU can't run the rasterizer");
@@ -956,6 +1067,7 @@ pub fn present(doc: &Document, page: NodeId, view: &View) -> Option<Frame> {
         Ok(plan) => plan,
         Err(e) => return refusal(e.reason()),
     };
+    let planned = t0.elapsed().as_secs_f64() * 1000.0;
     // A page with a backdrop node or a plus-darker layer is drawn in segments (a container with a
     // nested backdrop is a step of its own there too, so the layers before it are kept).
     let segmented = plan.iter().any(|s| matches!(s, crate::scene::Step::Backdrop(_) | crate::scene::Step::PlusDarker(_)));
@@ -973,9 +1085,23 @@ pub fn present(doc: &Document, page: NodeId, view: &View) -> Option<Frame> {
                 Err(e) => return refusal(e.reason()),
             }
         };
+        let built = t0.elapsed().as_secs_f64() * 1000.0;
         let Some(texture) = canvas.render(&backend.device, &backend.queue, &scene, background) else {
             return refusal("draw failed");
         };
+        if log {
+            let _ = backend.device.poll(wgpu::PollType::wait_indefinitely());
+            eprintln!(
+                "present {}×{} scale {:.3} origin {:?}: lock {locked:.1}, plan {:.1}, build {:.1}, render {:.1} ms",
+                view.width,
+                view.height,
+                view.scale,
+                view.origin,
+                planned - locked,
+                built - planned,
+                t0.elapsed().as_secs_f64() * 1000.0 - built
+            );
+        }
         texture
     };
     let frame = Frame { view: view.clone(), texture, slot: canvas.slot(), generation: canvas.generation() };

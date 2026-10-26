@@ -70,16 +70,17 @@ impl Mix {
         Some(Self { pipeline, layout })
     }
 
-    /// The blend of `levels` (their standard deviations, nearest first) at a ramp from `s0` at the
-    /// pixel point `a` to `s1` at `b` into `encoder`: the caller submits, with the levels' own
-    /// passes, so a progressive blur reaches the device in one submission.
+    /// The blend of `levels` (their standard deviations, nearest first, and each one's top-left in
+    /// the layer: a level is blurred only where it is used) at a ramp from `s0` at the pixel point
+    /// `a` to `s1` at `b` into `encoder`: the caller submits, with the levels' own passes, so a
+    /// progressive blur reaches the device in one submission.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode(
         &self,
         device: &Device,
         queue: &Queue,
         encoder: &mut CommandEncoder,
-        levels: &[Texture],
+        levels: &[(Texture, (i32, i32))],
         deviations: &[f64],
         (s0, s1, a, b): (f64, f64, (f64, f64), (f64, f64)),
         size: (u32, u32),
@@ -91,7 +92,8 @@ impl Mix {
         let d = (b.0 - a.0, b.1 - a.1);
         let len2 = d.0 * d.0 + d.1 * d.1;
         let (tx, ty) = if len2.is_finite() && len2 > 1e-12 { (d.0 / len2, d.1 / len2) } else { (0.0, 0.0) };
-        let mut params = [0u8; 64];
+        // The levels (32 bytes), the ramp, and two levels' top-lefts to a 16-byte row.
+        let mut params = [0u8; 128];
         for (i, v) in deviations.iter().take(MAX_LEVELS).enumerate() {
             params[i * 4..i * 4 + 4].copy_from_slice(&(*v as f32).to_le_bytes());
         }
@@ -99,16 +101,21 @@ impl Mix {
         for (i, v) in values.iter().enumerate() {
             params[32 + i * 4..36 + i * 4].copy_from_slice(&v.to_le_bytes());
         }
+        for (i, (_, (x, y))) in levels.iter().take(MAX_LEVELS).enumerate() {
+            let at = 64 + (i / 2) * 16 + (i % 2) * 8;
+            params[at..at + 4].copy_from_slice(&(*x as f32).to_le_bytes());
+            params[at + 4..at + 8].copy_from_slice(&(*y as f32).to_le_bytes());
+        }
         let uniform = device.create_buffer(&BufferDescriptor {
             label: Some("figcraft progressive blur"),
-            size: 64,
+            size: 128,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         queue.write_buffer(&uniform, 0, &params);
         // Every slot is bound: unused ones read the first level (their index is never picked).
         let views: Vec<wgpu::TextureView> =
-            (0..MAX_LEVELS).map(|i| levels.get(i).unwrap_or(&levels[0]).create_view(&TextureViewDescriptor::default())).collect();
+            (0..MAX_LEVELS).map(|i| levels.get(i).unwrap_or(&levels[0]).0.create_view(&TextureViewDescriptor::default())).collect();
         let mut entries = vec![BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() }];
         entries
             .extend(views.iter().enumerate().map(|(i, v)| BindGroupEntry { binding: 1 + i as u32, resource: wgpu::BindingResource::TextureView(v) }));

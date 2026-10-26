@@ -13,7 +13,12 @@ struct Params {
     t0: f32,
     tx: f32,
     ty: f32,
-    _pad: f32,
+    _pad0: f32,
+    _pad1: f32,
+    // Each level's top-left in the layer: a level is blurred only where it is used, plus its
+    // reach, so its texture is that crop (the blend reads it at the pixel less the crop). Two
+    // levels to a `vec4`.
+    offsets: array<vec4<f32>, 4>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -32,16 +37,28 @@ fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     return vec4<f32>(q * 2.0 - 1.0, 0.0, 1.0);
 }
 
+// `c` in `t`'s own pixels (past its edges reads the edge, where no weight is left).
+fn load(t: texture_2d<f32>, c: vec2<i32>) -> vec4<f32> {
+    let last = vec2<i32>(textureDimensions(t)) - 1;
+    return textureLoad(t, clamp(c, vec2<i32>(0), max(last, vec2<i32>(0))), 0);
+}
+
+fn offset_at(k: i32) -> vec2<i32> {
+    let v = params.offsets[k / 2];
+    return vec2<i32>(select(v.xy, v.zw, (k % 2) == 1));
+}
+
 fn at_level(k: i32, c: vec2<i32>) -> vec4<f32> {
+    let q = c - offset_at(k);
     switch k {
-        case 0: { return textureLoad(level0, c, 0); }
-        case 1: { return textureLoad(level1, c, 0); }
-        case 2: { return textureLoad(level2, c, 0); }
-        case 3: { return textureLoad(level3, c, 0); }
-        case 4: { return textureLoad(level4, c, 0); }
-        case 5: { return textureLoad(level5, c, 0); }
-        case 6: { return textureLoad(level6, c, 0); }
-        default: { return textureLoad(level7, c, 0); }
+        case 0: { return load(level0, q); }
+        case 1: { return load(level1, q); }
+        case 2: { return load(level2, q); }
+        case 3: { return load(level3, q); }
+        case 4: { return load(level4, q); }
+        case 5: { return load(level5, q); }
+        case 6: { return load(level6, q); }
+        default: { return load(level7, q); }
     }
 }
 

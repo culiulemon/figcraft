@@ -107,12 +107,15 @@ the CPU render within the parity tolerance; toggling the setting changes nothing
   composited with the node's opacity and blend mode; the pixels never leave the device. Parity
   (`the_gpu_layer_blur_matches_the_cpu_render`): mean channel difference 0.047/255, worst 33 on a
   blurred antialiased edge.
-- A box pass is **O(1) a pixel whatever the radius** (since 2026-10-26): a compute pass gives every
-  pixel the running sum along its line — one workgroup a line, a tile of 256 pixels at a time, a
-  strip of 256 lines a dispatch — and a pass takes the window's average as the difference of two
-  running sums (`blur.wgsl`). Before, each pixel read its whole window, so a 0 → 300 progressive
-  blur read some 5 × 10⁸ texels a frame and a weaker GPU dropped to a crawl; now the radius costs
-  nothing (numbers under P7). A device without compute falls back to reading the window directly.
+- A box pass is **O(1) a pixel whatever the radius**, in **one dispatch** (since 2026-10-26): a
+  workgroup takes 256 pixels of a line with the halo their windows read (up to 256 pixels a side),
+  scans the halo in shared memory, and writes the averages straight into the next texture
+  (`blur.wgsl`'s `box`) — no running-sums texture between passes. A radius past the halo (a blur
+  wider than ~500 document pixels at 100%) falls back to `scan` + `fs_box`: the running sum along
+  each line, and the window's average as the difference of two of them. Before, each pixel read its
+  whole window, so a 0 → 300 progressive blur read some 5 × 10⁸ texels a frame and a weaker GPU
+  dropped to a crawl; now the radius costs nothing (numbers under P7). A device without compute
+  falls back to reading the window directly.
 - Landed: **drop shadows** on rounded rectangles and frames (the common card): the shadow is vello's
   blurred rounded rect — the card's own outline, offset and blurred — drawn under the card, which
   hides it exactly where the CPU masks it. No offscreen layer, so a page of shadowed cards costs
@@ -338,7 +341,11 @@ drop shadows is drawn as one layer, in that order (`Builder::layer_pipeline`):
 - Each **layer blur** in the list is applied in order: a uniform one is the GPU's box blur, a
   **progressive** one is the renderer's own levels — `figcraft_render::blur::levels` of uniform
   blurs, mixed per pixel by `mix.wgsl` from the ramp (`bracket`'s two levels at that pixel) — so a
-  ramp of any steepness costs at most eight blurs and one pass.
+  ramp of any steepness costs at most eight blurs and one pass. Each level is blurred **only in the
+  band that uses it** (the ramp's deviation between its neighbours', plus the blur's reach), as the
+  renderer crops its own: a 0 → 300 ramp on a 200 × 300 card blurs 1.5 M pixels across all eight
+  levels instead of 10.6 M, and the blend reads each level at its own top-left
+  (`mix.wgsl`'s offsets; `a_progressive_level_blurs_only_its_band`).
 - **Grain** is the renderer's own noise: the layer's pixels are read back once, `grain::grains`
   works them out on the CPU (the grains are a hash of the cell and the node, so they land exactly
   where an export's do), and the pass draws them over the layer in the noise's blend mode.
@@ -381,7 +388,7 @@ same doc):
 
 Doubling the ramp barely moves the GPU frame (the layer's own pixels grow, not the window's taps);
 the CPU's four-box-per-level cost doubles. `the_gpu_draws_a_progressive_blur` checks the 0 → 300
-case (a 1100 × 1200 layer, five strips of the scan each way) against the CPU: mean 0.135/255, worst
+case (a 1100 × 1200 layer, each level blurred in its band) against the CPU: mean 0.135/255, worst
 30, 212 pixels off by more than 8. A progressive blur whose layer is past 6 M pixels (0 → 1250 on
 that card, or the same blur at 300% zoom) stays on the CPU: its eight full-size levels would cost
 hundreds of megabytes of device memory, and some drivers refuse the allocation.
@@ -560,7 +567,7 @@ Run in `cargo xtask ci` unless marked *timing* (release, `--ignored --nocapture`
 |---|---|---|
 | 1 | `the_gpu_canvas_matches_the_cpu_render` | pixel parity per feature: shapes, radii, gradients, text, opacity, blend, strokes |
 | 1b | `the_gpu_text_matches_the_cpu_render` | text is pixel-identical (measured: 0 differing bytes) |
-| 1c | `the_gpu_layer_blur_matches_the_cpu_render`, `the_gpu_drop_shadow_matches_the_cpu_render`, `the_gpu_draws_the_shadow_variations`, `the_gpu_draws_a_progressive_blur` | effects: mean 0.011, 0.044 and 0.512/255 (the last with spread, two shadows, a stroke, a gradient card, a clipped frame and a rotation); a 0 → 300 progressive blur over a 1100 × 1200 layer (striped scans): mean 0.135/255, worst 30 |
+| 1c | `the_gpu_layer_blur_matches_the_cpu_render`, `the_gpu_drop_shadow_matches_the_cpu_render`, `the_gpu_draws_the_shadow_variations`, `the_gpu_draws_a_progressive_blur`, `the_gpu_draws_a_sideways_progressive_blur` | effects: mean 0.011, 0.044 and 0.512/255 (the last with spread, two shadows, a stroke, a gradient card, a clipped frame and a rotation); a 0 → 300 progressive blur over a 1100 × 1200 layer, down the card and across it (bands of crops): mean 0.135/255, worst 30 |
 | 1d | `the_segmented_page_matches_the_cpu_with_one_glass_pane`, `..._one_background_blur`, `the_gpu_page_matches_with_several_backdrop_layers` | backdrop effects in the accumulated renderer: mean 0.061, 0.049 and 0.725/255 |
 | 1e | `the_gpu_draws_the_paint_variations` | paints: a photo 1:1, fitted, cropped, tiled, rotated, filtered and translucent, a pattern fill, a diamond gradient, multiplied and screened paints (mean 0.066/255, worst 10) |
 | 1f | `the_gpu_draws_shadows_of_any_shape`, `the_gpu_draws_the_texture_effect` | shadows of any shape: an ellipse, a star, a polygon, a per-corner card, text, a group, a frame with an overflowing child, inner shadows on shapes and a group's — with and without spread, and kept between frames (mean 0.130/255, worst 50); texture: a rough card, one clipped to its shape, one in a list with a blur and a shadow (mean 0.126/255, worst 92 on antialiased edges) |
@@ -790,15 +797,38 @@ stays on the fallback list.
   0.3 ms of rendering and 0.5 ms of wait; only the first frame of a new canvas pays its pipelines
   (110–170 ms). The progressive blur's device-memory ceiling is 6 M pixels, so the same card stays
   on the GPU at 200% zoom (~220 MB of levels).
-- 2026-10-26: **the box passes are O(1) a pixel.** A 200 × 300 card with a progressive blur from 0
-  to 300 (the radius the acceptance pass found laggy) dragged at 2400 × 1600 costs 0.83 ms a frame
-  where a full CPU render takes 252; 0 → 600 costs 1.07 ms against 1042 — the radius no longer
-  costs the GPU anything (`progressive_drag_timings`). The passes now take the window's sum from a
-  compute scan's running sums (`blur.wgsl`, a strip of 256 lines a dispatch, so the sums stay
-  small); a device without compute keeps the old window-reading pass.
-  `the_gpu_draws_a_progressive_blur` (a 1100 × 1200 layer, five strips each way): mean 0.135/255,
-  worst 30. A progressive blur whose layer is past 4.5 M pixels stays on the CPU (eight full-size
-  levels would cost hundreds of MB of device memory; some drivers abort on the allocation).
+- 2026-10-26: **the box passes are O(1) a pixel, in one dispatch.** A 200 × 300 card with a
+  progressive blur from 0 to 300 (the radius the acceptance pass found laggy) dragged at
+  2400 × 1600 costs 0.83 ms a frame where a full CPU render takes 252; 0 → 600 costs 1.07 ms
+  against 1042 — the radius no longer costs the GPU anything (`progressive_drag_timings`). Each
+  pass is one compute dispatch: a workgroup scans 256 pixels of a line and their halo (up to 256
+  a side) in shared memory and writes the averages straight out (`blur.wgsl`'s `box`); a radius
+  past the halo uses the running-sum `scan` + `fs_box` pair, and a device without compute keeps
+  the window-reading pass. `the_gpu_draws_a_progressive_blur` (a 1100 × 1200 layer):
+  mean 0.135/255, worst 30 — the same pixels as the strip version, which is the point: the
+  speedups below changed no output. `the_gpu_draws_a_sideways_progressive_blur` covers the ramp
+  across the card, where the levels' bands are columns and the crops start differently along x. A
+  progressive blur whose layer is past 6 M pixels stays on the CPU (eight levels would cost
+  hundreds of MB of device memory; some drivers abort on the allocation).
+- 2026-10-26: **a dragged blurred card reaches 60 fps in the app.** The acceptance case (200 × 300
+  card, progressive 0 → 300, 100% zoom, release app driven through the control channel) went from
+  **8 fps** to about **60**: 141 canvas frames in 2.31 s while the pointer moved 154 pixels a
+  second (the render thread skips to the newest job, so this is what the window shows), with only
+  six of them rebuilding the blur — the rest drew the kept layer at its new place. A rebuilding
+  frame is now 24–60 ms (it was 76–124 ms, and 250–370 ms before the pools), of which the blur's
+  encode is 0.4 ms, the command buffer's recording 1–30 ms and the vello draw 3–7 ms. Three
+  changes, in order of what they bought:
+  - **Only the pixels a level is used in are blurred** (`canvas::level_crop`): the ramp's bands,
+    plus 3σ + 3 of reach, cropped per level. 1.5 M pixels of crops against 10.6 M before; the
+    parity above is unchanged, and `a_progressive_level_blurs_only_its_band` pins the crop.
+  - **A box pass is one dispatch** (the halo in shared memory), not a scan pass plus an average
+    pass: 48 dispatches a frame instead of 96 plus a 21 MB running-sums texture read and written
+    twice a pass. Device time for the whole progressive blur fell from ~50 ms to 12–18 ms, which
+    is what a whole canvas frame now costs.
+  - **One parameters buffer with dynamic offsets** for a level's six passes, and one running-sums
+    texture shared by all eight levels, instead of a buffer an allocation and a texture a level.
+  What is left of the frame is not the blur: `queue.submit` is under a millisecond, and the
+  remainder is vello drawing the 1.1 M-pixel canvas plus the driver's command recording.
 - 2026-10-26: **texture landed.** A texture effect is the renderer's own pixel scatter: the layer's
   pixels are read back once, `grain::texture` moves each grain's pixel by its hashed jitter, and the
   result replaces the layer before the drop shadows are cast from it.
