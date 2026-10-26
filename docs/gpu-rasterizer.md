@@ -354,15 +354,25 @@ Exit: any single node's effect list draws on the GPU — met apart from the thre
 
 ### P8 — masks and plus-darker
 
-- **Masks** (alpha, luminance, outline): the mask node's coverage into a texture; the masked
-  siblings drawn into a layer; one pass multiplies the layer by the mask (the `compose` pipeline
-  with a second input). Layers that a mask hides are not drawn.
-- **`PlusDarker`**: no vello blend mode; composite the node's (or paint's) layer with a small pass
-  of the CPU's formula.
-- The editor's **mask outlines** stay an egui overlay.
+**Landed (masks).** A mask and the siblings it clips — its paint run, from the mask up to the next
+one, as `Document::paint_runs_of` gives it — are drawn in a layer of their own:
 
-Tests: parity for each mask type, a mask over a group, a text mask, and a plus-darker layer and
-paint. Exit: masked pages draw on the GPU.
+- The run's bounds (`layer_bounds` a node at a time, unioned and clipped to the view) set the layer's
+  rectangle; the mask and the run are built for a view whose origin is that layer's corner, so
+  anything inside them (an effect, a nested mask, text) lands on the layer's own grid.
+- The mask's **coverage** is its own paint (alpha), or its outline filled solid (vector); a
+  **luminance** mask is still the CPU's.
+- The pass is vello's own `Compose::SrcIn`: the coverage drawn first, the run over it in a
+  `SrcIn` layer — `source × destination's alpha`, which is the CPU's mask multiply. No new shader.
+- The result is keyed on the mask's subtree, the view and the zoom, and kept between frames.
+
+**Still on the CPU**: luminance masks, `PlusDarker` (vello has no such blend mode; the CPU's formula
+needs its own pass) and the editor's mask outlines (an egui overlay).
+
+Tests: `the_gpu_draws_masks` — an ellipse mask over a card inside a frame, a vector mask in a group,
+and a mask inside a group: mean 0.052/255, worst 57 on the mask's edges (vello's coverage against
+tiny-skia's mask sampling), 0.18% of pixels off by more than 8.
+Exit: masked pages draw on the GPU — met apart from luminance masks and plus-darker.
 
 ### P9 — the text tail
 
@@ -590,4 +600,12 @@ stays on the fallback list.
   - `the_gpu_draws_styled_text`: a coloured run and a stroked heading — pixel-identical to the CPU.
   - No text falls back any more; what is left is `Unsupported::Mask` (a text node masked, P8), and
     soft proof / Display P3 (P10).
+- 2026-10-25: **P8 landed — masks.** A mask and the siblings it clips are one layer: the mask's
+  coverage (its paint, or its outline for a vector mask) and the run, cut by vello's own
+  `Compose::SrcIn` (`source × destination's alpha` — the CPU's mask multiply, no new shader). The
+  run's bounds set the layer, and the sub-scenes are built for a view whose origin is that layer's
+  corner, so effects, text and nested masks inside land on its grid.
+  - `the_gpu_draws_masks`: an ellipse mask over a card in a frame, a vector mask in a group, a mask
+    in a group — mean 0.052/255, worst 57 on mask edges, 0.18% of pixels off by more than 8.
+  - Luminance masks and `PlusDarker` stay on the CPU.
 

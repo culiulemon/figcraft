@@ -1315,6 +1315,91 @@ fn the_gpu_draws_styled_text() {
     assert!(mean <= 1.0, "the mean difference is {mean:.3}");
 }
 
+/// Masks: a layer clipped by an ellipse above it, a vector mask, and a mask inside a group.
+fn mask_doc() -> Document {
+    let mut d = Document::new("gpu masks");
+    let p = d.first_page().unwrap();
+    let hex = |s: &str| Color::from_hex(s).unwrap_or(Color::WHITE);
+    let frame = d.create(p, NodeKind::Frame, "masked", 20.0, 20.0, 300.0, 200.0).unwrap();
+    d.get_mut(frame).unwrap().fills = vec![Paint::solid(hex("FFFFFF"))];
+    let mut card = |d: &mut Document, parent, name: &str, x: f64, y: f64, w: f64, h: f64, color: &str| {
+        let id = d.create(parent, NodeKind::Rectangle, name, x, y, w, h).unwrap();
+        d.get_mut(id).unwrap().fills = vec![Paint::solid(Color::from_hex(color).unwrap_or(Color::WHITE))];
+        d.get_mut(id).unwrap().corners.radii = [12.0; 4];
+        id
+    };
+    card(&mut d, frame, "under", 0.0, 0.0, 300.0, 200.0, "E8F0FF");
+    let mask = d.create(frame, NodeKind::Ellipse { start: 0.0, sweep: std::f64::consts::TAU, inner: 0.0 }, "mask", 40.0, 20.0, 220.0, 160.0).unwrap();
+    d.get_mut(mask).unwrap().fills = vec![Paint::solid(hex("FFFFFF"))];
+    d.get_mut(mask).unwrap().is_mask = true;
+    card(&mut d, frame, "over", 0.0, 0.0, 300.0, 200.0, "F06030");
+
+    // A vector mask: the outline of the node clips what is above it.
+    let group = d.create(p, NodeKind::Group, "vector masked", 360.0, 20.0, 220.0, 160.0).unwrap();
+    card(&mut d, group, "vector content", 0.0, 0.0, 220.0, 160.0, "30C080");
+    let vector = d.create(group, NodeKind::Rectangle, "vector mask", 20.0, 20.0, 180.0, 120.0).unwrap();
+    {
+        let n = d.get_mut(vector).unwrap();
+        n.fills = vec![Paint::solid(hex("FFFFFF"))];
+        n.corners.radii = [30.0; 4];
+        n.is_mask = true;
+        n.mask_type = figcraft_doc::MaskType::Vector;
+    }
+    card(&mut d, group, "vector over", 0.0, 0.0, 220.0, 160.0, "2050C0");
+
+    // A mask inside a group, masking a card above it.
+    let inner = d.create(p, NodeKind::Group, "nested", 360.0, 220.0, 220.0, 160.0).unwrap();
+    card(&mut d, inner, "nested content", 0.0, 0.0, 220.0, 160.0, "FFD040");
+    let star = d.create(inner, NodeKind::Rectangle, "nested mask", 20.0, 20.0, 160.0, 120.0).unwrap();
+    {
+        let n = d.get_mut(star).unwrap();
+        n.fills = vec![Paint::solid(hex("FFFFFF"))];
+        n.corners.radii = [60.0; 4];
+        n.is_mask = true;
+    }
+    card(&mut d, inner, "nested over", 0.0, 0.0, 220.0, 160.0, "8040E0");
+    d
+}
+
+#[test]
+fn the_gpu_draws_masks() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let d = mask_doc();
+    let p = d.first_page().unwrap();
+    assert_eq!(scene::supported(&d, p), Ok(()), "masks stay on the GPU");
+    let (w, h) = PARITY;
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+    let cpu = render_view(&d, p, &view, &Options::default()).unwrap();
+    let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+    let built = {
+        let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+        scene::build_with(&d, p, &view, &mut layers)
+    }
+    .expect("the GPU draws the masks");
+    assert!(canvas.render(&device, &queue, &built, scene::background(&d, p)).is_some());
+    let gpu = canvas.read(&device, &queue).unwrap();
+    let (worst, mean, at, over) = diff(&cpu, &gpu);
+    let px = |p: &Pixmap, (x, y): (u32, u32)| {
+        let i = ((y as usize * p.width() as usize) + x as usize) * 4;
+        p.data().get(i..i + 4).map(<[u8]>::to_vec)
+    };
+    println!(
+        "mask parity: worst {worst} at {at:?} (CPU {:?}, GPU {:?}), mean {mean:.3}, {over} pixels differ by more than 8",
+        px(&cpu, at),
+        px(&gpu, at)
+    );
+    if std::env::var("FIGCRAFT_REGIONS").is_ok() {
+        for (x, y) in [(164u32, 140u32), (30, 30), (170, 120), (460, 100), (470, 300)] {
+            println!("  mask {x},{y}: CPU {:?} GPU {:?}", px(&cpu, (x, y)), px(&gpu, (x, y)));
+        }
+    }
+    assert!(worst <= 96, "a channel differs by {worst} (mean {mean:.3})");
+    assert!(mean <= 0.6, "the mean difference is {mean:.3}");
+}
+
 #[test]
 fn the_gpu_canvas_reads_back() {
     let Some((device, queue)) = device() else {

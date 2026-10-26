@@ -182,7 +182,7 @@ fn subtree_backdrop(doc: &Document, id: NodeId, depth: usize) -> bool {
 
 /// Draw `ids` (children of `page`, in order) into `out`.
 pub fn draw_into(doc: &Document, page: NodeId, view: &View, layers: &mut dyn Layers, ids: &[NodeId], out: &mut Scene) -> Result<(), Unsupported> {
-    let mut b = Builder { doc, scene: Some(Scene::new()), layers, view: view.clone(), page, hidden: Vec::new(), no_strokes: Vec::new() };
+    let mut b = Builder { doc, scene: Some(Scene::new()), layers, view: view.clone(), page, hidden: Vec::new(), no_strokes: Vec::new(), as_content: Vec::new() };
     for id in ids {
         b.node(*id, view.transform(), 0)?;
     }
@@ -210,7 +210,7 @@ pub fn draw_backdrop_into(
         return Err(Unsupported::Mask);
     }
     let Some(effect) = backdrop_of(n) else { return Err(Unsupported::Effect) };
-    let mut b = Builder { doc, scene: Some(Scene::new()), layers, view: view.clone(), page, hidden: Vec::new(), no_strokes: Vec::new() };
+    let mut b = Builder { doc, scene: Some(Scene::new()), layers, view: view.clone(), page, hidden: Vec::new(), no_strokes: Vec::new(), as_content: Vec::new() };
     // A blur's pixels are its padded layer (a rectangle, so the shape clips them); a pane's pixels
     // are its layer, with the shape's own coverage in the alpha.
     let place = match effect {
@@ -394,7 +394,7 @@ impl Layers for NoLayers {
 pub fn supported(doc: &Document, page: NodeId) -> Result<(), Unsupported> {
     let mut probe = Probe;
     let view = View { origin: (0.0, 0.0), scale: 1.0, width: 1, height: 1 };
-    let mut b = Builder { doc, scene: None, layers: &mut probe, view, page, hidden: Vec::new(), no_strokes: Vec::new() };
+    let mut b = Builder { doc, scene: None, layers: &mut probe, view, page, hidden: Vec::new(), no_strokes: Vec::new(), as_content: Vec::new() };
     b.children(page, Affine::IDENTITY, 0)
 }
 
@@ -406,7 +406,7 @@ pub fn build(doc: &Document, page: NodeId, view: &View) -> Result<Scene, Unsuppo
 /// Draw page `page` of `doc` as seen through `view` into a vello scene, drawing effect layers
 /// through `layers` (the GPU canvas).
 pub fn build_with(doc: &Document, page: NodeId, view: &View, layers: &mut dyn Layers) -> Result<Scene, Unsupported> {
-    let mut b = Builder { doc, scene: Some(Scene::new()), layers, view: view.clone(), page, hidden: Vec::new(), no_strokes: Vec::new() };
+    let mut b = Builder { doc, scene: Some(Scene::new()), layers, view: view.clone(), page, hidden: Vec::new(), no_strokes: Vec::new(), as_content: Vec::new() };
     let xf = view.transform();
     let Some(p) = doc.node(page) else { return Ok(Scene::new()) };
     for c in &p.children {
@@ -427,6 +427,8 @@ struct Builder<'a> {
     hidden: Vec<NodeId>,
     /// Layers whose strokes are left out (they are painted after their children's).
     no_strokes: Vec<NodeId>,
+    /// Mask nodes drawn as ordinary content (their coverage, for the siblings they clip).
+    as_content: Vec<NodeId>,
 }
 
 /// What a node's visible effects need of the GPU, if anything.
@@ -620,10 +622,122 @@ fn effects_of(doc: &Document, n: &Node) -> Effects {
 impl Builder<'_> {
     fn children(&mut self, id: NodeId, xf: Affine, depth: usize) -> Result<(), Unsupported> {
         let Some(n) = self.doc.node(id) else { return Ok(()) };
-        for c in &n.children {
-            self.node(*c, xf, depth)?;
+        let reverse = n.layout.as_ref().is_some_and(|l| l.reverse_z);
+        let doc = self.doc;
+        let nodes: Vec<Option<&Node>> = n.children.iter().map(|c| doc.node(*c)).collect();
+        for run in Document::paint_runs_of(&nodes, reverse) {
+            let Some(Some(cn)) = nodes.get(run.start) else { continue };
+            if cn.is_mask && cn.visible {
+                // Everything above the mask (until the next mask) is clipped by its coverage.
+                let content = n.children.get(run.start + 1..run.end).unwrap_or(&[]);
+                self.masked(cn, content, xf, depth)?;
+            } else {
+                self.node(n.children[run.start], xf, depth)?;
+            }
         }
         Ok(())
+    }
+
+    /// A mask and the siblings it clips (until the next mask), in a layer of their own and cut by
+    /// the mask's coverage — the renderer's `draw_masked`. An alpha mask is the node's own paint;
+    /// a vector mask is its outline, solid.
+    fn masked(&mut self, mask: &Node, content: &[NodeId], parent_xf: Affine, depth: usize) -> Result<(), Unsupported> {
+        if mask.mask_type == figcraft_doc::MaskType::Luminance {
+            return Err(Unsupported::Mask);
+        }
+        // What the run covers, in device pixels, clipped to what is on screen.
+        let mut rect: Option<KRect> = None;
+        for id in content {
+            let Some(n) = self.doc.node(*id) else { continue };
+            if !n.visible || n.opacity <= 0.0 {
+                continue;
+            }
+            let Some((x, y, w, h)) = self.layer_rect(n)? else { continue };
+            let r = KRect::new(x, y, x + f64::from(w), y + f64::from(h));
+            rect = Some(rect.map_or(r, |a| a.union(r)));
+        }
+        let view = self.view.clone();
+        let screen = KRect::new(0.0, 0.0, f64::from(view.width), f64::from(view.height));
+        let Some(rect) = rect.map(|r| r.intersect(screen)) else { return Ok(()) };
+        if rect.width() < 1.0 || rect.height() < 1.0 {
+            return Ok(());
+        }
+        let (x0, y0) = (rect.x0.floor(), rect.y0.floor());
+        let (w, h) = ((rect.x1.ceil() - x0).min(f64::from(f32::MAX)) as u32, (rect.y1.ceil() - y0) as u32);
+        if w == 0 || h == 0 {
+            return Ok(());
+        }
+        let xf = view.transform();
+        let key = self.shadow_key(mask, u64::MAX - 2, xf * Affine::translate((x0, y0)));
+        let sampler = ImageSampler { x_extend: Extend::Pad, y_extend: Extend::Pad, quality: ImageQuality::Low, alpha: 1.0 };
+        if let Some(hit) = self.layers.kept_shadow(key) {
+            if let Some(s) = &mut self.scene {
+                s.draw_image(ImageBrush { image: &hit.image, sampler }, KAffine::translate((x0, y0)));
+            }
+            return Ok(());
+        }
+        // The layer's own pixels are a view of their own: every effect inside lands in it.
+        let sub = View {
+            origin: (view.origin.0 + x0 / view.scale, view.origin.1 + y0 / view.scale),
+            scale: view.scale,
+            width: w,
+            height: h,
+        };
+        // `parent_xf` is in page pixels: the layer's own grid starts at `(x0, y0)`.
+        let at = Affine::translate((-x0, -y0)) * parent_xf;
+        let coverage = if mask.mask_type == figcraft_doc::MaskType::Vector {
+            let mut scene = Scene::new();
+            if let Some((outline, rule)) = figcraft_render::subtree_outline(self.doc, mask, depth + 1) {
+                let white = PColor::new([1.0, 1.0, 1.0, 1.0]);
+                scene.fill(fill_rule(rule), k_affine(at * mask.transform), &Brush::Solid(white), None, &outline);
+            }
+            scene
+        } else {
+            self.as_content.push(mask.id);
+            let built = self.sub_scene(sub.clone(), |b| b.node(mask.id, at, depth + 1));
+            self.as_content.pop();
+            built?
+        };
+        let content_scene = self.sub_scene(sub, |b| {
+            for id in content {
+                b.node(*id, at, depth + 1)?;
+            }
+            Ok(())
+        })?;
+        let Some(coverage_layer) = self.layers.layer(&coverage, w, h, None) else { return Err(Unsupported::Effect) };
+        let Some(content_layer) = self.layers.layer(&content_scene, w, h, None) else { return Err(Unsupported::Effect) };
+        // The siblings only where the mask covers, in one layer (`SrcIn`: source × destination's
+        // alpha), then drawn where the run sits.
+        let mut scene = Scene::new();
+        scene.draw_image(ImageBrush { image: &coverage_layer.image, sampler }, KAffine::IDENTITY);
+        let target = KRect::new(0.0, 0.0, f64::from(w), f64::from(h));
+        scene.push_layer(Fill::NonZero, Compose::SrcIn, 1.0, KAffine::IDENTITY, &target);
+        scene.draw_image(ImageBrush { image: &content_layer.image, sampler }, KAffine::IDENTITY);
+        scene.pop_layer();
+        let Some(out) = self.layers.layer(&scene, w, h, Some(key)) else { return Err(Unsupported::Effect) };
+        if let Some(s) = &mut self.scene {
+            s.draw_image(ImageBrush { image: &out.image, sampler }, KAffine::translate((x0, y0)));
+        }
+        Ok(())
+    }
+
+    /// What `f` draws through `view`, into a scene of its own.
+    fn sub_scene<F>(&mut self, view: View, f: F) -> Result<Scene, Unsupported>
+    where
+        F: FnOnce(&mut Builder<'_>) -> Result<(), Unsupported>,
+    {
+        let mut b = Builder {
+            doc: self.doc,
+            scene: Some(Scene::new()),
+            layers: &mut *self.layers,
+            view,
+            page: self.page,
+            hidden: self.hidden.clone(),
+            no_strokes: self.no_strokes.clone(),
+            as_content: self.as_content.clone(),
+        };
+        f(&mut b)?;
+        Ok(b.scene.unwrap_or_default())
     }
 
     fn node(&mut self, id: NodeId, parent_xf: Affine, depth: usize) -> Result<(), Unsupported> {
@@ -637,7 +751,7 @@ impl Builder<'_> {
         if !n.visible || n.opacity <= 0.0 {
             return Ok(());
         }
-        if n.is_mask {
+        if n.is_mask && !self.as_content.contains(&id) {
             return Err(Unsupported::Mask);
         }
         match effects_of(self.doc, n) {
@@ -743,6 +857,7 @@ impl Builder<'_> {
             page,
             hidden: above.hidden,
             no_strokes: above.strokes,
+            as_content: Vec::new(),
         };
         if let Some(s) = &mut below.scene {
             let bg = background(self.doc, page);
@@ -842,6 +957,7 @@ impl Builder<'_> {
             page: self.page,
             hidden: self.hidden.clone(),
             no_strokes: self.no_strokes.clone(),
+            as_content: self.as_content.clone(),
         };
         // The content only: the node's opacity and blend mode apply to the result, not inside it.
         sub.content(n, layer.transform() * parent * n.transform, depth)?;
