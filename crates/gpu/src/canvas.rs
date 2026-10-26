@@ -48,6 +48,9 @@ pub struct CanvasGpu {
     segment: Option<Scratch>,
     /// A copy of the page, for a pass that reads it as it writes it (plus-darker).
     under: Option<Scratch>,
+    /// Layer textures a frame is done with, for the next frame's layers: a drag of a blurred card
+    /// would otherwise make and drop a dozen full-size textures a frame, which shows as judder.
+    layers_pool: Vec<Texture>,
     /// The plan steps' own segments, with the key of what each holds, kept between frames.
     steps: Vec<Option<(u64, Scratch)>>,
     /// Shadow images kept between frames, by what they were made from: while one layer moves, the
@@ -136,6 +139,7 @@ impl CanvasGpu {
             page: None,
             segment: None,
             under: None,
+            layers_pool: Vec::new(),
             steps: Vec::new(),
             shadows: HashMap::new(),
             shadows_bytes: 0,
@@ -181,6 +185,27 @@ impl CanvasGpu {
         // keyed on the view, so they would miss anyway; drop them rather than hold them.
         self.steps.clear();
         self.nodes.clear();
+        self.layers_pool.clear();
+    }
+
+    /// A `width` × `height` layer texture: one a frame was done with when its size matches.
+    fn take_layer(&mut self, device: &Device, label: &str, width: u32, height: u32) -> Texture {
+        if let Some(i) = self.layers_pool.iter().position(|t| t.width() == width && t.height() == height) {
+            return self.layers_pool.swap_remove(i);
+        }
+        layer_texture(device, label, width, height)
+    }
+
+    /// Keep `texture` for a later frame's layers (its passes are done: a queue runs in order).
+    fn give_layer(&mut self, texture: Texture) {
+        const POOL_BYTES: u64 = 128 << 20;
+        let bytes = |t: &Texture| u64::from(t.width()) * u64::from(t.height()) * 4;
+        let used: u64 = self.layers_pool.iter().map(bytes).sum();
+        if used.saturating_add(bytes(&texture)) > POOL_BYTES {
+            self.layers_pool.clear();
+            return;
+        }
+        self.layers_pool.push(texture);
     }
 
     /// Draw `scene` over `background` into the next target; returns its texture view.
@@ -324,13 +349,14 @@ impl CanvasGpu {
     /// come out premultiplied, as the blurs, the glass shader and vello's own image brush read them
     /// (vello's targets hold straight alpha, so the render is premultiplied before it is handed on).
     pub(crate) fn render_layer(&mut self, device: &Device, queue: &Queue, scene: &Scene, width: u32, height: u32) -> Option<Texture> {
-        let texture = layer_texture(device, "figcraft layer", width, height);
+        let texture = self.take_layer(device, "figcraft layer", width, height);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let params = RenderParams { base_color: vello::peniko::Color::new([0.0; 4]), width, height, antialiasing_method: AaConfig::Area };
         self.renderer.render_to_texture(device, queue, scene, &view, &params).ok()?;
-        let out = layer_texture(device, "figcraft layer", width, height);
+        let out = self.take_layer(device, "figcraft layer", width, height);
         let out_view = out.create_view(&wgpu::TextureViewDescriptor::default());
         self.compose.premultiply(device, queue, &view, &out_view);
+        self.give_layer(texture);
         Some(out)
     }
 
@@ -561,6 +587,10 @@ impl crate::scene::Layers for GpuLayers<'_> {
             levels.push(self.blur_texture_only(&texture, *d)?);
         }
         let out = self.canvas.mix.mix(self.device, self.queue, &levels, &deviations, (s0, s1, a, b), size)?;
+        // The levels are made again next frame: keep their textures for it.
+        for level in levels {
+            self.canvas.blur.give_back(level);
+        }
         let made = self.canvas.as_layer(out);
         self.keep(key, &made);
         Some(made)

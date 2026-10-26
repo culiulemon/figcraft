@@ -153,7 +153,7 @@ impl Blur {
     }
 
     /// Keep `texture` for the next run (its passes are done: a queue runs in order).
-    fn give_back(&self, texture: Texture) {
+    pub(crate) fn give_back(&self, texture: Texture) {
         let mut pool = self.pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let bytes = |t: &Texture| u64::from(t.width()) * u64::from(t.height()) * 4;
         let used: u64 = pool.iter().map(bytes).sum();
