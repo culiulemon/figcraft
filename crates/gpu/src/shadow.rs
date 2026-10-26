@@ -3,10 +3,11 @@
 
 use figcraft_color::Color;
 use wgpu::{
-    BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BufferDescriptor, BufferUsages,
-    ColorTargetState, ColorWrites, CommandEncoderDescriptor, Device, Extent3d, FragmentState, LoadOp, Operations, PipelineCompilationOptions,
-    PipelineLayoutDescriptor, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, ShaderModuleDescriptor,
-    ShaderSource, ShaderStages, StoreOp, Texture, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor, VertexState,
+    BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BufferDescriptor,
+    BufferUsages, ColorTargetState, ColorWrites, CommandEncoderDescriptor, Device, Extent3d, FragmentState, LoadOp, Operations,
+    PipelineCompilationOptions, PipelineLayoutDescriptor, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline,
+    RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, Texture, TextureDescriptor, TextureDimension,
+    TextureFormat, TextureUsages, TextureViewDescriptor, VertexState,
 };
 
 pub(crate) struct Shadow {
@@ -102,7 +103,16 @@ impl Shadow {
         self.pass(device, queue, &self.morph, &a, (w, h), &params, "figcraft shadow morph")
     }
 
-    fn pass(&self, device: &Device, queue: &Queue, pipeline: &RenderPipeline, src: &Texture, (w, h): (u32, u32), params: &[u8], label: &str) -> Option<Texture> {
+    fn pass(
+        &self,
+        device: &Device,
+        queue: &Queue,
+        pipeline: &RenderPipeline,
+        src: &Texture,
+        (w, h): (u32, u32),
+        params: &[u8],
+        label: &str,
+    ) -> Option<Texture> {
         if w == 0 || h == 0 {
             return None;
         }

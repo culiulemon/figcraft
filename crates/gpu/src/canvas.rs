@@ -44,6 +44,8 @@ pub struct CanvasGpu {
     page: Option<Scratch>,
     /// One segment on its way onto the page.
     segment: Option<Scratch>,
+    /// The plan steps' own segments, with the key of what each holds, kept between frames.
+    steps: Vec<Option<(u64, Scratch)>>,
     /// Shadow images kept between frames, by what they were made from: while one layer moves, the
     /// shadows of the others are drawn again as they are instead of being rebuilt.
     shadows: HashMap<(u64, u64), Kept>,
@@ -61,6 +63,10 @@ struct Kept {
 
 /// The most device bytes the kept shadows take (a page of effect layers fits many times over).
 const KEPT_SHADOW_BYTES: usize = 64 << 20;
+
+/// The most device bytes the kept step segments take: a canvas-sized texture each, and a segmented
+/// page has one per backdrop node (8 at 2400 × 1600).
+const STEP_BYTES: u64 = 128 << 20;
 
 struct Target {
     texture: Texture,
@@ -109,6 +115,7 @@ impl CanvasGpu {
             generation: 1,
             page: None,
             segment: None,
+            steps: Vec::new(),
             shadows: HashMap::new(),
             shadows_bytes: 0,
             tick: 0,
@@ -146,6 +153,8 @@ impl CanvasGpu {
         self.next = 0;
         self.last = 0;
         self.generation = self.generation.wrapping_add(1);
+        // A kept step's texture is re-made at the new size: what it held is gone.
+        self.steps.clear();
     }
 
     /// Draw `scene` over `background` into the next target; returns its texture view.
@@ -187,6 +196,47 @@ impl CanvasGpu {
     pub(crate) fn segment_layer(&mut self, device: &Device) -> Option<TextureView> {
         let (w, h) = self.size();
         keep(&mut self.segment, device, (w, h), "figcraft segment").map(|(_, view)| view)
+    }
+
+    /// The segment texture of plan step `i`, kept with the key of what it holds: a step that did
+    /// not change is laid over the page again instead of being drawn again.
+    pub(crate) fn step_kept(&self, i: usize, key: u64) -> Option<TextureView> {
+        self.steps.get(i)?.as_ref().filter(|(kept, _)| *kept == key).map(|(_, s)| s.view.clone())
+    }
+
+    /// The step segment for plan step `i`, made or resized as needed; `None` when the page has
+    /// more steps than the kept segments afford, and the step is drawn into the shared one.
+    pub(crate) fn step_layer(&mut self, device: &Device, i: usize) -> Option<TextureView> {
+        if i >= self.step_slots() {
+            return None;
+        }
+        let (w, h) = self.size();
+        if self.steps.len() <= i {
+            self.steps.resize_with(i + 1, || None);
+        }
+        let slot = self.steps.get_mut(i)?;
+        let stale = slot.as_ref().is_none_or(|(_, s)| s.size != (w, h));
+        if stale {
+            let texture = layer_texture(device, "figcraft step", w, h);
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            *slot = Some((0, Scratch { texture, view, size: (w, h) }));
+        }
+        slot.as_ref().map(|(_, s)| s.view.clone())
+    }
+
+    /// Mark what step `i`'s segment holds, once the step has drawn into it.
+    pub(crate) fn keep_step(&mut self, i: usize, key: u64) {
+        if let Some(Some((kept, _))) = self.steps.get_mut(i) {
+            *kept = key;
+        }
+    }
+
+    /// How many step segments are kept: as many canvas-sized textures as [`STEP_BYTES`] affords
+    /// (a page has one per backdrop node, and a handful more).
+    fn step_slots(&self) -> usize {
+        let (w, h) = self.size();
+        let bytes = (u64::from(w) * u64::from(h) * 4).max(1);
+        usize::try_from((STEP_BYTES / bytes).clamp(1, 16)).unwrap_or(1)
     }
 
     /// Fill a layer with `color` (the page background under the accumulation).
@@ -256,11 +306,6 @@ impl CanvasGpu {
         let size = (texture.width(), texture.height());
         let image = self.register_layer(texture.clone());
         crate::scene::Layer { image, texture: Some(texture), size }
-    }
-
-    /// Mark a kept layer's image as changed so vello copies its texture into its atlas again.
-    pub(crate) fn refresh_image(&mut self, image: &ImageData) {
-        self.renderer.mark_override_image_dirty(image);
     }
 
     /// A shadow kept from an earlier frame, if it was made from the same thing.
@@ -431,7 +476,7 @@ impl crate::scene::Layers for GpuLayers<'_> {
 impl GpuLayers<'_> {
     /// `texture` blurred by `sigma` (as it is, when the renderer would leave the blur out).
     fn blur_texture_only(&mut self, texture: &Texture, sigma: f64) -> Option<Texture> {
-        if !(sigma > 0.3) {
+        if !sigma.is_finite() || sigma <= 0.3 {
             return Some(texture.clone());
         }
         let size = (texture.width(), texture.height());
@@ -724,6 +769,8 @@ pub fn present(doc: &Document, page: NodeId, view: &View) -> Option<Frame> {
         Ok(plan) => plan,
         Err(e) => return refusal(e.reason()),
     };
+    // A page with a backdrop node is drawn in segments (a container with one nested inside it is
+    // a step of its own there too, so the layers before it are kept between frames).
     let segmented = plan.iter().any(|s| matches!(s, crate::scene::Step::Backdrop(_)));
     let texture = if segmented {
         match segmented_frame(&backend.device, &backend.queue, canvas, doc, page, view, &plan, background) {
@@ -753,6 +800,9 @@ pub fn present(doc: &Document, page: NodeId, view: &View) -> Option<Frame> {
 
 /// A page with backdrop effects, drawn in segments: the layers before each such node accumulate
 /// into one texture, the node makes its effect from that texture, and its content goes on top.
+///
+/// Each ordinary step is kept between frames under the key of what it holds: while one layer moves,
+/// the steps it did not change are laid over the page again instead of being drawn again.
 pub(crate) fn segmented_frame(
     device: &Device,
     queue: &Queue,
@@ -765,42 +815,46 @@ pub(crate) fn segmented_frame(
 ) -> Option<TextureView> {
     let (acc, acc_view) = canvas.page_layer(device)?;
     canvas.fill_layer(device, queue, &acc_view, background);
-    let mut pending = Scene::new();
-    // Whether `pending` holds layers: nothing is drawn or composed for an empty one (and backdrop
-    // nodes often follow each other, with no layers between them).
-    let mut dirty = false;
-    for step in plan {
+    for (i, step) in plan.iter().enumerate() {
         match step {
             crate::scene::Step::Nodes(ids) => {
+                let key = crate::scene::step_is_self_contained(doc, ids).then(|| crate::scene::step_key(doc, view, ids));
+                if let Some(key) = key
+                    && let Some(kept) = canvas.step_kept(i, key)
+                {
+                    canvas.compose_over(device, queue, &acc_view, &kept);
+                    continue;
+                }
+                let mut scene = Scene::new();
                 let drawn = {
                     let mut layers = GpuLayers { canvas, device, queue };
-                    crate::scene::draw_into(doc, page, view, &mut layers, ids, &mut pending)
+                    crate::scene::draw_into(doc, page, view, &mut layers, ids, &mut scene)
                 };
                 drawn.ok()?;
-                dirty = true;
+                match key.and_then(|key| canvas.step_layer(device, i).map(|view| (view, key))) {
+                    Some((target, key)) => {
+                        canvas.draw_into(device, queue, &scene, &target).then_some(())?;
+                        canvas.compose_over(device, queue, &acc_view, &target);
+                        canvas.keep_step(i, key);
+                    }
+                    None => lay_over(device, queue, canvas, &acc_view, &scene)?,
+                }
             }
             crate::scene::Step::Backdrop(id) => {
-                // Everything before the node goes into the accumulation first.
-                if dirty {
-                    lay_over(device, queue, canvas, &acc_view, &pending)?;
-                    pending = Scene::new();
-                }
-                // The effect reads what lies under the node, then the node goes over it.
+                // Every step before it is on the page already: the effect reads the accumulation.
                 let image = {
                     let mut layers = GpuLayers { canvas, device, queue };
                     layers.backdrop_effect(doc, *id, view, &acc)?
                 };
+                let mut scene = Scene::new();
                 let drawn = {
                     let mut layers = GpuLayers { canvas, device, queue };
-                    crate::scene::draw_backdrop_into(doc, page, view, &mut layers, *id, &image, &mut pending)
+                    crate::scene::draw_backdrop_into(doc, page, view, &mut layers, *id, &image, &mut scene)
                 };
                 drawn.ok()?;
-                dirty = true;
+                lay_over(device, queue, canvas, &acc_view, &scene)?;
             }
         }
-    }
-    if dirty {
-        lay_over(device, queue, canvas, &acc_view, &pending)?;
     }
     canvas.present_layer(device, queue, &acc)
 }

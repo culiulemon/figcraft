@@ -2,10 +2,11 @@
 //! as the renderer works it out (`figcraft_render::blur::progressive`).
 
 use wgpu::{
-    BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BufferDescriptor, BufferUsages,
-    ColorTargetState, ColorWrites, CommandEncoderDescriptor, Device, Extent3d, FragmentState, LoadOp, Operations, PipelineCompilationOptions,
-    PipelineLayoutDescriptor, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, ShaderModuleDescriptor,
-    ShaderSource, ShaderStages, StoreOp, Texture, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor, VertexState,
+    BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BufferDescriptor,
+    BufferUsages, ColorTargetState, ColorWrites, CommandEncoderDescriptor, Device, Extent3d, FragmentState, LoadOp, Operations,
+    PipelineCompilationOptions, PipelineLayoutDescriptor, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline,
+    RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, Texture, TextureDescriptor, TextureDimension,
+    TextureFormat, TextureUsages, TextureViewDescriptor, VertexState,
 };
 
 /// The most blur levels a progressive blur draws (the renderer's own cap).
@@ -92,14 +93,7 @@ impl Mix {
         for (i, v) in deviations.iter().take(MAX_LEVELS).enumerate() {
             params[i * 4..i * 4 + 4].copy_from_slice(&(*v as f32).to_le_bytes());
         }
-        let values = [
-            levels.len() as f32,
-            s0 as f32,
-            s1 as f32,
-            ((0.5 - a.0) * tx + (0.5 - a.1) * ty) as f32,
-            tx as f32,
-            ty as f32,
-        ];
+        let values = [levels.len() as f32, s0 as f32, s1 as f32, ((0.5 - a.0) * tx + (0.5 - a.1) * ty) as f32, tx as f32, ty as f32];
         for (i, v) in values.iter().enumerate() {
             params[32 + i * 4..36 + i * 4].copy_from_slice(&v.to_le_bytes());
         }
@@ -111,12 +105,13 @@ impl Mix {
         });
         queue.write_buffer(&uniform, 0, &params);
         // Every slot is bound: unused ones read the first level (their index is never picked).
-        let views: Vec<wgpu::TextureView> = (0..MAX_LEVELS)
-            .map(|i| levels.get(i).unwrap_or(&levels[0]).create_view(&TextureViewDescriptor::default()))
-            .collect();
+        let views: Vec<wgpu::TextureView> =
+            (0..MAX_LEVELS).map(|i| levels.get(i).unwrap_or(&levels[0]).create_view(&TextureViewDescriptor::default())).collect();
         let mut entries = vec![BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() }];
-        entries.extend(views.iter().enumerate().map(|(i, v)| BindGroupEntry { binding: 1 + i as u32, resource: wgpu::BindingResource::TextureView(v) }));
-        let bind = device.create_bind_group(&BindGroupDescriptor { label: Some("figcraft progressive blur"), layout: &self.layout, entries: &entries });
+        entries
+            .extend(views.iter().enumerate().map(|(i, v)| BindGroupEntry { binding: 1 + i as u32, resource: wgpu::BindingResource::TextureView(v) }));
+        let bind =
+            device.create_bind_group(&BindGroupDescriptor { label: Some("figcraft progressive blur"), layout: &self.layout, entries: &entries });
         let out = device.create_texture(&TextureDescriptor {
             label: Some("figcraft progressive blur"),
             size: Extent3d { width: w, height: h, depth_or_array_layers: 1 },

@@ -139,9 +139,10 @@ pub enum Step {
 }
 
 /// How to draw `page` in segments: its top-level children in order, with backdrop nodes as steps
-/// of their own (the page is accumulated up to each one). A backdrop node *nested* in a container
-/// needs no step: the builder re-renders what lies under it (`Builder::backdrop_of`) — correct,
-/// where a segment boundary inside a layer would not be.
+/// of their own (the page is accumulated up to each one). A container *with* one nested inside it
+/// gets a step of its own too (the builder re-renders what lies under it, which is work of its
+/// own, and the layers before it can then be kept between frames); a backdrop node *inside* a
+/// layer would need a boundary there, which would be wrong — the builder draws it whole instead.
 pub fn plan(doc: &Document, page: NodeId) -> Result<Vec<Step>, Unsupported> {
     let Some(p) = doc.node(page) else { return Ok(Vec::new()) };
     let mut steps = Vec::new();
@@ -156,9 +157,12 @@ pub fn plan(doc: &Document, page: NodeId) -> Result<Vec<Step>, Unsupported> {
                 steps.push(Step::Nodes(std::mem::take(&mut run)));
             }
             steps.push(Step::Backdrop(*c));
+        } else if nests_backdrop(doc, n, 0) {
+            if !run.is_empty() {
+                steps.push(Step::Nodes(std::mem::take(&mut run)));
+            }
+            steps.push(Step::Nodes(vec![*c]));
         } else {
-            // A backdrop effect further down re-renders what lies under itself (see
-            // [`Builder::backdrop_of`]): it needs no segment boundary, only that work.
             run.push(*c);
         }
     }
@@ -168,9 +172,53 @@ pub fn plan(doc: &Document, page: NodeId) -> Result<Vec<Step>, Unsupported> {
     Ok(steps)
 }
 
+/// The key of a step's own pixels (`Step::Nodes`): its nodes and everything under them, the view
+/// and the zoom — plus the document's shape and text layout, as a shadow's key — so a drag re-draws
+/// only the steps it changed.
+pub fn step_key(doc: &Document, view: &View, ids: &[NodeId]) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for id in ids {
+        if let Some(n) = doc.node(*id) {
+            subtree_hash(doc, n, 0).hash(&mut h);
+        }
+    }
+    (doc.next_id(), doc.node_count()).hash(&mut h);
+    figcraft_text::layout_generation().hash(&mut h);
+    doc.color_profile.hash(&mut h);
+    for v in [view.origin.0, view.origin.1, view.scale].into_iter().map(f64::to_bits) {
+        v.hash(&mut h);
+    }
+    (view.width, view.height).hash(&mut h);
+    h.finish()
+}
+
+/// Whether a visible backdrop effect (glass, background blur) is nested somewhere under `n`.
+fn nests_backdrop(doc: &Document, n: &Node, depth: usize) -> bool {
+    if depth > MAX_DEPTH || !n.visible {
+        return false;
+    }
+    n.children.iter().any(|c| doc.node(*c).is_some_and(|cn| (cn.visible && backdrop_of(cn).is_some()) || nests_backdrop(doc, cn, depth + 1)))
+}
+
+/// Whether a step's pixels depend on its own nodes alone: a backdrop effect nested inside the
+/// step reads what lies under it, which may be another step's layers, so such a step is drawn
+/// every frame instead of being kept.
+pub fn step_is_self_contained(doc: &Document, ids: &[NodeId]) -> bool {
+    !ids.iter().filter_map(|id| doc.node(*id)).any(|n| n.visible && nests_backdrop(doc, n, 0))
+}
+
 /// Draw `ids` (children of `page`, in order) into `out`.
 pub fn draw_into(doc: &Document, page: NodeId, view: &View, layers: &mut dyn Layers, ids: &[NodeId], out: &mut Scene) -> Result<(), Unsupported> {
-    let mut b = Builder { doc, scene: Some(Scene::new()), layers, view: view.clone(), page, hidden: Vec::new(), no_strokes: Vec::new(), as_content: Vec::new() };
+    let mut b = Builder {
+        doc,
+        scene: Some(Scene::new()),
+        layers,
+        view: view.clone(),
+        page,
+        hidden: Vec::new(),
+        no_strokes: Vec::new(),
+        as_content: Vec::new(),
+    };
     for id in ids {
         b.node(*id, view.transform(), 0)?;
     }
@@ -198,7 +246,16 @@ pub fn draw_backdrop_into(
         return Err(Unsupported::Mask);
     }
     let Some(effect) = backdrop_of(n) else { return Err(Unsupported::Effect) };
-    let mut b = Builder { doc, scene: Some(Scene::new()), layers, view: view.clone(), page, hidden: Vec::new(), no_strokes: Vec::new(), as_content: Vec::new() };
+    let mut b = Builder {
+        doc,
+        scene: Some(Scene::new()),
+        layers,
+        view: view.clone(),
+        page,
+        hidden: Vec::new(),
+        no_strokes: Vec::new(),
+        as_content: Vec::new(),
+    };
     // A blur's pixels are its padded layer (a rectangle, so the shape clips them); a pane's pixels
     // are its layer, with the shape's own coverage in the alpha.
     let place = match effect {
@@ -394,7 +451,16 @@ pub fn build(doc: &Document, page: NodeId, view: &View) -> Result<Scene, Unsuppo
 /// Draw page `page` of `doc` as seen through `view` into a vello scene, drawing effect layers
 /// through `layers` (the GPU canvas).
 pub fn build_with(doc: &Document, page: NodeId, view: &View, layers: &mut dyn Layers) -> Result<Scene, Unsupported> {
-    let mut b = Builder { doc, scene: Some(Scene::new()), layers, view: view.clone(), page, hidden: Vec::new(), no_strokes: Vec::new(), as_content: Vec::new() };
+    let mut b = Builder {
+        doc,
+        scene: Some(Scene::new()),
+        layers,
+        view: view.clone(),
+        page,
+        hidden: Vec::new(),
+        no_strokes: Vec::new(),
+        as_content: Vec::new(),
+    };
     let xf = view.transform();
     let Some(p) = doc.node(page) else { return Ok(Scene::new()) };
     for c in &p.children {
@@ -665,12 +731,7 @@ impl Builder<'_> {
             return Ok(());
         }
         // The layer's own pixels are a view of their own: every effect inside lands in it.
-        let sub = View {
-            origin: (view.origin.0 + x0 / view.scale, view.origin.1 + y0 / view.scale),
-            scale: view.scale,
-            width: w,
-            height: h,
-        };
+        let sub = View { origin: (view.origin.0 + x0 / view.scale, view.origin.1 + y0 / view.scale), scale: view.scale, width: w, height: h };
         // `parent_xf` is in page pixels: the layer's own grid starts at `(x0, y0)`.
         let at = Affine::translate((-x0, -y0)) * parent_xf;
         let coverage = if mask.mask_type == figcraft_doc::MaskType::Vector {
@@ -978,8 +1039,11 @@ impl Builder<'_> {
                 return Err(Unsupported::Effect);
             }
         }
-        let reads_pixels: Vec<&figcraft_doc::Effect> =
-            effects.iter().copied().filter(|e| matches!(e.kind, figcraft_doc::EffectKind::LayerBlur(_) | figcraft_doc::EffectKind::Noise(_))).collect();
+        let reads_pixels: Vec<&figcraft_doc::Effect> = effects
+            .iter()
+            .copied()
+            .filter(|e| matches!(e.kind, figcraft_doc::EffectKind::LayerBlur(_) | figcraft_doc::EffectKind::Noise(_)))
+            .collect();
         let silhouette = figcraft_render::shadow::silhouette(self.doc, n);
         let outside = figcraft_render::shadow::cover(self.doc, n).map(|c| outside(&c));
         let pixel_shadows = shadows.iter().any(|s| !casts_from_outline(&silhouette, s));
@@ -1104,7 +1168,15 @@ impl Builder<'_> {
 
     /// Draw a shadow's pixels at `at` (device pixels), cut to `bounds` (the CPU crops it to the
     /// layer), outside `hole` (the node's paints) when given, in the shadow's own blend mode.
-    fn draw_shadow_image(&mut self, image: &Layer, at: (f64, f64), bounds: Option<&KRect>, hole: Option<&figcraft_geom::BezPath>, mode: BlendMode, xf: Affine) {
+    fn draw_shadow_image(
+        &mut self,
+        image: &Layer,
+        at: (f64, f64),
+        bounds: Option<&KRect>,
+        hole: Option<&figcraft_geom::BezPath>,
+        mode: BlendMode,
+        xf: Affine,
+    ) {
         let image = &image.image;
         let Some(s) = &mut self.scene else { return };
         let blended = mode != BlendMode::Normal && mode != BlendMode::PassThrough;
@@ -1159,9 +1231,8 @@ impl Builder<'_> {
             let (image, at) = match self.layers.kept_shadow(key) {
                 Some(image) => {
                     let (dx, dy) = (s.offset.0 * scale, s.offset.1 * scale);
-                    let reach = s.radius.abs() / 2.0 * scale * 3.0
-                        + s.spread.abs() * scale * figcraft_doc::SPREAD_MITER_LIMIT
-                        + dx.abs().max(dy.abs());
+                    let reach =
+                        s.radius.abs() / 2.0 * scale * 3.0 + s.spread.abs() * scale * figcraft_doc::SPREAD_MITER_LIMIT + dx.abs().max(dy.abs());
                     let pad = if reach.is_finite() { reach.ceil().clamp(0.0, 2048.0) as u32 + 2 } else { 2 };
                     (image, (x0 - f64::from(pad), y0 - f64::from(pad)))
                 }
@@ -1556,10 +1627,16 @@ fn paint_layer(b: BlendMode) -> Result<bool, Unsupported> {
     Ok(!matches!(b, BlendMode::PassThrough | BlendMode::Normal))
 }
 
+/// An image's identity in the caches below: the pixmap's (or bitmap's) address and its size.
+type ImageKey = (usize, u32, u32);
+
+/// The pixmaps handed to vello, by [`ImageKey`] (with the image the scene draws).
+type ImageCache = Mutex<HashMap<ImageKey, (Arc<Pixmap>, ImageData)>>;
+
 /// The pixmaps handed to vello, kept so their `Blob` outlives the frame: vello's atlas only keeps
 /// an image's slot while the same blob is asked for, and a new one would upload it again.
-fn images() -> &'static Mutex<HashMap<(usize, u32, u32), (Arc<Pixmap>, ImageData)>> {
-    static IMAGES: OnceLock<Mutex<HashMap<(usize, u32, u32), (Arc<Pixmap>, ImageData)>>> = OnceLock::new();
+fn images() -> &'static ImageCache {
+    static IMAGES: OnceLock<ImageCache> = OnceLock::new();
     IMAGES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -1568,8 +1645,8 @@ const MAX_IMAGES: usize = 256;
 
 /// Colour glyphs' bitmaps handed to vello, by the layout's own cached bitmap: kept so their `Blob`
 /// outlives the frame (a new one would be uploaded again).
-fn glyph_images() -> &'static Mutex<HashMap<(usize, u32, u32), ImageData>> {
-    static GLYPHS: OnceLock<Mutex<HashMap<(usize, u32, u32), ImageData>>> = OnceLock::new();
+fn glyph_images() -> &'static Mutex<HashMap<ImageKey, ImageData>> {
+    static GLYPHS: OnceLock<Mutex<HashMap<ImageKey, ImageData>>> = OnceLock::new();
     GLYPHS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -1671,7 +1748,14 @@ fn outside(outlines: &[figcraft_render::shadow::Outline]) -> figcraft_geom::BezP
 
 /// `outlines` grown (`spread > 0`) or shrunk by `spread` local units, shifted by `(dx, dy)` device
 /// pixels, in white — the renderer's `shadow::spread_alpha`.
-fn silhouette_scene(scene: &mut Scene, outlines: &[figcraft_render::shadow::Outline], spread: f64, layer_xf: Affine, (dx, dy): (f64, f64), rect: KRect) {
+fn silhouette_scene(
+    scene: &mut Scene,
+    outlines: &[figcraft_render::shadow::Outline],
+    spread: f64,
+    layer_xf: Affine,
+    (dx, dy): (f64, f64),
+    rect: KRect,
+) {
     let at = KAffine::translate((dx, dy)) * k_affine(layer_xf);
     let white = PColor::new([1.0, 1.0, 1.0, 1.0]);
     for (path, rule) in outlines {

@@ -263,8 +263,7 @@ fn unsupported_pages_are_refused() {
     assert_eq!(scene::supported(&d, p), Err(scene::Unsupported::Paint));
     // An inner shadow of a shape is one blurred buffer clipped to it; a group's is the CPU's (it
     // is cast from the group's pixels).
-    let mut inner = figcraft_doc::Shadow::default();
-    inner.radius = 10.0;
+    let inner = figcraft_doc::Shadow { radius: 10.0, ..Default::default() };
     d.get_mut(id).unwrap().fills = vec![Paint::solid(Color::WHITE)];
     d.get_mut(id).unwrap().effects = vec![Effect { kind: EffectKind::InnerShadow(inner), visible: true }];
     assert_eq!(scene::supported(&d, p), Ok(()));
@@ -483,8 +482,7 @@ fn nested_backdrop_doc() -> Document {
     {
         let n = d.get_mut(blurred).unwrap();
         n.corners.radii = [16.0; 4];
-        let mut b = figcraft_doc::Blur::default();
-        b.radius = 24.0;
+        let b = figcraft_doc::Blur { radius: 24.0, ..Default::default() };
         n.effects = vec![Effect { kind: EffectKind::BackgroundBlur(b), visible: true }];
     }
     d
@@ -501,6 +499,158 @@ fn the_gpu_draws_nested_backdrops() {
     assert!(worst <= 128, "a channel differs by {worst} (mean {mean:.3})");
     assert!(mean <= 2.0, "the mean difference is {mean:.3}");
     assert!(over < (PARITY.0 * PARITY.1) as usize / 20, "{over} pixels differ by more than 8");
+}
+
+/// Four stripes, a glass pane of its own, then a group whose nested pane reads the stripes under
+/// it: the plan is `Nodes(stripes), Backdrop(pane), Nodes(group)`.
+fn pane_and_nested_glass_doc() -> Document {
+    let mut d = Document::new("gpu retained steps");
+    let p = d.first_page().unwrap();
+    let colours = ["E03030", "2040E0", "20C060", "F0C830"];
+    for i in 0..4u32 {
+        let id = d.create(p, NodeKind::Rectangle, "stripe", f64::from(i) * 60.0, 0.0, 60.0, 300.0).unwrap();
+        d.get_mut(id).unwrap().fills = vec![Paint::solid(Color::from_hex(colours[i as usize]).unwrap_or(Color::WHITE))];
+    }
+    let pane = d.create(p, NodeKind::Rectangle, "pane", 40.0, 180.0, 200.0, 120.0).unwrap();
+    {
+        let n = d.get_mut(pane).unwrap();
+        n.corners.radii = [24.0; 4];
+        n.fills = vec![Paint::solid(Color { a: 0.1, ..Color::WHITE })];
+        n.effects = vec![Effect { kind: EffectKind::Glass(Glass::default()), visible: true }];
+    }
+    // The nested pane overlaps both the stripes and the pane before it: what it refracts includes
+    // them, so its pixels are not its own subtree's.
+    let group = d.create(p, NodeKind::Group, "group", 20.0, 60.0, 300.0, 160.0).unwrap();
+    let nested = d.create(group, NodeKind::Rectangle, "nested pane", 30.0, 20.0, 200.0, 100.0).unwrap();
+    {
+        let n = d.get_mut(nested).unwrap();
+        n.corners.radii = [16.0; 4];
+        n.fills = vec![Paint::solid(Color { a: 0.1, ..Color::WHITE })];
+        n.effects = vec![Effect { kind: EffectKind::Glass(Glass::default()), visible: true }];
+    }
+    d
+}
+
+/// The ids of a plan's first ordinary step (the layers before the page's first backdrop node).
+fn first_step(plan: &[scene::Step]) -> Option<Vec<figcraft_doc::NodeId>> {
+    plan.iter().find_map(|s| match s {
+        scene::Step::Nodes(ids) => Some(ids.clone()),
+        scene::Step::Backdrop(_) => None,
+    })
+}
+
+/// Draw `d`'s first page through the segmented path on `canvas` and read the frame back.
+fn segmented_pixels(canvas: &mut CanvasGpu, device: &Device, queue: &Queue, d: &Document, view: &View) -> Option<Pixmap> {
+    let p = d.first_page()?;
+    let plan = scene::plan(d, p).ok()?;
+    crate::canvas::segmented_frame(device, queue, canvas, d, p, view, &plan, scene::background(d, p))?;
+    canvas.read(device, queue)
+}
+
+/// A cloned document with `id`'s paint changed: what the engine hands the canvas after an edit
+/// (the nodes are new `Arc`s there, so the step's key changes).
+fn recoloured(d: &Document, id: figcraft_doc::NodeId, hex: &str) -> Document {
+    let mut edited = d.clone();
+    if let Ok(n) = edited.get_mut(id) {
+        n.fills = vec![Paint::solid(Color::from_hex(hex).unwrap_or(Color::WHITE))];
+    }
+    edited
+}
+
+#[test]
+fn the_gpu_keeps_an_unchanged_step_between_frames() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let d = pane_and_nested_glass_doc();
+    let p = d.first_page().unwrap();
+    let (w, h) = PARITY;
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+    let plan = scene::plan(&d, p).unwrap();
+    let stripe = d.node(p).and_then(|p| p.children.first().copied()).expect("a stripe");
+    let ids = first_step(&plan).expect("the stripes are a step of their own");
+    assert!(scene::step_is_self_contained(&d, &ids), "the stripes read no backdrop");
+    let key = scene::step_key(&d, &view, &ids);
+    let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+    let first = segmented_pixels(&mut canvas, &device, &queue, &d, &view).expect("drawn");
+    assert!(canvas.step_kept(0, key).is_some(), "the unchanged step is kept");
+    // The same document again: the step is laid over the page from its kept segment.
+    let again = segmented_pixels(&mut canvas, &device, &queue, &d, &view).expect("drawn");
+    assert_eq!(first.data(), again.data(), "a kept step draws the same pixels");
+    // An edit inside the step gives it a new key: it is drawn again, and the frame matches one
+    // from a canvas that never drew this document before.
+    let edited = recoloured(&d, stripe, "102030");
+    let new_key = scene::step_key(&edited, &view, &ids);
+    assert_ne!(key, new_key, "an edited step has a new key");
+    let changed = segmented_pixels(&mut canvas, &device, &queue, &edited, &view).expect("drawn");
+    let mut fresh = CanvasGpu::new(&device, w, h).unwrap();
+    let expected = segmented_pixels(&mut fresh, &device, &queue, &edited, &view).expect("drawn");
+    assert_eq!(changed.data(), expected.data(), "the changed step is not taken from the kept segment");
+}
+
+#[test]
+fn the_gpu_keeps_a_step_while_a_later_backdrop_moves() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let d = pane_and_nested_glass_doc();
+    let p = d.first_page().unwrap();
+    let (w, h) = PARITY;
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+    let plan = scene::plan(&d, p).unwrap();
+    let ids = first_step(&plan).expect("the stripes are a step of their own");
+    let key = scene::step_key(&d, &view, &ids);
+    let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+    segmented_pixels(&mut canvas, &device, &queue, &d, &view).expect("drawn");
+    // The pane moves: the stripes did not change, so their step stays kept.
+    let pane = d.node(p).and_then(|p| p.children.get(4).copied()).expect("the pane");
+    let moved_by = figcraft_geom::Affine::translate((10.0, 6.0));
+    let mut edited = d.clone();
+    let was = edited.get(pane).map(|n| n.transform).unwrap_or(figcraft_geom::Affine::IDENTITY);
+    if let Ok(n) = edited.get_mut(pane) {
+        n.transform = moved_by * was;
+    }
+    assert_eq!(scene::step_key(&edited, &view, &ids), key, "the stripes did not change");
+    let moved = segmented_pixels(&mut canvas, &device, &queue, &edited, &view).expect("drawn");
+    assert!(canvas.step_kept(0, key).is_some(), "the unchanged step is kept");
+    let mut fresh = CanvasGpu::new(&device, w, h).unwrap();
+    let expected = segmented_pixels(&mut fresh, &device, &queue, &edited, &view).expect("drawn");
+    assert_eq!(moved.data(), expected.data(), "a moved pane draws over the kept step correctly");
+}
+
+#[test]
+fn a_step_that_reads_the_page_is_drawn_every_frame() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let d = pane_and_nested_glass_doc();
+    let p = d.first_page().unwrap();
+    let (w, h) = PARITY;
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+    let plan = scene::plan(&d, p).unwrap();
+    let group = first_step(&plan).expect("the stripes");
+    assert!(scene::step_is_self_contained(&d, &group), "the stripes read no backdrop");
+    let nested = plan
+        .iter()
+        .filter_map(|s| match s {
+            scene::Step::Nodes(ids) => Some(ids.clone()),
+            scene::Step::Backdrop(_) => None,
+        })
+        .nth(1)
+        .expect("the group is a step of its own");
+    assert!(!scene::step_is_self_contained(&d, &nested), "the group's nested pane reads the stripes under it");
+    let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+    segmented_pixels(&mut canvas, &device, &queue, &d, &view).expect("drawn");
+    // The stripes change under the nested pane: its step must be drawn again, not kept.
+    let stripe = d.node(p).and_then(|p| p.children.get(2).copied()).expect("a stripe under the pane");
+    let edited = recoloured(&d, stripe, "A040E0");
+    let changed = segmented_pixels(&mut canvas, &device, &queue, &edited, &view).expect("drawn");
+    let mut fresh = CanvasGpu::new(&device, w, h).unwrap();
+    let expected = segmented_pixels(&mut fresh, &device, &queue, &edited, &view).expect("drawn");
+    assert_eq!(changed.data(), expected.data(), "a step that reads the page is not kept");
 }
 
 #[test]
@@ -809,14 +959,7 @@ fn paints_doc() -> Document {
     add(&mut d, p, "photo tile", (20.0, 240.0), (180.0, 180.0), vec![image(figcraft_color::ImageScaleMode::Tile, &|i| i.scale = 0.5)]);
     add(&mut d, p, "photo turned", (220.0, 240.0), (200.0, 180.0), vec![image(figcraft_color::ImageScaleMode::Fill, &|i| i.rotation = 1)]);
     // A filtered photo, and a translucent one (the sampler's own alpha).
-    add(
-        &mut d,
-        p,
-        "photo tuned",
-        (440.0, 240.0),
-        (140.0, 180.0),
-        vec![image(figcraft_color::ImageScaleMode::Fill, &|i| i.filters.exposure = 0.3)],
-    );
+    add(&mut d, p, "photo tuned", (440.0, 240.0), (140.0, 180.0), vec![image(figcraft_color::ImageScaleMode::Fill, &|i| i.filters.exposure = 0.3)]);
     let mut faint = image(figcraft_color::ImageScaleMode::Fill, &|_| {});
     faint.opacity = 0.55;
     add(&mut d, p, "photo faint", (600.0, 240.0), (140.0, 180.0), vec![faint]);
@@ -914,7 +1057,8 @@ fn shadow_shape_doc() -> Document {
         id
     };
 
-    let ellipse = add(&mut d, NodeKind::Ellipse { start: 0.0, sweep: std::f64::consts::TAU, inner: 0.0 }, "ellipse", (20.0, 16.0), (160.0, 120.0), "E03030");
+    let ellipse =
+        add(&mut d, NodeKind::Ellipse { start: 0.0, sweep: std::f64::consts::TAU, inner: 0.0 }, "ellipse", (20.0, 16.0), (160.0, 120.0), "E03030");
     d.get_mut(ellipse).unwrap().effects = vec![shadow(12.0, 0.0, (0.0, 6.0))];
 
     let star = add(&mut d, NodeKind::Star { count: 6, inner_ratio: 0.45 }, "star", (210.0, 16.0), (140.0, 120.0), "2040E0");
@@ -969,7 +1113,14 @@ fn shadow_shape_doc() -> Document {
         n.corners.radii = [16.0; 4];
         n.effects = vec![inner(10.0, 6.0, (4.0, 4.0))];
     }
-    let inner_ellipse = add(&mut d, NodeKind::Ellipse { start: 0.0, sweep: std::f64::consts::TAU, inner: 0.0 }, "inner ellipse", (380.0, 380.0), (150.0, 120.0), "D0E8F0");
+    let inner_ellipse = add(
+        &mut d,
+        NodeKind::Ellipse { start: 0.0, sweep: std::f64::consts::TAU, inner: 0.0 },
+        "inner ellipse",
+        (380.0, 380.0),
+        (150.0, 120.0),
+        "D0E8F0",
+    );
     d.get_mut(inner_ellipse).unwrap().effects = vec![inner(8.0, 0.0, (2.0, 2.0))];
 
     // Effects together, in the CPU's order: inner shadows, the layer blur and grain, the shadows
@@ -990,9 +1141,7 @@ fn shadow_shape_doc() -> Document {
     {
         let n = d.get_mut(grain).unwrap();
         n.corners.radii = [24.0; 4];
-        let mut nz = figcraft_doc::Noise::default();
-        nz.size = 1.0;
-        nz.density = 0.6;
+        let nz = figcraft_doc::Noise { size: 1.0, density: 0.6, ..Default::default() };
         n.effects = vec![Effect::layer_blur(), Effect { kind: EffectKind::Noise(nz), visible: true }, shadow(10.0, 0.0, (2.0, 5.0))];
     }
     let ramp = add(&mut d, NodeKind::Rectangle, "progressive blur", (560.0, 530.0), (150.0, 110.0), "20C060");
@@ -1080,12 +1229,7 @@ fn the_gpu_draws_shadows_of_any_shape() {
                     }
                 }
             }
-            println!(
-                "  {name:14} worst {w:3} at {wp:?} (CPU {:?}, GPU {:?}), mean {:.3}",
-                px(&cpu, wp),
-                px(&gpu, wp),
-                sum / n.max(1) as f64
-            );
+            println!("  {name:14} worst {w:3} at {wp:?} (CPU {:?}, GPU {:?}), mean {:.3}", px(&cpu, wp), px(&gpu, wp), sum / n.max(1) as f64);
         }
     }
     assert!(worst <= 96, "a channel differs by {worst} (mean {mean:.3})");
@@ -1100,14 +1244,8 @@ fn the_gpu_draws_shadows_of_any_shape() {
     assert!(canvas.render(&device, &queue, &built, scene::background(&d, p)).is_some());
     let again = canvas.read(&device, &queue).unwrap();
     let (w1, m1, _, o1) = diff(&gpu, &again);
-    let shadowed = d
-        .nodes()
-        .filter(|n| {
-            n.effects.iter().any(|e| {
-                e.visible && matches!(e.kind, EffectKind::DropShadow(_) | EffectKind::InnerShadow(_))
-            })
-        })
-        .count();
+    let shadowed =
+        d.nodes().filter(|n| n.effects.iter().any(|e| e.visible && matches!(e.kind, EffectKind::DropShadow(_) | EffectKind::InnerShadow(_)))).count();
     println!("kept shadows: worst {w1}, mean {m1:.3}, {o1} differ by more than 8, {} kept of {shadowed} shadowed nodes", canvas.kept_shadows());
     if std::env::var("FIGCRAFT_REGIONS").is_ok() {
         let (w2, m2, _, o2) = diff(&cpu, &again);
@@ -1163,9 +1301,7 @@ fn shadow_layer_cards(n: u32, inner: bool) -> Document {
         let node = d.get_mut(id).unwrap();
         if inner {
             node.corners.radii = [0.0, 34.0, 12.0, 26.0];
-            let mut s = figcraft_doc::Shadow::default();
-            s.radius = 14.0;
-            s.offset = (0.0, 4.0);
+            let s = figcraft_doc::Shadow { radius: 14.0, offset: (0.0, 4.0), ..Default::default() };
             node.effects = vec![Effect { kind: EffectKind::InnerShadow(s), visible: true }];
         } else {
             node.effects = vec![Effect::drop_shadow()];
@@ -1372,7 +1508,7 @@ fn mask_doc() -> Document {
     let hex = |s: &str| Color::from_hex(s).unwrap_or(Color::WHITE);
     let frame = d.create(p, NodeKind::Frame, "masked", 20.0, 20.0, 300.0, 200.0).unwrap();
     d.get_mut(frame).unwrap().fills = vec![Paint::solid(hex("FFFFFF"))];
-    let mut card = |d: &mut Document, parent, name: &str, x: f64, y: f64, w: f64, h: f64, color: &str| {
+    let card = |d: &mut Document, parent, name: &str, x: f64, y: f64, w: f64, h: f64, color: &str| {
         let id = d.create(parent, NodeKind::Rectangle, name, x, y, w, h).unwrap();
         d.get_mut(id).unwrap().fills = vec![Paint::solid(Color::from_hex(color).unwrap_or(Color::WHITE))];
         d.get_mut(id).unwrap().corners.radii = [12.0; 4];
@@ -1739,86 +1875,112 @@ fn segmented_timings() {
     }
 }
 
-/// Where a segmented frame's time goes: encoding each segment (vello's CPU side), the composes,
-/// the effects, and the present.
+/// A frame as the app draws it: the segmented path when the page has a backdrop node, the single
+/// scene otherwise (what `canvas::present` chooses).
+fn gpu_frame(canvas: &mut CanvasGpu, device: &Device, queue: &Queue, d: &Document, view: &View, background: figcraft_color::Color) -> bool {
+    let Some(p) = d.first_page() else { return false };
+    let Ok(plan) = scene::plan(d, p) else { return false };
+    if plan.iter().any(|s| matches!(s, scene::Step::Backdrop(_))) {
+        return crate::canvas::segmented_frame(device, queue, canvas, d, p, view, &plan, background).is_some();
+    }
+    let built = {
+        let mut layers = crate::canvas::GpuLayers { canvas, device, queue };
+        scene::build_with(d, p, view, &mut layers)
+    };
+    built.is_ok_and(|s| canvas.render(device, queue, &s, background).is_some())
+}
+
+/// The middle of a set of frame times (the machine's GPU throughput moves with what else runs).
+fn median(times: &mut [f64]) -> f64 {
+    if times.is_empty() {
+        return 0.0;
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    times[times.len() / 2]
+}
+
+/// A single-layer drag as the app draws it: one card moves a pixel a frame (a new document
+/// revision each frame) on the corpus pages. The CPU's own canvas path (`Retained`: damaged
+/// pixels only, effect layers kept) is the baseline the GPU has to meet.
 #[test]
 #[ignore = "timing: run in release with --ignored --nocapture"]
-fn segmented_breakdown() {
+fn segmented_drag_timings() {
     let Some((device, queue)) = device() else {
         eprintln!("no GPU adapter: skipping");
         return;
     };
-    let d = heavy_effects_doc();
-    let p = d.first_page().unwrap();
-    let view = View { origin: (-164.6, -841.2), scale: 0.3464285714285714, width: 904, height: 860 };
-    let plan = scene::plan(&d, p).unwrap();
-    let mut canvas = CanvasGpu::new(&device, view.width, view.height).unwrap();
-    let background = scene::background(&d, p);
-    let mut t_draw = 0.0f64;
-    let mut t_effect = 0.0f64;
-    let mut frames = 0u32;
-    let mut segments = 0u32;
-    let mut t_all = 0.0f64;
-    // The same steps as `canvas::segmented_frame`, with a clock around each part.
-    for _ in 0..6 {
-        let frame_start = std::time::Instant::now();
-        let (acc, acc_view) = canvas.page_layer(&device).unwrap();
-        canvas.fill_layer(&device, &queue, &acc_view, background);
-        let mut pending = vello::Scene::new();
-        let mut dirty = false;
-        let mut over = |canvas: &mut CanvasGpu, pending: &vello::Scene| {
-            let segment_view = canvas.segment_layer(&device).unwrap();
-            assert!(canvas.draw_into(&device, &queue, pending, &segment_view));
-            canvas.compose_over(&device, &queue, &acc_view, &segment_view);
-            segments += 1;
-        };
-        for step in &plan {
-            match step {
-                scene::Step::Nodes(ids) => {
-                    let t = std::time::Instant::now();
-                    {
-                        let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
-                        scene::draw_into(&d, p, &view, &mut layers, ids, &mut pending).unwrap();
+    let pages = [
+        ("plain", shadow_cards(30)),
+        ("layer blur", blurred_doc()),
+        ("one glass pane", glass_doc()),
+        ("heavy", heavy_effects_doc()),
+        ("nested backdrops", nested_backdrop_doc()),
+    ];
+    let mut doc_id = 1u64;
+    for (name, d) in pages {
+        let p = d.first_page().unwrap();
+        for (w, h) in [(904u32, 860u32), (2400, 1600)] {
+            doc_id += 1;
+            let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+            let background = scene::background(&d, p);
+            let card = d.node(p).and_then(|p| p.children.first().copied());
+            let moved = |i: u32| {
+                let mut e = d.clone();
+                if let Some(id) = card {
+                    let by = figcraft_geom::Affine::translate((f64::from(i), 0.0));
+                    let was = e.get(id).map(|n| n.transform).unwrap_or(figcraft_geom::Affine::IDENTITY);
+                    if let Ok(n) = e.get_mut(id) {
+                        n.transform = by * was;
                     }
-                    t_draw += t.elapsed().as_secs_f64() * 1000.0;
-                    dirty = true;
                 }
-                scene::Step::Backdrop(id) => {
-                    if dirty {
-                        over(&mut canvas, &pending);
-                        pending = vello::Scene::new();
-                    }
-                    let t = std::time::Instant::now();
-                    let image = {
-                        let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
-                        layers.backdrop_effect(&d, *id, &view, &acc)
-                    };
-                    t_effect += t.elapsed().as_secs_f64() * 1000.0;
-                    let image = image.unwrap();
-                    {
-                        let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
-                        scene::draw_backdrop_into(&d, p, &view, &mut layers, *id, &image, &mut pending).unwrap();
-                    }
-                    dirty = true;
-                }
+                e
+            };
+            // The GPU: warm up (pipelines, glass geometry), then ten frames of the drag, each
+            // waited for (what the window shows is the finished frame).
+            let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+            for _ in 0..2 {
+                assert!(gpu_frame(&mut canvas, &device, &queue, &d, &view, background));
             }
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let mut drag = Vec::new();
+            for i in 0..10 {
+                let t = std::time::Instant::now();
+                assert!(gpu_frame(&mut canvas, &device, &queue, &moved(i), &view, background));
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                drag.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            // A frame with nothing changed: every step kept.
+            let mut still = Vec::new();
+            for _ in 0..10 {
+                let t = std::time::Instant::now();
+                assert!(gpu_frame(&mut canvas, &device, &queue, &d, &view, background));
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                still.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            // The CPU's canvas: its retained layers and damaged pixels on the same frames (the
+            // options `render_worker` gives it).
+            let mut retained = figcraft_render::Retained::default();
+            let opts = Options { lod: true, doc_id, ..Options::default() };
+            let run = |retained: &mut figcraft_render::Retained, i: u32| {
+                let doc = Arc::new(moved(i));
+                retained.render(&doc, p, &view, &opts).is_some()
+            };
+            assert!(run(&mut retained, 0));
+            assert!(run(&mut retained, 1));
+            let mut cpu_frames = Vec::new();
+            for i in 0..10 {
+                let t = std::time::Instant::now();
+                assert!(run(&mut retained, i));
+                cpu_frames.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            println!(
+                "{name:16} {w} × {h}: CPU retained {:5.2} ms | GPU drag {:5.2} ms, still {:5.2} ms (medians)",
+                median(&mut cpu_frames),
+                median(&mut drag),
+                median(&mut still)
+            );
         }
-        if dirty {
-            over(&mut canvas, &pending);
-        }
-        canvas.present_layer(&device, &queue, &acc);
-        t_all += frame_start.elapsed().as_secs_f64() * 1000.0;
-        frames += 1;
     }
-    let _ = device.poll(wgpu::PollType::wait_indefinitely());
-    println!(
-        "segmented breakdown, {} segments a frame: {:.2} ms (encoding {:.2}, effects {:.2}, segments and composes {:.2})",
-        segments / frames,
-        t_all / f64::from(frames),
-        t_draw / f64::from(frames),
-        t_effect / f64::from(frames),
-        (t_all - t_draw - t_effect) / f64::from(frames)
-    );
 }
 
 #[test]

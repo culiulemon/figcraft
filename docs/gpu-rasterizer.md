@@ -151,8 +151,9 @@ the CPU render within the parity tolerance; toggling the setting changes nothing
   layer, or a crop + blur + the glass shader) and the node's content goes over it. The page under
   two panes is drawn once, so panes no longer compound.
 - **Everything that reads its backdrop now stays on the GPU**, as many panes and blurs as the page
-  has. `scene::plan` refuses only a backdrop node nested inside another layer — there is no
-  segment boundary inside a layer — and that page stays on the CPU.
+  has, nested in containers too (P10): `scene::plan` refuses nothing for a backdrop effect any more;
+  a container with one nested inside it gets a step of its own (P11) and the builder re-renders what
+  lies under the node.
 - Parity: glass mean 0.061/255, worst 6, no pixel differs by more than 8
   (`the_segmented_page_matches_the_cpu_with_one_glass_pane` — the same numbers as the single-scene
   path); background blur mean 0.049/255, worst 25
@@ -167,16 +168,14 @@ the CPU render within the parity tolerance; toggling the setting changes nothing
   still one rounded rect, not a layer.
 - In the app (release, control channel, canvas 904 × 860, the same page): the GPU holds
   `canvas.rasterizer = gpu` and drags it in 12–19 ms a frame where the CPU's *full* render takes
-  30–34 ms; a single-layer drag is 4.3–4.5 ms on the CPU's retained layers against 12–19 ms on the
-  GPU, which re-encodes the page every frame (see "Next slice" below).
-- Next: **cross-frame retention for segmented pages** — while one layer moves, the segments and
-  effect pixels under it have not changed, and the CPU path re-draws only what moved
-  (`figcraft_render::layers`); the GPU path needs the same (a key on the document's subtrees, the
-  view and the zoom) before a single-layer drag on a backdrop page beats the CPU's retained
-  renderer on render time. Its canvas *latency* is already lower in the app (17.8 ms against the
-  CPU's 41 ms in the same session), because no pixels cross the bus.
+  30–34 ms; a single-layer drag was 4.3–4.5 ms on the CPU's retained layers against 12–19 ms on the
+  GPU, which re-encoded the page every frame. P11 has since kept the page's steps between frames
+  (see P11 below): a single-layer drag on the corpus pages is now 0.9–10.9 ms, at or under the
+  CPU's retained renderer on the content-dominated pages and still 2–3× it on backdrop pages.
+  Its canvas *latency* was already lower in the app (17.8 ms against the CPU's 41 ms in the same
+  session), because no pixels cross the bus.
 - Then: inner shadows, grain, spread and translucent shadows, and drop shadows cast from blurred
-  layers.
+  layers — all landed under P6/P7.
 
 Exit: the 30-shadow + 3-glass + 2-blur page renders entirely on the GPU, and its drag frame at
 2400 × 1600 stays at or under the 10–13 ms the CPU path reaches with the layer cache, at
@@ -218,7 +217,8 @@ from 11.6 to 3.2 ms a frame.
   `docs/gaps.md` and `ROADMAP.md` carry the numbers.
 - **Nothing CPU-only was removed, on purpose.** The CPU renderer is still the oracle for the parity
   suite, the source of every export, the browser's canvas, the fallback for refused pages and the
-  retainer the GPU lacks (cross-frame retention). The single-scene backdrop route in
+  reference for what the GPU's own retention should cost (it keeps effect layers and repaints only
+  damaged pixels; the GPU keeps steps, see P11). The single-scene backdrop route in
   `scene::build_with` is kept as the parity reference for each effect, though the canvas always
   segments a page that has a backdrop node.
 - What is left is the full-coverage program below (P5–P11), also listed in `docs/gaps.md` (gap 7).
@@ -394,10 +394,12 @@ Exit: no text falls back — met.
 
 **Landed (nested backdrops).** A backdrop node inside a container (a glass pane in a group, a
 blurred card in a card) used to make `scene::plan` refuse the page. It doesn't need a segment
-boundary: the builder already re-renders everything that lies under such a node
+boundary *inside* a layer: the builder already re-renders everything that lies under such a node
 (`Builder::backdrop_of`, over `figcraft_render::backdrop::above`) and blurs that — the page's
 content up to the node, its ancestors' earlier children included. That is one extra page render per
-nested backdrop each frame (the price of not segmenting inside a layer), and it is exact.
+nested backdrop each frame (the price of not segmenting inside a layer), and it is exact. P11 gives
+the top-level container such a node lives in a step of its own, so the layers before it are kept
+between frames; the render under the node itself still repeats.
 
 `the_gpu_draws_nested_backdrops`: stripes, a group with a card and a glass pane on it, a frame with
 a blurred card inside — **pixel-identical** to the CPU (worst 0, mean 0.000).
@@ -413,22 +415,63 @@ named under P7.
 
 ### P11 — performance: cross-frame retention
 
-Coverage first, then speed. **Not started.** A segmented page is re-encoded whole every frame, so
-dragging one layer costs 12–19 ms against the CPU's retained 4–5 ms (its canvas latency is already
-lower). Keep the node's encoded scene and its effect pixels between frames, keyed on the document's
-subtrees, the view and the zoom, as `figcraft_render::layers` does; a drag then re-encodes only what
-moved, and the segments below it are reused. The shadow and mask caches are the first step of this
-(P6, P8) — what is missing is the *scene* per subtree and per segment.
+Coverage first, then speed. **Landed (2026-10-25), with the damage-tracking part left open.**
 
-Tests: a drag benchmark that must beat the CPU's retained renderer on every page in the corpus
-(plain, layer blur, shadows, glass, blurs); a test that a kept segment is dropped when its content
-changes. Exit: the GPU is at or under the CPU's retained frame time everywhere, at full quality.
+A segmented page no longer re-encodes itself whole every frame:
+
+- Each ordinary `Step::Nodes` is drawn into a canvas-sized step segment kept between frames, keyed
+  on its subtrees, the view and the zoom (`scene::step_key`, as `figcraft_render::layers` keys its
+  kept layers). A step whose key still matches is laid over the page again instead of being drawn
+  again. The segments are bounded: as many canvas-sized textures as `STEP_BYTES` (128 MB) affords
+  (`CanvasGpu::step_slots`); a page with more steps than that draws the rest into the shared one.
+- A step whose pixels are not its own — a container with a backdrop effect nested inside it — is
+  never kept (`scene::step_is_self_contained`): it reads the page under it, which may have changed.
+- A top-level container with a backdrop effect nested in it gets a segment of its own
+  (`scene::plan`), so on a segmented page the layers before it are kept and only its own re-render
+  (the page under it, then the glass or blur) repeats. On a page that is not segmented otherwise
+  (all its backdrop effects nested), the single-scene builder draws it whole, as in P10.
+
+Tests: `the_gpu_keeps_an_unchanged_step_between_frames` (a kept segment draws the same pixels; an
+edit gives the step a new key and the frame matches one from a canvas that never drew it),
+`the_gpu_keeps_a_step_while_a_later_backdrop_moves`, `a_step_that_reads_the_page_is_drawn_every_frame`
+(a nested pane's step is drawn again when the stripes under it change), and the *timing*
+`segmented_drag_timings`.
+
+Measured (`segmented_drag_timings`, release, medians of ten frames with a wait after each, one card
+dragged a pixel a frame; the CPU is `figcraft_render::Retained` — damaged pixels and kept effect
+layers — on the same frames; owner's machine, 2026-10-25, three runs shown as ranges because the
+GPU's throughput moves 2–3× with what else is running):
+
+| page | canvas | CPU retained | GPU drag | GPU, nothing changed |
+|---|---|---|---|---|
+| plain (30 shadowed cards) | 904 × 860 | 2.7–3.3 ms | 1.1–1.4 ms | 1.0–1.3 ms |
+| | 2400 × 1600 | 3.1–4.8 | 1.1–1.5 | 1.2–1.3 |
+| layer blur | 904 × 860 | 0.2–0.3 | 0.9–1.1 | 0.8–1.1 |
+| | 2400 × 1600 | 0.2–0.3 | 1.0–1.4 | 1.0–1.3 |
+| one glass pane | 904 × 860 | 2.2–2.6 | 1.8–6.5 | 2.8–3.8 |
+| | 2400 × 1600 | 2.3–2.5 | 5.3–6.6 | 2.1–2.3 |
+| heavy (30 shadows, 3 panes, 2 blurs) | 904 × 860 | 10.1–10.3 | 6.2–8.6 | 6.2–8.4 |
+| | 2400 × 1600 | 9.8–10.2 | 5.7–9.3 | 6.1–6.5 |
+| nested backdrops | 904 × 860 | 3.0–3.4 | 5.1–7.1 | 4.6–6.7 |
+| | 2400 × 1600 | 2.8–3.3 | 10.6–10.9 | 10.2–10.9 |
+
+The content-dominated pages are at or under the CPU's retained renderer, and every frame is inside
+a 60 Hz budget (16.7 ms) at 2400 × 1600. A drag *on a backdrop page* is still 2–3× the CPU's: the
+GPU assembles the whole page every frame (the background fill, a compose per step, the effect
+passes, the present copy) where the CPU repaints only the damaged rectangle. **The exit is not met
+on backdrop pages.** Closing it needs damage-tracked assembly: keep the last frame's page, clear
+only the damage rectangle, compose the steps that meet it and redo only the effects whose pane it
+touches (4–6 h).
 
 ### What is left on the CPU
 
 Content, after P5–P10: **texture**, a **group's inner shadow**, **`PlusDarker`** (a layer's and a
 paint's), and **luminance masks**. Each is a pass or a pixel walk of its own, named where it is
 planned above (P7, P8). A content file with one of those still re-renders whole on the CPU.
+
+Performance, after P11: **damage-tracked assembly** on backdrop pages (4–6 h) — the GPU assembles a
+segmented page every frame; the CPU repaints only the damaged rectangle, so a drag there is 2–3×
+faster.
 
 Deliberate exceptions, documented rather than ported: exports (`svg`, `pdf`, `png`/`jpg`), the parity
 suite and the browser keep the CPU renderer; the editor's outline modes, skipped layers, soft proof
@@ -448,10 +491,11 @@ Run in `cargo xtask ci` unless marked *timing* (release, `--ignored --nocapture`
 | 1e | `the_gpu_draws_the_paint_variations` | paints: a photo 1:1, fitted, cropped, tiled, rotated, filtered and translucent, a pattern fill, a diamond gradient, multiplied and screened paints (mean 0.066/255, worst 10) |
 | 1f | `the_gpu_draws_shadows_of_any_shape` | shadows of any shape: an ellipse, a star, a polygon, a per-corner card, text, a group, a frame with an overflowing child, inner shadows — with and without spread, and kept between frames (mean 0.066/255, worst 50) |
 | 1g | `the_gpu_draws_styled_text`, `the_gpu_draws_masks`, `the_gpu_draws_nested_backdrops` | styled runs and stroked text (pixel-identical), masks (mean 0.052/255), nested backdrops (pixel-identical) |
+| 1h | `the_gpu_keeps_an_unchanged_step_between_frames`, `the_gpu_keeps_a_step_while_a_later_backdrop_moves`, `a_step_that_reads_the_page_is_drawn_every_frame` | a kept step's pixels, an edit giving it a new key, and a step that reads the page never being kept (the frame matches a canvas that drew it fresh) |
 | 2 | `unsupported_pages_fall_back` | the predicate rejects exactly the features not yet ported |
 | 3 | `the_gpu_canvas_reads_back` | screenshot/export path: texture → `Pixmap`, premultiplied, same size |
 | 4 | *timing* `canvas_frame_timings`, `segmented_timings` | CPU vs GPU frame at 2320 × 1440 (plain and heavy) and 2400 × 1600 (backdrop pages) |
-| 5 | *timing* `heavy_scene_timings` (one effect group at a time, GPU against CPU), `heavy_scene_gpu_timings`, `layer_blur_timings`, `shadow_timings`, `segmented_breakdown` | each effect's own cost stays honest |
+| 5 | *timing* `heavy_scene_timings` (one effect group at a time, GPU against CPU), `heavy_scene_gpu_timings`, `layer_blur_timings`, `shadow_timings`, `segmented_drag_timings` | each effect's own cost stays honest, and a single-layer drag against the CPU's retained renderer on the corpus pages |
 | 6 | `cargo xtask wasm` | the browser build still compiles and stays CPU |
 | 7 | screenshot comparison | the real app looks the same with the GPU canvas on. Measured on the 34-layer page at 34.6%: mean 0.9/255, differences on shape and shadow edges only — the CPU path snaps the view outwards to whole device pixels while the GPU draws the requested view, so content can sit a pixel apart |
 
@@ -630,4 +674,16 @@ stays on the fallback list.
   - The editor's outline modes, skipped layers, soft proof and Display P3 stay on the CPU by design
     (`render_worker::gpu_job`), as does `PlusDarker`; texture and a group's inner shadow are the
     last two content cases left (P7).
+- 2026-10-25: **P11 landed — cross-frame retention for segmented pages, and nested backdrops get a
+  segment of their own.** Each ordinary step is drawn once and kept in a canvas-sized texture under
+  the key of its subtrees, the view and the zoom; unchanged steps are laid over the page again
+  without being drawn again. A step that reads the page (a container with a nested backdrop effect)
+  is never kept, and on a segmented page such a container forms a step of its own. A single-layer
+  drag on the corpus pages is 0.9–10.9 ms against the CPU's retained renderer's 0.2–10.3: at or
+  under it on the plain, shadow and effect-heavy pages, still 2–3× on backdrop pages, which the GPU
+  re-assembles whole each frame (`segmented_drag_timings`). Damage-tracked assembly is what is left
+  of P11 (4–6 h).
+  - `the_gpu_keeps_an_unchanged_step_between_frames`, `the_gpu_keeps_a_step_while_a_later_backdrop_moves`,
+    `a_step_that_reads_the_page_is_drawn_every_frame`: a kept step draws the same pixels, an edit
+    gives it a new key, and a step that reads the page is redrawn when what lies under it changes.
 

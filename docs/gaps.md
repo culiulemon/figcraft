@@ -20,7 +20,7 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
 | 4 | Interaction fidelity not compared tool by tool | UI/UX | 40–60 | [ui-parity](ui-parity.md) |
 | 5 | Localization: English, reviewed Russian, plus unreviewed Spanish (and Latin American Spanish), French, German, Brazilian Portuguese, Japanese, Korean, Simplified Chinese, Indonesian and Czech drafts; Turkish and Swedish catalogs | Localization | 29–51 | [localization-parity](localization-parity.md) |
 | 6 | Plugins: widgets take clicks only, a self-hosted directory but no public catalogue; Figma's plugins don't run | Ecosystem | 8–26 | [target-app-parity](target-app-parity.md) |
-| 7 | CPU canvas where Figma uses the GPU: blurs and glass run on the window's GPU, isolated layers are kept between frames, and the canvas draws pages of shapes, text and gradients with vello straight into an egui texture — layer blur, drop shadows on rounded opaque cards and a page's background blur included (2026-10-24: plain pages 1.1–1.7 ms a frame where the CPU takes 5.4–6.7 ms; 30 shadowed cards 0.7–0.8 ms where a CPU frame takes 24 ms); glass is implemented and parity-tested on the GPU but stays on the CPU until the backdrop render is shared between panes, and spread/translucent shadows, inner shadows, grain and masks still fall back — a drag across a page of glass is 12–15 ms a frame where Figma keeps its layers on the GPU | Hardware/performance | 25–50 | [hardware-parity](hardware-parity.md), [gpu-rasterizer](gpu-rasterizer.md) |
+| 7 | CPU canvas where Figma uses the GPU: the canvas draws on the window's GPU with vello (shapes, text, images, patterns, every effect list, masks, glass and backdrop effects, nested in containers too), keeping each page step between frames; texture, a group's inner shadow, plus-darker and luminance masks, and the editor's own modes stay on the CPU. A single-layer drag is 0.9–10.9 ms a frame (at or under the CPU's retained renderer on plain, shadow and effect-heavy pages; 2–3× it on backdrop pages, which are re-assembled whole each frame) — damage-tracked assembly is left | Hardware/performance | 4–6 | [hardware-parity](hardware-parity.md), [gpu-rasterizer](gpu-rasterizer.md) |
 | 8 | Platform QA: Linux and the browser left (Windows pass done 2026-10-11) | Stability/platforms | 10–20 | [hardware-parity](hardware-parity.md) |
 | 9 | Figma Draw: pen pressure on macOS/Linux tablets (multi-edit, brushes, pressure, text on a path and pattern fills landed) | Feature | 1–3 | [target-app-parity](target-app-parity.md) |
 | 10 | Team libraries: no team-wide lists or accounts; analytics are counts | Feature | 4–8 | [components-parity](components-parity.md) |
@@ -277,17 +277,29 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
   and a **backdrop effect nested in a group or frame** no longer refuses the page (pixel-identical).
   Still on the CPU for content: **texture**, a **group's inner shadow**, **plus-darker** (a layer's
   and a paint's) and **luminance masks**; the editor's outline modes, skipped layers, soft proof and
-  Display P3 stay there by design. A segmented page is still re-encoded whole each frame, so dragging
-  one layer on it costs 12–19 ms against the CPU's 4.3–4.5 ms retained render (its canvas latency is
-  still lower: 17.8 against 41 ms, as no pixels cross the bus); **cross-frame retention for those
-  pages is the next slice** — [`gpu-rasterizer.md`](gpu-rasterizer.md).
+  Display P3 stay there by design.
+- **Landed (2026-10-25), P11:** a segmented page keeps each ordinary step in a canvas-sized texture
+  between frames (keyed on its subtrees, the view and the zoom), and a step that reads the page under
+  it is never kept; on such a page a container with a nested backdrop gets a step of its own. A
+  single-layer drag on the corpus pages (release, medians of ten frames, CPU `Retained` on the same
+  frames; ranges over three runs, the GPU's throughput moving 2–3× with what else runs):
+  - 904 × 860 — plain 1.1–1.4 ms against 2.7–3.3, layer blur 0.9–1.1 against 0.2–0.3, one glass
+    pane 1.8–6.5 against 2.2–2.6, heavy 6.2–8.6 against 10.1–10.3, nested backdrops 5.1–7.1
+    against 3.0–3.4;
+  - 2400 × 1600 — plain 1.1–1.5 against 3.1–4.8, layer blur 1.0–1.4 against 0.2–0.3, one pane
+    5.3–6.6 against 2.3–2.5, heavy 5.7–9.3 against 9.8–10.2, nested 10.6–10.9 against 2.8–3.3
+    (`segmented_drag_timings`).
+
+  At or under the CPU on the content-dominated pages and inside one 60 Hz frame everywhere; a drag
+  on a *backdrop* page is still 2–3× the CPU's, which repaints only the damaged rectangle —
+  **damage-tracked assembly is the next slice** ([`gpu-rasterizer.md`](gpu-rasterizer.md) P11).
 - **Evidence (measured, `cargo xtask bench`):** a 50k-layer page ~8 ms zoomed out with levels of
   detail, single-layer edits at 10k layers ~0.2 ms; full 1440×900 renders 7–15 ms at 10k layers.
   Heavy effects (glass, background blur, noise) and 4K/5K canvases at 2x are where CPU time grows.
 - **Impact:** large files and effect-heavy designs; battery on laptops.
-- **Estimate:** 5–8 h left ([`gpu-rasterizer.md`](gpu-rasterizer.md) P11): cross-frame retention.
-  P5–P10 landed 2026-10-25; the content left on the CPU is texture, a group's inner shadow,
-  plus-darker and luminance masks, each a pass or a pixel walk of its own.
+- **Estimate:** 4–6 h left ([`gpu-rasterizer.md`](gpu-rasterizer.md) P11): damage-tracked assembly
+  for pages with backdrop effects. P5–P11 landed 2026-10-25; the content left on the CPU is texture,
+  a group's inner shadow, plus-darker and luminance masks, each a pass or a pixel walk of its own.
 
 ### 8. Platform QA: Linux and the browser left
 - **Missing:** regular runs on Linux and the browser; real screen readers; a repeat of the Windows
