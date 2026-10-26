@@ -139,8 +139,9 @@ pub enum Step {
 }
 
 /// How to draw `page` in segments: its top-level children in order, with backdrop nodes as steps
-/// of their own (the page is accumulated up to each one). `Err` when a backdrop node is nested —
-/// there is no segment boundary inside a layer, so such a page stays on the CPU.
+/// of their own (the page is accumulated up to each one). A backdrop node *nested* in a container
+/// needs no step: the builder re-renders what lies under it (`Builder::backdrop_of`) — correct,
+/// where a segment boundary inside a layer would not be.
 pub fn plan(doc: &Document, page: NodeId) -> Result<Vec<Step>, Unsupported> {
     let Some(p) = doc.node(page) else { return Ok(Vec::new()) };
     let mut steps = Vec::new();
@@ -156,9 +157,8 @@ pub fn plan(doc: &Document, page: NodeId) -> Result<Vec<Step>, Unsupported> {
             }
             steps.push(Step::Backdrop(*c));
         } else {
-            if subtree_backdrop(doc, *c, 0) {
-                return Err(Unsupported::Effect);
-            }
+            // A backdrop effect further down re-renders what lies under itself (see
+            // [`Builder::backdrop_of`]): it needs no segment boundary, only that work.
             run.push(*c);
         }
     }
@@ -166,18 +166,6 @@ pub fn plan(doc: &Document, page: NodeId) -> Result<Vec<Step>, Unsupported> {
         steps.push(Step::Nodes(run));
     }
     Ok(steps)
-}
-
-/// Whether `id` or anything in it reads its backdrop.
-fn subtree_backdrop(doc: &Document, id: NodeId, depth: usize) -> bool {
-    if depth > MAX_DEPTH {
-        return true;
-    }
-    let Some(n) = doc.node(id) else { return false };
-    if backdrop_of(n).is_some() {
-        return true;
-    }
-    n.children.iter().any(|c| subtree_backdrop(doc, *c, depth + 1))
 }
 
 /// Draw `ids` (children of `page`, in order) into `out`.

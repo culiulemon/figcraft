@@ -453,6 +453,56 @@ fn glass_doc() -> Document {
     d
 }
 
+/// Backdrop effects inside containers: a glass pane in a group, a blurred card in a frame.
+fn nested_backdrop_doc() -> Document {
+    let mut d = Document::new("gpu nested backdrops");
+    let p = d.first_page().unwrap();
+    let colours = ["E03030", "2040E0", "20C060", "F0C830"];
+    for i in 0..18u32 {
+        let id = d.create(p, NodeKind::Rectangle, "stripe", f64::from(i) * 50.0, 0.0, 50.0, 400.0).unwrap();
+        d.get_mut(id).unwrap().fills = vec![Paint::solid(Color::from_hex(colours[i as usize % colours.len()]).unwrap_or(Color::WHITE))];
+    }
+    let group = d.create(p, NodeKind::Group, "card group", 60.0, 40.0, 520.0, 320.0).unwrap();
+    let card = d.create(group, NodeKind::Rectangle, "card", 0.0, 0.0, 520.0, 320.0).unwrap();
+    d.get_mut(card).unwrap().fills = vec![Paint::solid(Color::from_hex("FFFFFF").unwrap_or(Color::WHITE))];
+    let pane = d.create(group, NodeKind::Rectangle, "nested glass", 40.0, 40.0, 240.0, 160.0).unwrap();
+    {
+        let n = d.get_mut(pane).unwrap();
+        n.corners.radii = [32.0; 4];
+        n.fills = vec![Paint::solid(Color { a: 0.1, ..Color::WHITE })];
+        n.effects = vec![Effect { kind: EffectKind::Glass(Glass::default()), visible: true }];
+    }
+    let frame = d.create(p, NodeKind::Frame, "blurred card", 600.0, 40.0, 240.0, 200.0).unwrap();
+    {
+        let n = d.get_mut(frame).unwrap();
+        n.corners.radii = [24.0; 4];
+        n.fills = vec![Paint::solid(Color::from_hex("F06030").unwrap_or(Color::WHITE))];
+        n.clip = true;
+    }
+    let blurred = d.create(frame, NodeKind::Rectangle, "nested blur", 30.0, 30.0, 160.0, 100.0).unwrap();
+    {
+        let n = d.get_mut(blurred).unwrap();
+        n.corners.radii = [16.0; 4];
+        let mut b = figcraft_doc::Blur::default();
+        b.radius = 24.0;
+        n.effects = vec![Effect { kind: EffectKind::BackgroundBlur(b), visible: true }];
+    }
+    d
+}
+
+#[test]
+fn the_gpu_draws_nested_backdrops() {
+    if device().is_none() {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    }
+    let d = nested_backdrop_doc();
+    let Some((worst, mean, over)) = segmented_parity(&d, "nested backdrops") else { return };
+    assert!(worst <= 128, "a channel differs by {worst} (mean {mean:.3})");
+    assert!(mean <= 2.0, "the mean difference is {mean:.3}");
+    assert!(over < (PARITY.0 * PARITY.1) as usize / 20, "{over} pixels differ by more than 8");
+}
+
 #[test]
 fn the_gpu_glass_matches_the_cpu_canvas() {
     let Some((device, queue)) = device() else {

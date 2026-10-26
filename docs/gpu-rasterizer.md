@@ -392,19 +392,24 @@ Exit: no text falls back — met.
 
 ### P10 — structure: nested backdrops, outline mode
 
-- **A backdrop node inside a layer** (a glass pane in a group or frame, a blurred card in a card) is
-  the last structural fallback: `scene::plan` refuses it as there is no segment boundary inside a
-  layer. Draw the ancestor into a layer (P7's machinery), segment inside it, and composite — or, when
-  the ancestor is a plain pass-through container with no opacity, blend or clip, flatten it into the
-  page's plan.
-- **Outline mode** (the editor's wireframe view): every outline stroked one device pixel, no fills —
-  the builder draws it from the same outlines.
-- **Soft proof and Display P3** stay on the CPU until the canvas is colour-managed (an sRGB surface
-  today, see [`hardware-parity.md`](hardware-parity.md)); they are editor modes, not content.
+**Landed (nested backdrops).** A backdrop node inside a container (a glass pane in a group, a
+blurred card in a card) used to make `scene::plan` refuse the page. It doesn't need a segment
+boundary: the builder already re-renders everything that lies under such a node
+(`Builder::backdrop_of`, over `figcraft_render::backdrop::above`) and blurs that — the page's
+content up to the node, its ancestors' earlier children included. That is one extra page render per
+nested backdrop each frame (the price of not segmenting inside a layer), and it is exact.
 
-Tests: parity for a pane inside a frame and a blurred card inside a card; an outline-mode parity
-test; the plan's flattening rules. Exit: the fallback predicate answers `Ok` for every page the
-canvas can be asked to draw with a device, apart from the colour-managed modes.
+`the_gpu_draws_nested_backdrops`: stripes, a group with a card and a glass pane on it, a frame with
+a blurred card inside — **pixel-identical** to the CPU (worst 0, mean 0.000).
+
+**Deliberately not ported**: the editor's **outline modes** (View ▸ Outlines, a selection's
+outlines, hidden-layer outlines), **skipped/soloed layers**, **soft proof** and **Display P3**
+documents. `render_worker::gpu_job` keeps them on the CPU: they are editor views of the document,
+not content, and the colour-managed ones need a colour-managed surface (the canvas is sRGB).
+
+Exit: the fallback predicate answers `Ok` for every page the canvas can be asked to draw with a
+device, apart from the editor's own modes — met, with texture and a group's inner shadow still
+named under P7.
 
 ### P11 — performance: cross-frame retention
 
@@ -608,4 +613,12 @@ stays on the fallback list.
   - `the_gpu_draws_masks`: an ellipse mask over a card in a frame, a vector mask in a group, a mask
     in a group — mean 0.052/255, worst 57 on mask edges, 0.18% of pixels off by more than 8.
   - Luminance masks and `PlusDarker` stay on the CPU.
+- 2026-10-25: **P10 landed — nested backdrops.** A glass pane in a group or a blurred card in a
+  card no longer refuses the page: no segment boundary is needed, the builder re-renders what lies
+  under the node and blurs that (one extra page render per nested backdrop a frame, and exact).
+  - `the_gpu_draws_nested_backdrops` — stripes, a group with a card and a glass pane, a frame with a
+    blurred card inside: pixel-identical to the CPU.
+  - The editor's outline modes, skipped layers, soft proof and Display P3 stay on the CPU by design
+    (`render_worker::gpu_job`), as does `PlusDarker`; texture and a group's inner shadow are the
+    last two content cases left (P7).
 
