@@ -368,6 +368,11 @@ pub trait Layers {
     fn shadow_of_layer(&mut self, layer: &Layer, grow: i32, sigma: f64, color: Color, key: Option<(u64, u64)>) -> Option<Layer>;
     /// `layer`'s pixels, for the effects the CPU works out (grain's noise, the texture's scatter).
     fn layer_pixels(&mut self, layer: &Layer) -> Option<Pixmap>;
+    /// `content` cut by `mask`'s luminance × alpha into one layer (a luminance mask; the CPU's
+    /// `MaskType::Luminance`), kept under `key` when it was made before.
+    fn luminance_masked(&mut self, _content: &Scene, _mask: &Layer, _width: u32, _height: u32, _key: Option<(u64, u64)>) -> Option<Layer> {
+        None
+    }
     /// A layer kept from an earlier frame under `key` (`None`: there is none, or keeping is off).
     fn kept_shadow(&mut self, _key: (u64, u64)) -> Option<Layer> {
         None
@@ -424,6 +429,9 @@ impl Layers for Probe {
     }
     fn shadow_of_layer(&mut self, layer: &Layer, _grow: i32, _sigma: f64, _color: Color, _key: Option<(u64, u64)>) -> Option<Layer> {
         Some(Layer::blank(layer.size.0, layer.size.1))
+    }
+    fn luminance_masked(&mut self, _content: &Scene, _mask: &Layer, width: u32, height: u32, _key: Option<(u64, u64)>) -> Option<Layer> {
+        Some(Layer::blank(width, height))
     }
     fn layer_pixels(&mut self, layer: &Layer) -> Option<Pixmap> {
         Pixmap::new(layer.size.0, layer.size.1)
@@ -729,11 +737,9 @@ impl Builder<'_> {
 
     /// A mask and the siblings it clips (until the next mask), in a layer of their own and cut by
     /// the mask's coverage — the renderer's `draw_masked`. An alpha mask is the node's own paint;
-    /// a vector mask is its outline, solid.
+    /// a vector mask is its outline, solid; a luminance mask is its paint's luma × alpha.
     fn masked(&mut self, mask: &Node, content: &[NodeId], parent_xf: Affine, depth: usize) -> Result<(), Unsupported> {
-        if mask.mask_type == figcraft_doc::MaskType::Luminance {
-            return Err(Unsupported::Mask);
-        }
+        let luma = mask.mask_type == figcraft_doc::MaskType::Luminance;
         // What the run covers, in device pixels, clipped to what is on screen.
         let mut rect: Option<KRect> = None;
         for id in content {
@@ -789,16 +795,21 @@ impl Builder<'_> {
             Ok(())
         })?;
         let Some(coverage_layer) = self.layers.layer(&coverage, w, h, None) else { return Err(Unsupported::Effect) };
-        let Some(content_layer) = self.layers.layer(&content_scene, w, h, None) else { return Err(Unsupported::Effect) };
-        // The siblings only where the mask covers, in one layer (`SrcIn`: source × destination's
-        // alpha), then drawn where the run sits.
-        let mut scene = Scene::new();
-        scene.draw_image(ImageBrush { image: &coverage_layer.image, sampler }, KAffine::IDENTITY);
-        let target = KRect::new(0.0, 0.0, f64::from(w), f64::from(h));
-        scene.push_layer(Fill::NonZero, Compose::SrcIn, 1.0, KAffine::IDENTITY, &target);
-        scene.draw_image(ImageBrush { image: &content_layer.image, sampler }, KAffine::IDENTITY);
-        scene.pop_layer();
-        let Some(out) = self.layers.layer(&scene, w, h, Some(key)) else { return Err(Unsupported::Effect) };
+        // A luminance mask multiplies by the mask's luma × alpha in one pass; an alpha mask keeps
+        // the siblings only where the mask's alpha covers (`SrcIn`: source × destination's alpha).
+        let out = if luma {
+            self.layers.luminance_masked(&content_scene, &coverage_layer, w, h, Some(key))
+        } else {
+            let Some(content_layer) = self.layers.layer(&content_scene, w, h, None) else { return Err(Unsupported::Effect) };
+            let mut scene = Scene::new();
+            scene.draw_image(ImageBrush { image: &coverage_layer.image, sampler }, KAffine::IDENTITY);
+            let target = KRect::new(0.0, 0.0, f64::from(w), f64::from(h));
+            scene.push_layer(Fill::NonZero, Compose::SrcIn, 1.0, KAffine::IDENTITY, &target);
+            scene.draw_image(ImageBrush { image: &content_layer.image, sampler }, KAffine::IDENTITY);
+            scene.pop_layer();
+            self.layers.layer(&scene, w, h, Some(key))
+        };
+        let Some(out) = out else { return Err(Unsupported::Effect) };
         if let Some(s) = &mut self.scene {
             s.draw_image(ImageBrush { image: &out.image, sampler }, KAffine::translate((x0, y0)));
         }

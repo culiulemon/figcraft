@@ -359,6 +359,38 @@ impl CanvasGpu {
         self.shadows.insert(key, Kept { layer, bytes, used: tick });
     }
 
+    /// `content` (a scene) cut by `mask`'s luminance × alpha into a `width` × `height` layer (a
+    /// luminance mask, as the CPU's `MaskType::Luminance`), kept under `key` when made before.
+    pub(crate) fn luminance_masked(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        content: &Scene,
+        mask: &crate::scene::Layer,
+        width: u32,
+        height: u32,
+        key: Option<(u64, u64)>,
+    ) -> Option<crate::scene::Layer> {
+        if let Some(key) = key
+            && let Some(hit) = self.kept_shadow(key)
+        {
+            return Some(hit);
+        }
+        let mask_texture = mask.texture.clone()?;
+        let content_texture = self.render_layer(device, queue, content, width, height)?;
+        let content_view = content_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mask_view = mask_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let out = layer_texture(device, "figcraft masked layer", width, height);
+        let out_view = out.create_view(&wgpu::TextureViewDescriptor::default());
+        self.compose.luminance(device, queue, &out_view, &content_view, &mask_view);
+        let layer = self.as_layer(out);
+        if let Some(key) = key {
+            let bytes = width as usize * height as usize * 4;
+            self.keep_shadow(key, layer.clone(), bytes);
+        }
+        Some(layer)
+    }
+
     /// How many shadows are kept (tests: a drag keeps the ones that did not move).
     #[cfg(test)]
     pub(crate) fn kept_shadows(&self) -> usize {
@@ -531,6 +563,10 @@ impl crate::scene::Layers for GpuLayers<'_> {
 
     fn kept_shadow(&mut self, key: (u64, u64)) -> Option<Layer> {
         self.canvas.kept_shadow(key)
+    }
+
+    fn luminance_masked(&mut self, content: &Scene, mask: &Layer, width: u32, height: u32, key: Option<(u64, u64)>) -> Option<Layer> {
+        self.canvas.luminance_masked(self.device, self.queue, content, mask, width, height, key)
     }
 
     fn cached_node(&mut self, key: u64) -> Option<Arc<Scene>> {

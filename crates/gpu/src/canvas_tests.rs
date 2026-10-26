@@ -1601,6 +1601,29 @@ fn mask_doc() -> Document {
         n.is_mask = true;
     }
     card(&mut d, inner, "nested over", 0.0, 0.0, 220.0, 160.0, "8040E0");
+
+    // A luminance mask: a white-to-black gradient, so the card above it fades out across the run.
+    let luma_frame = d.create(p, NodeKind::Frame, "luminance masked", 20.0, 400.0, 300.0, 160.0).unwrap();
+    d.get_mut(luma_frame).unwrap().fills = vec![Paint::solid(hex("FFFFFF"))];
+    card(&mut d, luma_frame, "luma content", 0.0, 0.0, 300.0, 160.0, "3060E0");
+    let luma = d.create(luma_frame, NodeKind::Rectangle, "luma mask", 20.0, 20.0, 260.0, 120.0).unwrap();
+    {
+        let g = Gradient {
+            kind: GradientKind::Linear,
+            stops: vec![
+                figcraft_color::ColorStop { position: 0.0, color: hex("FFFFFF") },
+                figcraft_color::ColorStop { position: 1.0, color: hex("000000") },
+            ],
+            from: (0.0, 0.5),
+            to: (1.0, 0.5),
+            width: (0.0, -0.5),
+        };
+        let n = d.get_mut(luma).unwrap();
+        n.fills = vec![Paint::gradient(g)];
+        n.is_mask = true;
+        n.mask_type = figcraft_doc::MaskType::Luminance;
+    }
+    card(&mut d, luma_frame, "luma over", 0.0, 0.0, 300.0, 160.0, "F06030");
     d
 }
 
@@ -1613,7 +1636,8 @@ fn the_gpu_draws_masks() {
     let d = mask_doc();
     let p = d.first_page().unwrap();
     assert_eq!(scene::supported(&d, p), Ok(()), "masks stay on the GPU");
-    let (w, h) = PARITY;
+    // A taller canvas than `PARITY`: the mask cases (the luminance one in particular) sit below it.
+    let (w, h) = (900u32, 660u32);
     let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
     let cpu = render_view(&d, p, &view, &Options::default()).unwrap();
     let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
@@ -1641,6 +1665,18 @@ fn the_gpu_draws_masks() {
     }
     assert!(worst <= 96, "a channel differs by {worst} (mean {mean:.3})");
     assert!(mean <= 0.6, "the mean difference is {mean:.3}");
+    // The luminance mask over the run at y 420..540: its white left end shows the run's card, its
+    // black right end fades it out to the card below — and both match the CPU.
+    for (point, label) in [((60u32, 480u32), "bright"), ((290, 480), "dark")] {
+        let (cpu_px, gpu_px) = (px(&cpu, point).unwrap_or_default(), px(&gpu, point).unwrap_or_default());
+        assert_eq!(cpu_px.len(), 4, "the {label} end of the luminance mask was drawn");
+        for c in 0..3 {
+            let d = i16::from(cpu_px[c]) - i16::from(gpu_px[c]);
+            assert!(d.abs() <= 16, "the {label} end: channel {c} is {gpu_px:?} on the GPU, {cpu_px:?} on the CPU");
+        }
+    }
+    let dark = px(&gpu, (290, 480)).unwrap_or_default();
+    assert!(dark.get(2).is_some_and(|b| *b >= 150), "the mask's black end fades the card out to the one below: {dark:?}");
 }
 
 #[test]

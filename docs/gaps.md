@@ -273,11 +273,12 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
   (parity 0.066/255); a node's **effect list** — inner shadows, each layer blur (progressive
   included) and grain, then the drop shadows cast from that result — is one layer on the GPU
   (0.130/255); **text** is one outline per run with the run's own paints, colour glyphs and glyph
-  strokes (pixel-identical); **masks** are the mask's coverage cut into the run it clips (0.052/255);
+  strokes (pixel-identical); **masks** — alpha, vector and luminance — are the mask's coverage cut
+  into the run it clips (0.052/255);
   and a **backdrop effect nested in a group or frame** no longer refuses the page (pixel-identical).
-  Still on the CPU for content: **texture**, a **group's inner shadow**, **plus-darker** (a layer's
-  and a paint's) and **luminance masks**; the editor's outline modes, skipped layers, soft proof and
-  Display P3 stay there by design.
+  Still on the CPU for content: **texture**, a **group's inner shadow** and **plus-darker** (a
+  layer's and a paint's); the editor's outline modes, skipped layers, soft proof and Display P3 stay
+  there by design.
 - **Landed (2026-10-25), P11:** a segmented page keeps each ordinary step in a canvas-sized texture
   between frames (keyed on its subtrees, the view and the zoom), each page node's encoded scene is
   kept too (so a drag encodes only the layers it changed), and a step or node that reads the page
