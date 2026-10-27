@@ -811,6 +811,46 @@ stays on the fallback list.
   speedups below changed no output. `the_gpu_draws_a_sideways_progressive_blur` covers the ramp
   across the card, where the levels' bands are columns and the crops start differently along x. A
   progressive blur whose layer is past 16 M pixels stays on the CPU (see the entry above).
+- 2026-10-28: **a drag is silky at any zoom (100% … 2000%).** At 600% a full frame was 25–35 ms
+  (the card's layer is clipped to the window and made again per frame, and its blur plus the page
+  render did not fit in a frame), so the pointer outran it. Three changes:
+  - **Interaction frames are previews, drawn into the canvas's own texture.** `present` takes the
+    window's device size separately from the view: half of it each way for a preview (a quarter of
+    the pixels), drawn into the target's top-left corner — the target is not reallocated, no
+    texture is registered again, and `Frame.uv` says which part of the texture the frame fills
+    (the UI samples it). The worker draws a preview when a full frame of *this* zoom took more than
+    13 ms (`Renders::gpu_wants_preview`, which also requires the same uid/page/scale, so zooming
+    out is drawn full and sharp again); the UI asks for the sharp frame with `Job::refine` once
+    nothing has been asked for for 60 ms and the pointer is up (`GPU_REFINE_AFTER_MS`), and once
+    per view (`CanvasState::refined`). While a drag goes on no full frame is drawn at all: a full
+    render between two slow steps used to cost the drag its next preview.
+  - **Each progressive level is blurred at its own resolution** (`canvas::level_scale`): a level
+    whose box radius is past the one-dispatch pass's halo (256 px) takes running sums — a dozen
+    dispatches — so its sigma is what costs, not its pixels: at 900 px it is blurred at a quarter,
+    at 1800 px at an eighth, while a narrow level keeps the layer's resolution (the ramp's sharp
+    end). The chain at 600% is 2.5–4 ms on the device (was 10–16), and the sharp frame 15–22 ms
+    (was 40).
+  - **vello was handed a new image every frame.** Each layer registered a fresh blank `ImageData`
+    (a new blob id), so vello's image atlas added a slot a frame, grew to 8192 × 8192 and was
+    reallocated *twice a frame* (a layer's solid content has no late-bound resource, so it reports
+    a 1 × 1 atlas; the page with the layer's image the big one) — 40 ms of driver stalls a frame
+    after a few seconds of dragging. Now a texture keeps the image it was first registered with
+    (its atlas slot with it) and its pixels are marked dirty (`register_layer`), an evicted kept
+    layer gives its texture back to the pool (`keep_shadow`), a scene that draws a layer image is
+    not kept as a scene (`scene::has_effects`: the canvas reuses those images), and a layer or
+    segment scene with no late-bound resource gets a transparent gradient (`canvas::steady_atlas`)
+    so its atlas size matches the page render's. The atlas sits at 4096 × 4096 `Reused`, one
+    upload a frame.
+  Sustained 400-move drags (control channel, release app, maximized window, 2560 × 1440) at
+  600%: 67, 70 and 72 canvas frames a second one after another (before, a long drag fell from 60 to
+  15–18 fps); 2000%: 76 fps; 1200%: 75; 200%: 94; 100%: 160. The frame at 600% is `build 8.8–9.8,
+  render 1.8–1.9 ms` (a preview, with the log's device wait) and the sharp one `build 12.8,
+  render 2.6 ms`. Tests: `a_smaller_frame_fills_the_canvas_corner` (a preview is the same pixels as
+  a canvas of its own size, and the target is not reallocated), `wide_blur_levels_are_blurred_smaller_than_narrow_ones`,
+  `a_scene_that_draws_a_layer_image_is_not_kept`, `a_preview_comes_only_after_a_slow_full_frame_of_the_same_zoom`,
+  `a_preview_on_screen_asks_for_the_sharp_frame_once`, `the_canvas_shows_images_of_its_own_page_and_never_a_coarser_one_of_its_view`
+  (a preview of newer content does go over a refined frame of older content — a drag — while a
+  preview of the same content does not).
 - 2026-10-28: **the card drags smoothly at any zoom, 200% included.** A real cursor over the
   maximized window at 200% exposed two more places where a zoom other than 100% was different:
   - **The blur's device-memory ceiling (6 M pixels) put 200% on the CPU.** The card's layer is

@@ -27,6 +27,10 @@ pub struct CanvasState {
     /// The texture the GPU canvas drew the last frame into; shown instead of `texture` when set.
     #[cfg(not(target_arch = "wasm32"))]
     gpu_tex: Option<egui::TextureId>,
+    /// The part of that texture the frame fills (`[0, 0, 1, 1]` for a full frame; an interaction
+    /// preview fills the canvas's top-left part).
+    #[cfg(not(target_arch = "wasm32"))]
+    gpu_uv: [f32; 4],
     /// The textures registered with egui, by canvas buffer.
     #[cfg(not(target_arch = "wasm32"))]
     gpu_ids: [Option<GpuTexture>; 2],
@@ -36,9 +40,16 @@ pub struct CanvasState {
     tex_of: Option<(u64, NodeId)>,
     /// The texture is a coarse preview (see [`crate::render_worker`]).
     pub tex_coarse: bool,
+    /// The document revision the texture shows (a preview of newer content goes on over it).
+    tex_revision: Option<u64>,
     /// Which rasterizer drew the shown frame: `"gpu"`, `"cpu"` (or `"none"` before the first one).
     pub rasterizer: &'static str,
     submitted: Option<JobKey>,
+    /// When the last render was asked for (a preview is sharpened only once nothing has been
+    /// asked for for [`crate::render_worker::GPU_REFINE_AFTER_MS`]).
+    last_submitted: Option<web_time::Instant>,
+    /// The key a sharp frame was asked for over a preview (so it is asked for once).
+    refined: Option<JobKey>,
     /// The view of the last render asked for.
     want_view: Option<figcraft_render::View>,
     /// What the last canvas render had to do (shown by `ui.inspect`).
@@ -47,6 +58,10 @@ pub struct CanvasState {
     /// canvas texture (ms; the texture is uploaded when that frame is painted).
     pub preview_latency_ms: Option<f64>,
     pub refine_latency_ms: Option<f64>,
+    /// Frames shown so far, previews and refined ones apart (`ui.inspect`: how an interaction
+    /// keeps up with the pointer).
+    pub preview_frames: u64,
+    pub refined_frames: u64,
     dragging: bool,
     space_pan: bool,
     middle_pan: Option<(Pos2, f64, f64)>,
@@ -75,16 +90,23 @@ impl Default for CanvasState {
             #[cfg(not(target_arch = "wasm32"))]
             gpu_tex: None,
             #[cfg(not(target_arch = "wasm32"))]
+            gpu_uv: [0.0, 0.0, 1.0, 1.0],
+            #[cfg(not(target_arch = "wasm32"))]
             gpu_ids: [None, None],
             tex_view: None,
             tex_of: None,
             tex_coarse: false,
+            tex_revision: None,
             rasterizer: "none",
             submitted: None,
+            last_submitted: None,
+            refined: None,
             want_view: None,
             render_work: None,
             preview_latency_ms: None,
             refine_latency_ms: None,
+            preview_frames: 0,
+            refined_frames: 0,
             dragging: false,
             space_pan: false,
             middle_pan: None,
@@ -219,7 +241,12 @@ pub fn show(app: &mut FigApp, ui: &mut Ui, worker: &mut Worker) {
     app.sync_preedit();
     // Retained rendering snaps the view outward and adds one pixel on each axis.
     let max_texture_side = (ctx.input(|i| i.max_texture_side).min(16_384) as u32).saturating_sub(1).max(1);
-    request_render(app, worker, ppp, max_texture_side);
+    // A pointer held down is an interaction in progress: its previews are not sharpened between
+    // its steps (a full frame would cost the drag its next preview).
+    let holding = ctx.input(|i| i.pointer.any_down());
+    if let Some(wait) = request_render(app, worker, ppp, max_texture_side, holding) {
+        ctx.request_repaint_after(wait);
+    }
     // Every finished render is shown, even when a newer one is already on its way: renders finish
     // in order, and an edit every frame (a drag) would otherwise never show until it stopped.
     let shown = app.session.ds().map(|ds| (ds.uid, ds.page)).ok();
@@ -241,10 +268,12 @@ pub fn show(app: &mut FigApp, ui: &mut Ui, worker: &mut Worker) {
             Some(frame) => {
                 let filter = if pixel_preview { wgpu::FilterMode::Nearest } else { wgpu::FilterMode::Linear };
                 app.canvas.gpu_tex = register_gpu_texture(app, frame, filter);
+                app.canvas.gpu_uv = frame.uv;
                 app.canvas.gpu_tex.is_some()
             }
             None => {
                 app.canvas.gpu_tex = None;
+                app.canvas.gpu_uv = [0.0, 0.0, 1.0, 1.0];
                 false
             }
         };
@@ -258,13 +287,23 @@ pub fn show(app: &mut FigApp, ui: &mut Ui, worker: &mut Worker) {
         let latency = Some(done.at.elapsed().as_secs_f64() * 1000.0);
         if done.coarse {
             app.canvas.preview_latency_ms = latency;
+            app.canvas.preview_frames = app.canvas.preview_frames.saturating_add(1);
         } else {
             app.canvas.refine_latency_ms = latency;
+            app.canvas.refined_frames = app.canvas.refined_frames.saturating_add(1);
         }
         app.canvas.tex_view = Some(done.view);
         app.canvas.tex_of = Some((done.uid, done.page));
         app.canvas.tex_coarse = done.coarse;
+        app.canvas.tex_revision = Some(done.revision);
         app.canvas.rasterizer = if drawn_on_gpu { "gpu" } else { "cpu" };
+        if done.coarse {
+            // One more frame: this one asked for a render before the preview was on screen, and
+            // that next frame asks (with nothing new to draw) for the sharp one.
+            ctx.request_repaint();
+        } else {
+            app.canvas.refined = None;
+        }
     }
     let painter = ui.painter_at(rect);
     let t = Tokens::get(&ctx);
@@ -289,9 +328,14 @@ pub fn show(app: &mut FigApp, ui: &mut Ui, worker: &mut Worker) {
         let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
         #[cfg(not(target_arch = "wasm32"))]
         let gpu = app.canvas.gpu_tex;
+        #[cfg(not(target_arch = "wasm32"))]
+        let gpu_uv = app.canvas.gpu_uv;
         #[cfg(target_arch = "wasm32")]
         let gpu: Option<egui::TextureId> = None;
         if let Some(id) = gpu {
+            // A preview fills the canvas texture's top-left part: sample just that.
+            #[cfg(not(target_arch = "wasm32"))]
+            let uv = Rect::from_min_max(pos2(gpu_uv[0], gpu_uv[1]), pos2(gpu_uv[2], gpu_uv[3]));
             painter.image(id, image_rect, uv, Color32::WHITE);
         } else if let Some(tex) = &app.canvas.texture {
             painter.image(tex.id(), image_rect, uv, Color32::WHITE);
@@ -335,7 +379,9 @@ pub fn show(app: &mut FigApp, ui: &mut Ui, worker: &mut Worker) {
 fn register_gpu_texture(app: &mut FigApp, frame: &figcraft_gpu::canvas::Frame, filter: wgpu::FilterMode) -> Option<egui::TextureId> {
     let state = app.canvas.render_state.clone()?;
     let slot = usize::from(frame.slot).min(app.canvas.gpu_ids.len().saturating_sub(1));
-    let size = (frame.view.width, frame.view.height);
+    // The texture's own size, not the frame's: a preview fills part of the same canvas texture
+    // (and says which part in `frame.uv`), so registering it once per generation is enough.
+    let size = frame.texture_size;
     if let Some((generation, id, cached)) = app.canvas.gpu_ids.get(slot).copied().flatten()
         && generation == frame.generation
         && cached == size
@@ -401,18 +447,24 @@ fn describe_box([x0, y0, x1, y1]: [f64; 4]) -> String {
 
 /// Whether a finished render goes on screen: an image of the file and page shown (`shown`), and
 /// not a coarse preview over a refined image that already shows the whole view asked for at its
-/// zoom (the same zoom elsewhere on the page is no such image).
+/// zoom (the same zoom elsewhere on the page is no such image). A preview of *newer* content does
+/// go on over a refined image: while a drag moves a layer the view does not change, and the frame
+/// that follows the pointer is the preview.
 fn shows(c: &CanvasState, done: &Done, shown: Option<(u64, NodeId)>) -> bool {
     if shown != Some((done.uid, done.page)) {
         return false;
     }
+    let same_content = c.tex_of == shown && c.tex_revision.is_some();
     let refined_here = !c.tex_coarse
-        && c.tex_of == shown
+        && same_content
+        && c.tex_revision == Some(done.revision)
         && c.tex_view
             .as_ref()
             .zip(c.want_view.as_ref())
             .is_some_and(|(have, want)| have.scale.to_bits() == want.scale.to_bits() && covers(have, want));
-    !(done.coarse && refined_here)
+    // A preview of content the screen has moved past (a frame that landed late) is a step back.
+    let behind = same_content && c.tex_revision.is_some_and(|shown| done.revision < shown);
+    !(done.coarse && (refined_here || behind))
 }
 
 /// Whether `outer` shows all of the page that `inner` does.
@@ -423,8 +475,11 @@ fn covers(outer: &figcraft_render::View, inner: &figcraft_render::View) -> bool 
     o.x0 <= i.x0 + eps && o.y0 <= i.y0 + eps && o.x1 >= i.x1 - eps && o.y1 >= i.y1 - eps
 }
 
-fn request_render(app: &mut FigApp, worker: &mut Worker, ppp: f32, max_texture_side: u32) {
-    let Ok(ds) = app.session.ds() else { return };
+/// Ask the render thread for the frame the canvas needs, when it needs a new one. Returns how
+/// long until a preview on screen should ask for its sharp frame (the UI wakes for it); `None`
+/// when there is nothing to wait for.
+fn request_render(app: &mut FigApp, worker: &mut Worker, ppp: f32, max_texture_side: u32, holding: bool) -> Option<std::time::Duration> {
+    let Ok(ds) = app.session.ds() else { return None };
     let rect = app.canvas.rect;
     let (mut ox, mut oy) = ds.view.origin();
     let (scale, visible_w, visible_h) = if let Some(k) = ds.view.pixel_preview_scale() {
@@ -465,21 +520,35 @@ fn request_render(app: &mut FigApp, worker: &mut Worker, ppp: f32, max_texture_s
         fonts: figcraft_text::layout_generation(),
         proof,
     };
+    let view = figcraft_render::View { origin: requested, scale, width: size.0, height: size.1 };
+    let mut nothing_new = app.canvas.submitted.as_ref() == Some(&key);
     if let Some(previous) = &app.canvas.submitted {
         let previous_origin = (previous.origin.0 as f64 / 1000.0, previous.origin.1 as f64 / 1000.0);
         let same_content = JobKey { origin: previous.origin, size: previous.size, ..key.clone() } == *previous;
         let covers = cached_render_covers(previous_origin, previous.size, origin, visible, scale);
-        if same_content && covers {
-            return;
-        }
+        nothing_new = nothing_new || (same_content && covers);
     }
-    if app.canvas.submitted.as_ref() == Some(&key) {
-        return;
+    // What is on screen is a preview from an interaction (the zoom or a drag was moving faster
+    // than a full frame): once nothing new is asked for — the pointer is up and nothing has been
+    // asked for a while — draw the sharp frame, even though this job's key matches the preview's.
+    // A full frame takes a few previews' worth of time, so a drag that steps slowly keeps its
+    // previews instead.
+    let quiet = app.canvas.last_submitted.is_none_or(|at| at.elapsed().as_secs_f64() * 1000.0 >= crate::render_worker::GPU_REFINE_AFTER_MS);
+    let sharpen = nothing_new && !holding && !worker.in_flight() && app.canvas.tex_coarse;
+    let refine = sharpen && quiet && app.canvas.refined.as_ref() != Some(&key);
+    if nothing_new && !refine {
+        // A preview waits for the quiet time: wake the UI when it is over, and this frame asks again.
+        if sharpen && !quiet {
+            let waited = app.canvas.last_submitted.map_or(0.0, |at| at.elapsed().as_secs_f64() * 1000.0);
+            let left = (crate::render_worker::GPU_REFINE_AFTER_MS - waited).max(1.0);
+            return Some(std::time::Duration::from_millis(left.ceil() as u64));
+        }
+        return None;
     }
     let job = Job {
         doc,
         page: ds.page,
-        view: figcraft_render::View { origin: requested, scale, width: size.0, height: size.1 },
+        view: view.clone(),
         outline: ds.view.outlines,
         outline_extras,
         outlined,
@@ -487,12 +556,21 @@ fn request_render(app: &mut FigApp, worker: &mut Worker, ppp: f32, max_texture_s
         solo: key.solo,
         proof,
         uid: ds.uid,
+        revision: ds.revision,
         zoom_preview: ds.view.pixel_preview_scale().is_none(),
+        refine,
         at: web_time::Instant::now(),
     };
     app.canvas.want_view = Some(job.view.clone());
     worker.submit(job);
-    app.canvas.submitted = Some(key);
+    app.canvas.last_submitted = Some(web_time::Instant::now());
+    if refine {
+        app.canvas.refined = Some(key);
+    } else {
+        app.canvas.submitted = Some(key);
+        app.canvas.refined = None;
+    }
+    None
 }
 
 /// Leave a 96-pixel reserve so the next render starts before a pan reaches a cached edge.
@@ -554,14 +632,55 @@ fn a_moved_document_asks_for_a_new_frame() {
     let mut app = FigApp::new(figcraft_engine::Session::with_document(doc), Box::new(crate::NoServices));
     app.canvas.rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(96.0, 72.0));
     let mut worker = crate::render_worker::Worker::new(egui::Context::default());
-    request_render(&mut app, &mut worker, 1.0, 16_383);
+    let _ = request_render(&mut app, &mut worker, 1.0, 16_383, false);
     let Some(first) = app.canvas.submitted.clone() else { return };
     // Where a drag's step lands: one command, one new revision.
     app.session.set_selection(vec![card]);
     assert!(app.run("node.set", json!({"props": {"x": 20.0}})).is_some(), "the move");
-    request_render(&mut app, &mut worker, 1.0, 16_383);
+    let _ = request_render(&mut app, &mut worker, 1.0, 16_383, false);
     let Some(second) = app.canvas.submitted.clone() else { return };
     assert!(first != second, "the moved frame was the job before it: the canvas keeps its texture");
+}
+
+/// Frames until the worker has nothing left (a few seconds at most).
+#[cfg(test)]
+fn render_idle(worker: &mut crate::render_worker::Worker) {
+    for _ in 0..600 {
+        if !worker.in_flight() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// An interaction on screen (a preview drawn at fewer pixels while the pointer moves) gets one
+/// sharp frame once nothing new is asked for — and only one, until the interaction moves again.
+#[cfg(test)]
+#[test]
+fn a_preview_on_screen_asks_for_the_sharp_frame_once() {
+    let doc = figcraft_doc::Document::new("preview");
+    let mut app = FigApp::new(figcraft_engine::Session::with_document(doc), Box::new(crate::NoServices));
+    app.canvas.rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(96.0, 72.0));
+    let mut worker = crate::render_worker::Worker::new(egui::Context::default());
+    let _ = request_render(&mut app, &mut worker, 1.0, 16_383, false);
+    let first = worker.submitted_count();
+    assert_eq!(first, 1, "the first frame is asked for");
+    render_idle(&mut worker);
+    app.canvas.tex_coarse = true;
+    // A pointer held down is still interacting (a drag): its previews are not sharpened.
+    let _ = request_render(&mut app, &mut worker, 1.0, 16_383, true);
+    assert_eq!(worker.submitted_count(), first, "a drag in progress keeps its previews");
+    // Nothing new to draw for a while, and a preview on screen: the sharp frame is asked for.
+    std::thread::sleep(std::time::Duration::from_millis(70));
+    let _ = request_render(&mut app, &mut worker, 1.0, 16_383, false);
+    assert_eq!(worker.submitted_count(), first + 1, "the preview asks for the sharp frame");
+    let _ = request_render(&mut app, &mut worker, 1.0, 16_383, false);
+    assert_eq!(worker.submitted_count(), first + 1, "and only once");
+    // The sharp frame is on screen: nothing more is asked for.
+    render_idle(&mut worker);
+    app.canvas.tex_coarse = false;
+    let _ = request_render(&mut app, &mut worker, 1.0, 16_383, false);
+    assert_eq!(worker.submitted_count(), first + 1);
 }
 
 /// The zoom tool while Z is held (Alt: zoom out): a click zooms a step about the pointer, a drag

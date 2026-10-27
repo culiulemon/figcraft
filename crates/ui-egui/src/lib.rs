@@ -1835,6 +1835,8 @@ impl FigApp {
                 "gpuRefusal": gpu_refusal(),
                 "previewLatencyMs": self.canvas.preview_latency_ms,
                 "refineLatencyMs": self.canvas.refine_latency_ms,
+                "previewFrames": self.canvas.preview_frames,
+                "refinedFrames": self.canvas.refined_frames,
             },
             "live": live::inspect(self),
             "window": self.windows.current,

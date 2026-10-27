@@ -318,10 +318,42 @@ fn draw_top(
 /// without the node changing).
 pub(crate) fn node_scene_key(doc: &Document, view: &View, id: NodeId) -> Option<u64> {
     let n = doc.node(id)?;
-    if !n.visible || n.opacity <= 0.0 || n.is_mask || reads_backdrop(doc, n) {
+    if !n.visible || n.opacity <= 0.0 || n.is_mask || reads_backdrop(doc, n) || has_effects(doc, n) {
         return None;
     }
     Some(step_key(doc, view, &[id]))
+}
+
+/// Whether anything under `n` draws a layer image (a blur, grain, texture, inner shadow, backdrop
+/// effect or mask): those images are the canvas's to reuse and recycle, so a scene that kept one
+/// could later draw another layer's pixels under the old layer's key.
+fn has_effects(doc: &Document, n: &Node) -> bool {
+    let mut stack = vec![n.id];
+    let mut seen = 0usize;
+    while let Some(id) = stack.pop() {
+        seen += 1;
+        if seen > 4096 {
+            return true;
+        }
+        let Some(node) = doc.node(id) else { continue };
+        if node.is_mask {
+            return true;
+        }
+        let image = match effects_of(doc, node) {
+            Effects::None => false,
+            // Drop shadows drawn from the outline are vello's own blurred rects: no image.
+            Effects::Shadows(shape) => {
+                let silhouette = figcraft_render::shadow::silhouette(doc, node);
+                shape.shadows.iter().any(|s| !casts_from_outline(&silhouette, s))
+            }
+            _ => true,
+        };
+        if image {
+            return true;
+        }
+        stack.extend(node.children.iter().copied());
+    }
+    false
 }
 
 /// Whether `n`'s pixels depend on the page under it: its own backdrop effect, or one nested in it.

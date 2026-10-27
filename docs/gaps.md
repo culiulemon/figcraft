@@ -290,6 +290,38 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
   device pixels: 0 rebuilds, `plan 0.0, build 0.1, render 6.5–8.3 ms` a frame, and screen captures
   put the card within 7 px of the cursor (~10 ms behind). Tests: `a_dragged_card_keeps_its_blur`
   (100%, 86% and 244%), `a_whole_pixel_move_keeps_the_layer_key`.
+- **Landed (2026-10-28), any zoom, silky:** a drag keeps up with the pointer at 100%, 200%,
+  600%, 1200% and 2000%. Three things were in the way, each measured with the present log and the
+  release app's frame counters:
+  - **The drag frames are previews.** A full 600% frame (the card's layer clipped to the window)
+    cost 25–35 ms, so the pointer outran it; the canvas now draws an interaction frame at half
+    resolution each way into the canvas target's top-left corner (no reallocation, no new texture
+    registration: `Frame.uv` says which part the frame fills), and the UI asks for the sharp frame
+    once the pointer is up and nothing has been asked for for 60 ms (`GPU_REFINE_AFTER_MS`) — a
+    full render between two slow drag steps would cost the drag its next preview. The sharp frame
+    is then 15–22 ms. Sustained 400-move drags at 600%: 67, 70 and 72 canvas frames a second one
+    after another (a drag used to fall to 15–18 fps as the device degraded); 2000%: 76 fps; 200%:
+    94; 100%: 160 (a quick frame is drawn full, and a new zoom is always drawn full first, so the
+    preview is never a step down at a zoom that doesn't need it).
+  - **Each progressive level is blurred at its own resolution.** Wide levels (sigma past the
+    one-dispatch halo, 256 px) use running sums — a dozen dispatches a level — so they are the
+    cost, not pixels: they are now computed smaller until their box passes fit the halo (a 900 px
+    sigma level at a quarter, an 1800 px one at an eighth), while narrow levels keep the layer's
+    own resolution (the ramp's sharp end stays sharp). The blur chain at 600% fell from 10–16 ms to
+    2.5–4 ms, and the sharp frame from 40 to 15–22 ms. Tests:
+    `wide_blur_levels_are_blurred_smaller_than_narrow_ones`, and the parity tests are unchanged.
+  - **vello's image atlas was being fed a new image every frame.** A layer handed vello a fresh
+    blank image (a new blob id) per frame, so its atlas grew a slot per frame to 8192 × 8192 and
+    was reallocated *twice a frame* (the layer's solid content reports a 1 × 1 atlas, the page
+    with the layer's image the big one): 40 ms of driver stalls a frame. A texture now keeps the
+    image it was registered with (the atlas slot with it) and only its pixels are marked dirty;
+    evicted kept layers give their texture back to the pool; scenes that draw a layer image are no
+    longer kept as scenes (`has_effects`: an image the canvas reuses could otherwise be drawn
+    under an old key); and every layer/segment scene gets a transparent gradient when it has no
+    late-bound resource, so its atlas size matches the page render's instead of flipping to 1 × 1.
+    The atlas sits at 4096 × 4096, `Reused`, one upload a frame. Tests:
+    `a_scene_that_draws_a_layer_image_is_not_kept`, `a_drag_reuses_the_encoded_scenes_of_the_layers_it_did_not_move`
+    (outline-cast shadows are still kept).
 - **Landed (2026-10-28), zoom:** the same card drags smoothly at 200% (and 244%) too. Two more
   address-shaped keys and one budget were in the way. The progressive blur's device-memory ceiling
   (6 M pixels) was smaller than the card's layer at 200% (2800 × 2930 = 8.2 M: the layer is the

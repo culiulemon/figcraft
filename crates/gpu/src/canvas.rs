@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use figcraft_doc::{Document, NodeId};
 use figcraft_render::{Pixmap, View};
-use vello::peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
+use vello::kurbo::{Affine as KAffine, Point, Rect as KRect};
+use vello::peniko::color::DynamicColor;
+use vello::peniko::{Blob, Color as PColor, ColorStop, ColorStops, Fill, Gradient as PGradient, ImageAlphaType, ImageData, ImageFormat};
 use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene};
 use wgpu::{Device, Queue, Texture, TextureFormat, TextureUsages, TextureView};
 
@@ -46,6 +48,13 @@ pub struct CanvasGpu {
     page: Option<Scratch>,
     /// One segment on its way onto the page.
     segment: Option<Scratch>,
+    /// The pixels the frame being drawn fills: the canvas's own size, or the top-left part of it
+    /// when an interaction frame is drawn at fewer pixels each way (see
+    /// [`crate::canvas::present`]). The target is always the canvas's size, so a preview frame
+    /// costs no reallocation, and what it drew is the top-left `frame` region.
+    frame: (u32, u32),
+    /// The region the last frame filled (what [`Self::read`] reads).
+    last_frame: (u32, u32),
     /// A copy of the page, for a pass that reads it as it writes it (plus-darker).
     under: Option<Scratch>,
     /// Layer textures a frame is done with, for the next frame's layers: a drag of a blurred card
@@ -59,6 +68,11 @@ pub struct CanvasGpu {
     shadows_bytes: usize,
     /// Page-level nodes' encoded scenes, by their key: a drag re-encodes only what it changed.
     nodes: HashMap<u64, CachedScene>,
+    /// The image registered for a layer texture, by texture: vello's atlas keeps a slot for every
+    /// image it has ever seen (and grows the atlas — 8192 × 8192 within seconds of dragging — until
+    /// it can't). A texture's own image keeps its slot: the same layer is drawn from the same place
+    /// each frame, its pixels copied over the old ones.
+    layer_images: HashMap<Texture, ImageData>,
     /// Look-ups that found a kept scene (tests: a drag re-encodes only what moved).
     #[cfg(test)]
     node_hits: u64,
@@ -141,12 +155,15 @@ impl CanvasGpu {
             generation: 1,
             page: None,
             segment: None,
+            frame: (width, height),
+            last_frame: (width, height),
             under: None,
             layers_pool: Vec::new(),
             steps: Vec::new(),
             shadows: HashMap::new(),
             shadows_bytes: 0,
             nodes: HashMap::new(),
+            layer_images: HashMap::new(),
             #[cfg(test)]
             node_hits: 0,
             #[cfg(test)]
@@ -158,6 +175,20 @@ impl CanvasGpu {
     /// The size in device pixels.
     pub fn size(&self) -> (u32, u32) {
         self.targets.first().map_or((1, 1), |t| t.size)
+    }
+
+    /// The pixels the frame being drawn fills (the canvas's size, or its top-left part for a
+    /// frame drawn at fewer pixels each way).
+    fn frame_size(&self) -> (u32, u32) {
+        self.frame
+    }
+
+    /// Draw the next frame into the canvas's top-left `width` × `height` (an interaction frame at
+    /// fewer pixels each way): the target keeps the canvas's size, so a preview and the frame
+    /// after it reallocate nothing.
+    pub(crate) fn set_frame(&mut self, width: u32, height: u32) {
+        let (cw, ch) = self.size();
+        self.frame = (width.clamp(1, cw), height.clamp(1, ch));
     }
 
     /// The last frame's texture (egui registers this view once per generation).
@@ -185,6 +216,8 @@ impl CanvasGpu {
         self.targets = [target(device, width, height), target(device, width, height)];
         self.next = 0;
         self.last = 0;
+        self.frame = (width, height);
+        self.last_frame = (width, height);
         self.generation = self.generation.wrapping_add(1);
         // A kept step's texture is re-made at the new size: what it held is gone. Node scenes are
         // keyed on the view, so they would miss anyway; drop them rather than hold them.
@@ -218,9 +251,11 @@ impl CanvasGpu {
         }
     }
 
-    /// Draw `scene` over `background` into the next target; returns its texture view.
+    /// Draw `scene` over `background` into the next target; returns its texture view. The scene is
+    /// drawn into the frame's own region (the target's top-left when the frame is a preview): what
+    /// is outside it keeps the frame before, and is never shown.
     pub fn render(&mut self, device: &Device, queue: &Queue, scene: &Scene, background: figcraft_color::Color) -> Option<TextureView> {
-        let (width, height) = self.size();
+        let (width, height) = self.frame_size();
         let params = RenderParams { base_color: crate::scene::pcolor(background), width, height, antialiasing_method: AaConfig::Area };
         let count = self.targets.len();
         let target = self.targets.get_mut(self.next)?;
@@ -228,6 +263,7 @@ impl CanvasGpu {
             Ok(()) => {
                 let view = target.view.clone();
                 self.last = self.next;
+                self.last_frame = (width, height);
                 self.next = (self.next + 1) % count;
                 Some(view)
             }
@@ -241,13 +277,13 @@ impl CanvasGpu {
     /// The last frame's pixels, premultiplied (screenshots, exports and the parity tests).
     pub fn read(&self, device: &Device, queue: &Queue) -> Option<Pixmap> {
         let target = self.targets.get(self.last)?;
-        read(device, queue, &target.texture, target.size)
+        read(device, queue, &target.texture, self.last_frame)
     }
 
     /// The accumulation texture (kept between frames). Its pixels are all written each frame — the
     /// background fill, then every segment vello draws — so it needs no clear of its own.
     pub(crate) fn page_layer(&mut self, device: &Device) -> Option<(Texture, TextureView)> {
-        let (w, h) = self.size();
+        let (w, h) = self.frame_size();
         keep(&mut self.page, device, (w, h), "figcraft page")
     }
 
@@ -255,7 +291,7 @@ impl CanvasGpu {
     /// page before the next one. It is sampled by the compose pass and written after it, and the
     /// queue runs the two in order, so one is enough.
     pub(crate) fn segment_layer(&mut self, device: &Device) -> Option<TextureView> {
-        let (w, h) = self.size();
+        let (w, h) = self.frame_size();
         keep(&mut self.segment, device, (w, h), "figcraft segment").map(|(_, view)| view)
     }
 
@@ -271,7 +307,7 @@ impl CanvasGpu {
         if i >= self.step_slots() {
             return None;
         }
-        let (w, h) = self.size();
+        let (w, h) = self.frame_size();
         if self.steps.len() <= i {
             self.steps.resize_with(i + 1, || None);
         }
@@ -295,7 +331,7 @@ impl CanvasGpu {
     /// How many step segments are kept: as many canvas-sized textures as [`STEP_BYTES`] affords
     /// (a page has one per backdrop node, and a handful more).
     fn step_slots(&self) -> usize {
-        let (w, h) = self.size();
+        let (w, h) = self.frame_size();
         let bytes = (u64::from(w) * u64::from(h) * 4).max(1);
         usize::try_from((STEP_BYTES / bytes).clamp(1, 16)).unwrap_or(1)
     }
@@ -308,8 +344,10 @@ impl CanvasGpu {
 
     /// Draw `scene` into `view` over a transparent ground (a page segment).
     pub(crate) fn draw_into(&mut self, device: &Device, queue: &Queue, scene: &Scene, view: &TextureView) -> bool {
-        let (width, height) = self.size();
+        let (width, height) = self.frame_size();
         let params = RenderParams { base_color: vello::peniko::Color::new([0.0; 4]), width, height, antialiasing_method: AaConfig::Area };
+        let steady = steady_atlas(scene);
+        let scene = steady.as_ref().unwrap_or(scene);
         self.renderer.render_to_texture(device, queue, scene, view, &params).is_ok()
     }
 
@@ -321,7 +359,7 @@ impl CanvasGpu {
     /// `src` (a step's pixels, straight alpha from vello) plus-darker'd onto the page — the CPU's
     /// `fx::plus_darker`, through a copy of the page (a pass can't read what it writes).
     pub(crate) fn plus_darker(&mut self, device: &Device, queue: &Queue, page: &Texture, page_view: &TextureView, src: &TextureView) -> Option<()> {
-        let (w, h) = self.size();
+        let (w, h) = self.frame_size();
         let (under, _) = keep(&mut self.under, device, (w, h), "figcraft under")?;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("figcraft under copy") });
         encoder.copy_texture_to_texture(
@@ -339,18 +377,20 @@ impl CanvasGpu {
     pub(crate) fn present_layer(&mut self, device: &Device, queue: &Queue, src: &Texture) -> Option<TextureView> {
         let index = self.next;
         let target = self.targets.get(index)?;
-        if src.width() != target.size.0 || src.height() != target.size.1 {
+        let (width, height) = self.frame_size();
+        if src.width() != width || src.height() != height {
             return None;
         }
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("figcraft present") });
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo { texture: src, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             wgpu::TexelCopyTextureInfo { texture: &target.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::Extent3d { width: target.size.0, height: target.size.1, depth_or_array_layers: 1 },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
         queue.submit([encoder.finish()]);
         let view = target.view.clone();
         self.last = index;
+        self.last_frame = (width, height);
         self.next = (index + 1) % self.targets.len();
         Some(view)
     }
@@ -363,6 +403,8 @@ impl CanvasGpu {
         let texture = self.take_layer(device, "figcraft layer", width, height);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let params = RenderParams { base_color: vello::peniko::Color::new([0.0; 4]), width, height, antialiasing_method: AaConfig::Area };
+        let steady = steady_atlas(scene);
+        let scene = steady.as_ref().unwrap_or(scene);
         self.renderer.render_to_texture(device, queue, scene, &view, &params).ok()?;
         let drawn = t0.elapsed().as_secs_f64() * 1000.0;
         let out = self.take_layer(device, "figcraft layer", width, height);
@@ -375,14 +417,43 @@ impl CanvasGpu {
         Some(out)
     }
 
-    /// Hand `texture` to vello as an image (copied into its atlas before the next render).
+    /// Hand `texture` to vello as an image (copied into its atlas before the next render). The
+    /// texture keeps the image it was first registered with — the atlas slot with it — and the new
+    /// pixels are marked for copying over the old ones.
     pub(crate) fn register_layer(&mut self, texture: Texture) -> ImageData {
+        if let Some(image) = self.layer_images.get(&texture) {
+            self.renderer.mark_override_image_dirty(image);
+            return image.clone();
+        }
         let data = blank_image(texture.width(), texture.height());
         let _ = self.renderer.override_image(
             &data,
-            Some(wgpu::TexelCopyTextureInfoBase { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All }),
+            Some(wgpu::TexelCopyTextureInfoBase {
+                texture: texture.clone(),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            }),
         );
+        self.layer_images.insert(texture, data.clone());
         data
+    }
+
+    /// Forget layer images (and their overrides) once there are more than the pool can keep in
+    /// use: each pins its texture and a slot in vello's atlas. Only called between frames, when no
+    /// scene refers to them (cached scenes never hold an effect layer's image).
+    fn trim_layer_images(&mut self) {
+        const MAX_IMAGES: usize = 32;
+        if self.layer_images.len() <= MAX_IMAGES {
+            return;
+        }
+        // A kept layer draws its image again: forget those with the images.
+        self.shadows.clear();
+        self.shadows_bytes = 0;
+        let images: Vec<ImageData> = self.layer_images.drain().map(|(_, image)| image).collect();
+        for image in images {
+            let _ = self.renderer.override_image(&image, None);
+        }
     }
 
     /// `texture` as a layer: its image for the scene, and the texture the passes read.
@@ -423,11 +494,20 @@ impl CanvasGpu {
         let tick = self.tick;
         if let Some(old) = self.shadows.remove(&key) {
             self.shadows_bytes = self.shadows_bytes.saturating_sub(old.bytes);
+            // Its texture goes back to the pool: a drag that keeps a new layer every frame would
+            // otherwise make and drop two window-sized textures a frame, and every one of them is
+            // a new image in vello's atlas.
+            if let Some(texture) = old.layer.texture {
+                self.give_layer(texture);
+            }
         }
         while self.shadows_bytes + bytes > KEPT_SHADOW_BYTES {
             let Some(oldest) = self.shadows.iter().min_by_key(|(_, k)| k.used).map(|(k, _)| *k) else { break };
             if let Some(old) = self.shadows.remove(&oldest) {
                 self.shadows_bytes = self.shadows_bytes.saturating_sub(old.bytes);
+                if let Some(texture) = old.layer.texture {
+                    self.give_layer(texture);
+                }
             }
         }
         self.shadows_bytes += bytes;
@@ -610,82 +690,79 @@ impl crate::scene::Layers for GpuLayers<'_> {
         let deviations = figcraft_render::blur::levels(s0.min(s1), s0.max(s1));
         let size = layer.size;
         let t0 = std::time::Instant::now();
-        // A level is a blur: past this many pixels it is computed at half resolution (a quarter of
-        // the work) and the blend reads it upscaled — the detail a box pass averages away anyway —
-        // while the layer itself, which the ramp's sharp end shows, stays at full resolution. This
-        // is what keeps a layer the size of the window (a card zoomed past the screen) smooth.
-        const LEVEL_BUDGET: u64 = 2_000_000;
-        let pixels = u64::from(size.0).saturating_mul(u64::from(size.1));
-        let level_scale = if pixels > 8_000_000 {
-            0.25
-        } else if pixels > LEVEL_BUDGET {
-            0.5
-        } else {
-            1.0
-        };
-        // The levels and their blend reach the device in one submission (with their scratch kept
-        // until it lands): a submit a pass made the canvas queue a dozen of them a frame, and in
-        // the app each of those waited behind the window's own submits.
-        let source = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        // The layer at the levels' resolution (themselves), when that is smaller.
-        let small = (level_scale < 1.0).then(|| {
-            let (sw, sh) = (scale_px(size.0, level_scale), scale_px(size.1, level_scale));
-            let out = self.canvas.take_layer(self.device, "figcraft blur small", sw, sh);
-            let view = out.create_view(&wgpu::TextureViewDescriptor::default());
-            self.canvas.compose.downscale(self.device, self.queue, &view, &source);
-            (out, (sw, sh))
-        });
-        let (read, read_size) = match &small {
-            Some((out, size)) => (out.create_view(&wgpu::TextureViewDescriptor::default()), *size),
-            None => (source.clone(), size),
-        };
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("figcraft progressive blur") });
-        let mut levels: Vec<(Texture, (f32, f32), f32)> = Vec::with_capacity(deviations.len());
-        let mut after: Vec<Texture> = Vec::new();
-        // One running-sums texture for every level: its passes run one after another, and eight of
-        // its size would be most of the pool (and of the memory a drag holds).
-        let sums = self.canvas.blur.take_sums(self.device, read_size);
-        for (k, d) in deviations.iter().enumerate() {
-            if !d.is_finite() || *d <= 0.3 {
-                // The renderer leaves a blur this small out: the layer itself is the level.
-                levels.push((texture.clone(), (0.0, 0.0), 1.0));
-            } else {
+        // Each level is a blur of the band that uses it, drawn at the resolution its own sigma
+        // allows: a level whose radius is past the one-dispatch pass's halo takes running sums (a
+        // dozen dispatches a level — that, not the pixels, made a 600% drag lag), so the wide ones
+        // are computed smaller (a blur that wide has no detail to lose) while the narrow ones stay
+        // at the layer's own resolution (the ramp's sharp end stays sharp).
+        let crops: Vec<(u32, u32, u32, u32, f64)> = deviations
+            .iter()
+            .enumerate()
+            .map(|(k, d)| {
+                if !d.is_finite() || *d <= 0.3 {
+                    return (0, 0, size.0, size.1, 1.0);
+                }
                 // Only the pixels that use this level (plus its blur's reach) are blurred: an
                 // 0 → 300 ramp on a 200 × 300 card blurs a few hundred rows a level instead of the
                 // whole 1100 × 1200 layer eight times (the renderer crops the same way).
                 let reach = (d * 3.0).ceil().clamp(0.0, 8192.0) as u32 + 3;
                 let (x, y, w, h) = level_crop(&deviations, k, s0, s1, a, b, size, reach);
-                // The same crop of the smaller layer: its texels, its radius, and its position
-                // kept in layer pixels for the blend, so the two grids line up.
-                let (x0, y0) = (scale_px(x, level_scale), scale_px(y, level_scale));
-                let (cw, ch) = (
-                    scale_px(w, level_scale).min(read_size.0.saturating_sub(x0)).max(1),
-                    scale_px(h, level_scale).min(read_size.1.saturating_sub(y0)).max(1),
-                );
-                let (level, scratch) = crate::blur::blur_texture_in(
-                    self.device,
-                    self.queue,
-                    &self.canvas.blur,
-                    &mut encoder,
-                    &read,
-                    (x0, y0),
-                    (cw, ch),
-                    *d * level_scale,
-                    sums.as_ref(),
-                )?;
-                // The crop's corner in layer pixels: the blend reads the level from there.
-                let at = (x0 as f32 / level_scale as f32, y0 as f32 / level_scale as f32);
-                levels.push((level.clone(), at, level_scale as f32));
-                after.push(level);
-                after.extend(scratch);
+                let scale = level_scale(*d, (w, h));
+                (x, y, w, h, scale)
+            })
+            .collect();
+        // The levels and their blend reach the device in one submission (with their scratch kept
+        // until it lands): a submit a pass made the canvas queue a dozen of them a frame, and in
+        // the app each of those waited behind the window's own submits.
+        let source = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // The layer at the resolutions the levels ask for (half, quarter, an eighth), each made
+        // from the one above it: a box downsample of the layer, not a bilinear read of all of it.
+        let mut mips: Vec<(f64, Texture, (u32, u32))> = Vec::new();
+        {
+            let mut wanted: Vec<f64> = crops.iter().map(|c| c.4).filter(|s| *s < 1.0).collect();
+            wanted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            wanted.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+            let mut above = (texture.clone(), source.clone(), size);
+            for s in wanted {
+                let (sw, sh) = (scale_px(size.0, s), scale_px(size.1, s));
+                let out = self.canvas.take_layer(self.device, "figcraft blur small", sw, sh);
+                let view = out.create_view(&wgpu::TextureViewDescriptor::default());
+                self.canvas.compose.downscale(self.device, self.queue, &view, &above.1);
+                mips.push((s, out.clone(), (sw, sh)));
+                above = (out, view, (sw, sh));
             }
         }
-        after.extend(sums);
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("figcraft progressive blur") });
+        let mut levels: Vec<(Texture, (f32, f32), f32)> = Vec::with_capacity(deviations.len());
+        let mut after: Vec<Texture> = Vec::new();
+        for (k, d) in deviations.iter().enumerate() {
+            let &(x, y, w, h, scale) = crops.get(k)?;
+            if !d.is_finite() || *d <= 0.3 {
+                // The renderer leaves a blur this small out: the layer itself is the level.
+                levels.push((texture.clone(), (0.0, 0.0), 1.0));
+                continue;
+            }
+            // The level's own resolution: the layer itself, or the mip made for it. Its crop, the
+            // blur's radius and its corner are converted to that grid, and the corner is kept in
+            // layer pixels for the blend, so all the levels line up.
+            let (read, read_size) = match mips.iter().find(|m| (m.0 - scale).abs() < 1e-9) {
+                Some((_, texture, size)) => (texture.create_view(&wgpu::TextureViewDescriptor::default()), *size),
+                None => (source.clone(), size),
+            };
+            let (x0, y0) = (scale_px(x, scale), scale_px(y, scale));
+            let (cw, ch) =
+                (scale_px(w, scale).min(read_size.0.saturating_sub(x0)).max(1), scale_px(h, scale).min(read_size.1.saturating_sub(y0)).max(1));
+            let (level, scratch) =
+                crate::blur::blur_texture_in(self.device, self.queue, &self.canvas.blur, &mut encoder, &read, (x0, y0), (cw, ch), d * scale, None)?;
+            let at = (x0 as f32 / scale as f32, y0 as f32 / scale as f32);
+            levels.push((level.clone(), at, scale as f32));
+            after.push(level);
+            after.extend(scratch);
+        }
         // The blend's output comes from the layer pool too: a fresh window-sized texture a frame
         // was an allocation the driver charged 5–15 ms for.
         let blended = self.canvas.take_layer(self.device, "figcraft progressive blur", size.0, size.1);
         let out = self.canvas.mix.encode(self.device, self.queue, &mut encoder, &levels, &deviations, (s0, s1, a, b), size, blended)?;
-        let small = small.map(|(texture, _)| texture);
         let encoded = t0.elapsed().as_secs_f64() * 1000.0;
         let t1 = std::time::Instant::now();
         let cb = encoder.finish();
@@ -708,8 +785,8 @@ impl crate::scene::Layers for GpuLayers<'_> {
         for texture in after {
             self.canvas.blur.give_back(texture);
         }
-        if let Some(small) = small {
-            self.canvas.give_layer(small);
+        for (_, texture, _) in mips {
+            self.canvas.give_layer(texture);
         }
         let made = self.canvas.as_layer(out);
         self.keep(key, &made);
@@ -821,6 +898,60 @@ impl GpuLayers<'_> {
         let frosted_view = frosted.create_view(&wgpu::TextureViewDescriptor::default());
         let glass = self.canvas.glass.paint_texture(self.device, self.queue, pane, &frosted_view)?;
         Some(self.canvas.as_layer(glass))
+    }
+}
+
+/// `scene` with a late-bound resource added when it has none.
+///
+/// vello sizes its image atlas to the images a scene uses, and a scene with no gradients, images or
+/// glyphs reports a 1 × 1 one — and vello frees and recreates its atlas *texture* whenever that size
+/// changes from one render to the next. A frame draws a layer's content (solid shapes, no patches)
+/// and then the page with that layer's image: once the atlas had grown, every frame reallocated it
+/// twice (268 MB by 8192 × 8192), which stalled the device for 40 ms a frame at 600%.
+fn steady_atlas(scene: &Scene) -> Option<Scene> {
+    if !scene.encoding().resources.patches.is_empty() {
+        return None;
+    }
+    let mut steady = scene.clone();
+    let clear = DynamicColor::from_alpha_color(PColor::TRANSPARENT);
+    let mut stops = ColorStops::new();
+    stops.extend([ColorStop { offset: 0.0, color: clear }, ColorStop { offset: 1.0, color: clear }]);
+    let brush = PGradient::new_linear(Point::new(0.0, 0.0), Point::new(1.0, 0.0)).with_stops(stops);
+    // A transparent gradient over one pixel: nothing is drawn, and the ramp sizes the atlas the
+    // way a gradient (or an image) would.
+    steady.fill(Fill::NonZero, KAffine::IDENTITY, &brush, None, &KRect::new(0.0, 0.0, 1.0, 1.0));
+    Some(steady)
+}
+
+/// The most pixels a level's crop takes at full resolution (a fifth of a 2560 × 1440 window).
+const LEVEL_BUDGET: u64 = 2_000_000;
+/// The largest box radius the one-dispatch pass covers (the shader's halo): past it a level's
+/// passes take running sums — a dozen dispatches a level — and that is what made a 600% drag lag.
+const FUSED_RADIUS: f64 = 256.0;
+/// The smallest sigma a level keeps at its own resolution: the blend reads the level upscaled, and
+/// a blur narrower than this would show the texels.
+const MIN_LEVEL_SIGMA: f64 = 4.0;
+
+/// The resolution a progressive blur's level (sigma `d` layer pixels, its crop `crop` pixels) is
+/// blurred at: the coarsest that keeps its box passes in the one-dispatch halo and its pixels in
+/// budget, but no coarser than a few texels of sigma. Both bounds follow the layer's own size, so
+/// an interaction frame (drawn at fewer pixels each way) needs no special case.
+pub(crate) fn level_scale(d: f64, (w, h): (u32, u32)) -> f64 {
+    let d = if d.is_finite() { d.max(1e-9) } else { 1e-9 };
+    let pixels = u64::from(w).saturating_mul(u64::from(h)).max(1);
+    let by_pixels = (LEVEL_BUDGET as f64 / pixels as f64).sqrt();
+    let coarsest = by_pixels.min(FUSED_RADIUS / d).min(1.0);
+    let finest = (MIN_LEVEL_SIGMA / d).min(1.0);
+    let scale = coarsest.max(finest);
+    // Powers of two: the blend reads the level on the layer's own grid, and a halving is exact.
+    if scale >= 1.0 {
+        1.0
+    } else if scale >= 0.5 {
+        0.5
+    } else if scale >= 0.25 {
+        0.25
+    } else {
+        0.125
     }
 }
 
@@ -1064,6 +1195,11 @@ pub struct Frame {
     /// Which buffer, and which generation of them.
     pub slot: u8,
     pub generation: u64,
+    /// The texture's size in device pixels.
+    pub texture_size: (u32, u32),
+    /// The part of the texture this frame fills, from 0 to 1 on each axis. It is all of it for a
+    /// full frame; an interaction frame (fewer pixels each way) fills the top-left part.
+    pub uv: [f32; 4],
 }
 
 /// The canvas the window shares with its render thread: the device, queue and the two buffers
@@ -1114,7 +1250,12 @@ fn refusal(reason: &'static str) -> Option<Frame> {
 
 /// Draw page `page` of `doc` through `view` on the GPU, when the page is in the scene builder's
 /// feature set (see [`crate::scene::supported`]); `None` leaves the frame to the CPU renderer.
-pub fn present(doc: &Document, page: NodeId, view: &View) -> Option<Frame> {
+///
+/// `view` is what to show, and `canvas` is the window's device size: the two are the same for a
+/// frame drawn at the screen's own resolution, and a smaller `view` (an interaction preview asked
+/// for by [`crate::render_worker`]'s counterpart in the UI) fills the canvas's top-left corner in
+/// [`Frame::uv`] instead — so a preview needs no reallocation and no new texture registration.
+pub fn present(doc: &Document, page: NodeId, view: &View, canvas: (u32, u32)) -> Option<Frame> {
     let t0 = std::time::Instant::now();
     let log = std::env::var("FIGCRAFT_PRESENT_LOG").is_ok();
     let Some(backend) = backend() else { return refusal("not installed") };
@@ -1125,14 +1266,17 @@ pub fn present(doc: &Document, page: NodeId, view: &View) -> Option<Frame> {
     let background = crate::scene::background(doc, page);
     let Ok(mut slot) = backend.canvas.lock() else { return refusal("canvas is busy") };
     let locked = t0.elapsed().as_secs_f64() * 1000.0;
+    let canvas_size = (canvas.0.clamp(1, 16_384), canvas.1.clamp(1, 16_384));
     if slot.is_none() {
-        let Some(canvas) = CanvasGpu::new(&backend.device, view.width, view.height) else {
+        let Some(canvas) = CanvasGpu::new(&backend.device, canvas_size.0, canvas_size.1) else {
             return refusal("the GPU can't run the rasterizer");
         };
         *slot = Some(canvas);
     }
     let Some(canvas) = slot.as_mut() else { return refusal("the GPU can't run the rasterizer") };
-    canvas.resize(&backend.device, view.width, view.height);
+    canvas.resize(&backend.device, canvas_size.0, canvas_size.1);
+    canvas.trim_layer_images();
+    canvas.set_frame(view.width, view.height);
     let plan = match crate::scene::plan(doc, page) {
         Ok(plan) => plan,
         Err(e) => return refusal(e.reason()),
@@ -1174,7 +1318,10 @@ pub fn present(doc: &Document, page: NodeId, view: &View) -> Option<Frame> {
         }
         texture
     };
-    let frame = Frame { view: view.clone(), texture, slot: canvas.slot(), generation: canvas.generation() };
+    let (fw, fh) = canvas.frame_size();
+    let (cw, ch) = canvas.size();
+    let uv = [0.0, 0.0, fw as f32 / cw.max(1) as f32, fh as f32 / ch.max(1) as f32];
+    let frame = Frame { view: view.clone(), texture, slot: canvas.slot(), generation: canvas.generation(), texture_size: (cw, ch), uv };
     if let Ok(mut r) = refusal_slot().lock() {
         *r = None;
     }

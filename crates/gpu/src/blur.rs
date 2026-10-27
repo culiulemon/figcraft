@@ -213,24 +213,6 @@ impl Blur {
             pool.push(texture);
         }
     }
-
-    /// The running sums a run writes, a texture of the whole layer: a progressive blur's levels
-    /// pass one to every level (a level's passes run one after another, so they can share it), and
-    /// eight of them at once would be most of the pool. `None` when the runs keep no sums at all
-    /// (the one-dispatch pass needs none; only a radius past its halo does).
-    pub(crate) fn take_sums(&self, device: &Device, (w, h): (u32, u32)) -> Option<Texture> {
-        if self.fused.is_some() {
-            return None;
-        }
-        self.scan.as_ref()?;
-        Some(self.take(
-            device,
-            "figcraft blur sums",
-            (w, h),
-            TextureFormat::Rgba32Float,
-            TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
-        ))
-    }
 }
 
 /// The textures a blur reads and writes: one after one, a box pass a time.
@@ -476,9 +458,10 @@ pub(crate) fn blur_texture(device: &Device, queue: &Queue, blur: &Blur, src: &Te
 }
 
 /// [`blur_texture`] into `encoder`: the result, and the scratch to hand back once the caller has
-/// submitted it. A progressive blur's levels and its mix then go in one submission; `sums` (from
-/// [`Blur::take_sums`]) lets all of them share one running-sums texture, and `origin` picks the
-/// crop of `src` a level is blurred in (the pixels it is used in, plus its reach).
+/// submitted it. A progressive blur's levels and their mix then go in one submission; `sums` lets
+/// several passes share one running-sums texture (a run takes its own when given none), and
+/// `origin` picks the crop of `src` a level is blurred in (the pixels it is used in, plus its
+/// reach).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn blur_texture_in(
     device: &Device,

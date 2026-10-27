@@ -715,6 +715,26 @@ fn a_step_that_reads_the_page_is_drawn_every_frame() {
     assert_eq!(changed.data(), expected.data(), "a step that reads the page is not kept");
 }
 
+/// A scene that draws an effect layer's image is not kept between frames: the canvas reuses those
+/// images (and their atlas slots), so a kept scene would later draw whatever pixels the image holds
+/// then. What it does keep is the layer itself, under the layer's own key.
+#[test]
+fn a_scene_that_draws_a_layer_image_is_not_kept() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let d = progressive_card_doc(120.0);
+    let (w, h) = PARITY;
+    let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
+    let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+    let first = single_scene_pixels(&mut canvas, &device, &queue, &d, &view).expect("drawn");
+    assert_eq!(canvas.kept_node_scenes(), 1, "the ground's scene is kept, the card's (it draws its blurred layer) is not");
+    let again = single_scene_pixels(&mut canvas, &device, &queue, &d, &view).expect("drawn");
+    assert_eq!(again.data(), first.data(), "the same frame draws the same pixels");
+    assert!(canvas.kept_shadow_hits() > 0, "the blurred layer itself was kept");
+}
+
 /// Draw `d`'s first page as the single-scene path does (what `canvas::present` uses when the page
 /// has no top-level backdrop node) and read it back.
 fn single_scene_pixels(canvas: &mut CanvasGpu, device: &Device, queue: &Queue, d: &Document, view: &View) -> Option<Pixmap> {
@@ -727,13 +747,17 @@ fn single_scene_pixels(canvas: &mut CanvasGpu, device: &Device, queue: &Queue, d
     canvas.read(device, queue)
 }
 
+/// Scenes are kept between frames unless they draw a layer image (an effect layer's image is the
+/// canvas's to reuse, so a scene that kept one could later draw another layer's pixels). The cards
+/// here cast their shadows from their outlines (a spread), which vello draws as blurred rects: no
+/// image, so their scenes are kept.
 #[test]
 fn a_drag_reuses_the_encoded_scenes_of_the_layers_it_did_not_move() {
     let Some((device, queue)) = device() else {
         eprintln!("no GPU adapter: skipping");
         return;
     };
-    let d = shadow_cards(12);
+    let d = shadow_cards_with(12, 2.0);
     let p = d.first_page().unwrap();
     let (w, h) = PARITY;
     let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
@@ -1807,6 +1831,66 @@ fn the_gpu_canvas_reads_back() {
     assert_eq!(pix.data().get(3), Some(&255), "the read-back is opaque");
     canvas.resize(&device, 320, 200);
     assert_eq!(canvas.size(), (320, 200));
+}
+
+/// A progressive blur's levels are blurred at the resolution their own sigma allows: a narrow one
+/// keeps the layer's resolution (the ramp's sharp end stays sharp), and a wide one drops until its
+/// box passes fit the one-dispatch halo — the scan path's dozen dispatches a level are what made a
+/// 600% drag lag.
+#[test]
+fn wide_blur_levels_are_blurred_smaller_than_narrow_ones() {
+    use crate::canvas::level_scale;
+    // A 0 → 300 ramp on a 200 × 300 card, its layer clipped to the window: 150 design pixels of
+    // sigma, 900 device pixels at 600% — a quarter of the pixels is a 225 box radius, inside the
+    // halo. (The same blur in the half-resolution preview is 450 px, so half of *that* layer.)
+    let (w, h) = (2281u32, 1625u32);
+    assert_eq!(level_scale(900.0, (w, h)), 0.25);
+    assert_eq!(level_scale(450.0, (1141, 813)), 0.5);
+    // A narrow level keeps the layer at its own resolution: this is the sharp end of the ramp.
+    assert_eq!(level_scale(1.0, (w, h)), 1.0);
+    assert_eq!(level_scale(200.0, (400, 300)), 1.0);
+    // A crop that would be too many pixels is cut by the budget even when the blur is narrow-ish.
+    assert_eq!(level_scale(300.0, (w, h)), 0.5);
+}
+
+/// An interaction frame (fewer pixels each way) fills the canvas texture's top-left corner at its
+/// own resolution: the target keeps the canvas's size — so a preview and the frame after it
+/// reallocate nothing — and the read-back is the frame, not the canvas.
+#[test]
+fn a_smaller_frame_fills_the_canvas_corner() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let d = parity_doc();
+    let p = d.first_page().unwrap();
+    let (w, h) = PARITY;
+    let small = View { origin: (0.0, 0.0), scale: 0.5, width: w / 2, height: h / 2 };
+    let scene = scene::build(&d, p, &small).unwrap();
+    let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+    canvas.set_frame(small.width, small.height);
+    assert_eq!(canvas.size(), (w, h), "the canvas itself is not reallocated");
+    assert!(canvas.render(&device, &queue, &scene, scene::background(&d, p)).is_some());
+    let pix = canvas.read(&device, &queue).unwrap();
+    assert_eq!((pix.width(), pix.height()), (small.width, small.height), "the read-back is the frame");
+    // The corner holds what a canvas of the frame's own size draws for the same view.
+    let mut direct = CanvasGpu::new(&device, small.width, small.height).unwrap();
+    assert!(direct.render(&device, &queue, &scene, scene::background(&d, p)).is_some());
+    let want = direct.read(&device, &queue).unwrap();
+    let (mut worst, mut at) = (0u8, (0u32, 0u32));
+    for y in 0..small.height {
+        for x in 0..small.width {
+            let i = ((y * small.width + x) * 4) as usize;
+            for c in 0..4 {
+                let d = i16::from(pix.data()[i + c]) - i16::from(want.data()[i + c]);
+                if d.unsigned_abs() as u8 > worst {
+                    worst = d.unsigned_abs() as u8;
+                    at = (x, y);
+                }
+            }
+        }
+    }
+    assert!(worst <= 1, "the frame differs by {worst} at {at:?}");
 }
 
 /// A page of `n` rounded, gradient-filled cards at 2400 × 1600: enough geometry to show what the

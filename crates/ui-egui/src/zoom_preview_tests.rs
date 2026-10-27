@@ -73,7 +73,9 @@ fn job(doc: &Arc<Document>, page: NodeId, uid: u64, view: View) -> Job {
         solo: None,
         proof: false,
         uid,
+        revision: 0,
         zoom_preview: true,
+        refine: false,
         at: web_time::Instant::now(),
     }
 }
@@ -234,8 +236,8 @@ fn the_canvas_shows_images_of_its_own_page_and_never_a_coarser_one_of_its_view()
     assert!(!shows(&c, &refined, Some((ds.uid + 1, ds.page))), "another file");
     assert!(!shows(&c, &refined, Some((ds.uid, NodeId(ds.page.0 + 1)))), "another page");
     assert!(!shows(&c, &refined, None), "no file open");
-    // Showing the refined image of the view asked for: a preview arriving late stays off.
-    (c.tex_view, c.tex_of, c.tex_coarse) = (Some(refined.view.clone()), here, false);
+    // Showing the refined image of the view asked for: a preview of the same content stays off.
+    (c.tex_view, c.tex_of, c.tex_coarse, c.tex_revision) = (Some(refined.view.clone()), here, false, Some(refined.revision));
     assert!(!shows(&c, &preview, here));
     // Once the view asked for moves on, the preview is the better match.
     c.want_view = Some(far.view.clone());
@@ -246,6 +248,13 @@ fn the_canvas_shows_images_of_its_own_page_and_never_a_coarser_one_of_its_view()
     assert!(shows(&c, &preview, here));
     (c.tex_coarse, c.tex_of) = (false, Some((ds.uid, NodeId(ds.page.0 + 1))));
     assert!(shows(&c, &preview, here));
+    // And over a refined image of the same view when the content moved on (a drag's frame).
+    c.tex_of = here;
+    let mut moved = preview.clone();
+    moved.revision = refined.revision.wrapping_add(1);
+    moved.coarse = false;
+    (c.tex_view, c.tex_coarse, c.tex_revision) = (Some(moved.view.clone()), false, Some(moved.revision));
+    assert!(!shows(&c, &preview, here), "the preview is older content than what is on screen");
 }
 
 #[test]
@@ -277,8 +286,12 @@ fn a_preview_replaces_a_refined_image_of_the_same_zoom_elsewhere_on_the_page() {
     assert!(shows(&c, polled, here), "A at the same zoom shows 1/64 of A': the preview of all of it goes on");
     // Once A' itself is refined on screen, a preview of it would be a step down.
     let refined_a2 = r.refine(&a2).unwrap();
-    let c = CanvasState { tex_view: Some(refined_a2.view.clone()), ..c };
+    let c = CanvasState { tex_view: Some(refined_a2.view.clone()), tex_revision: Some(refined_a2.revision), ..c };
     assert!(!shows(&c, polled, here));
+    // While the content moves on (a drag), a preview of the new content goes on over it.
+    let mut moved = (*polled).clone();
+    moved.revision = refined_a2.revision.wrapping_add(1);
+    assert!(shows(&c, &moved, here));
 }
 
 #[test]
