@@ -359,14 +359,19 @@ impl CanvasGpu {
     /// come out premultiplied, as the blurs, the glass shader and vello's own image brush read them
     /// (vello's targets hold straight alpha, so the render is premultiplied before it is handed on).
     pub(crate) fn render_layer(&mut self, device: &Device, queue: &Queue, scene: &Scene, width: u32, height: u32) -> Option<Texture> {
+        let t0 = std::time::Instant::now();
         let texture = self.take_layer(device, "figcraft layer", width, height);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let params = RenderParams { base_color: vello::peniko::Color::new([0.0; 4]), width, height, antialiasing_method: AaConfig::Area };
         self.renderer.render_to_texture(device, queue, scene, &view, &params).ok()?;
+        let drawn = t0.elapsed().as_secs_f64() * 1000.0;
         let out = self.take_layer(device, "figcraft layer", width, height);
         let out_view = out.create_view(&wgpu::TextureViewDescriptor::default());
         self.compose.premultiply(device, queue, &view, &out_view);
         self.give_layer(texture);
+        if std::env::var("FIGCRAFT_PRESENT_LOG").is_ok() {
+            eprintln!("layer {width}×{height}: vello {drawn:.1}, premultiply {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0 - drawn);
+        }
         Some(out)
     }
 

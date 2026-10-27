@@ -331,15 +331,18 @@ fn boxes(
         None
     };
     let mut read = src.clone();
-    for (k, radius) in radii.iter().copied().enumerate() {
-        for (d, vertical) in [false, true].into_iter().enumerate() {
-            let target = other.create_view(&TextureViewDescriptor::default());
-            let slot = u32::try_from((k * 2 + d) * align).unwrap_or(0);
-            let mut started = false;
-            // The whole pass in one dispatch, where the halo fits in shared memory.
-            if radius <= HALO_RADIUS as usize
-                && let Some((fused, fused_layout)) = &blur.fused
-            {
+    // When every pass fits the one-dispatch form, the whole chain goes into one compute pass: a
+    // pass a box pass was the recording that made a window-sized blur cost 5–28 ms in
+    // `encoder.finish` (a dozen bind groups and command lists), where the dispatches are cheap.
+    // Each dispatch is its own usage scope, so wgpu keeps their reads and writes in order.
+    let all_fused = blur.fused.is_some() && radii.iter().all(|r| *r <= HALO_RADIUS as usize);
+    if all_fused && let Some((fused, fused_layout)) = &blur.fused {
+        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor { label: Some("figcraft blur box"), timestamp_writes: None });
+        pass.set_pipeline(fused);
+        for (k, _) in radii.iter().enumerate() {
+            for (d, vertical) in [false, true].into_iter().enumerate() {
+                let target = other.create_view(&TextureViewDescriptor::default());
+                let slot = u32::try_from((k * 2 + d) * align).unwrap_or(0);
                 let bind = device.create_bind_group(&BindGroupDescriptor {
                     label: Some("figcraft blur box"),
                     layout: fused_layout,
@@ -350,79 +353,107 @@ fn boxes(
                     ],
                 });
                 let (len, lines) = if vertical { (h, w) } else { (w, h) };
-                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor { label: Some("figcraft blur box"), timestamp_writes: None });
-                pass.set_pipeline(fused);
                 pass.set_bind_group(0, &bind, &[slot]);
                 pass.dispatch_workgroups(len.div_ceil(256), lines.max(1), 1);
-                started = true;
+                std::mem::swap(&mut current, &mut other);
+                read = current.create_view(&TextureViewDescriptor::default());
             }
-            if !started && let (Some(scan), Some(average), Some(scan_layout), Some(sums)) = (&blur.scan, &blur.average, &blur.scan_layout, sums) {
-                let written = sums.create_view(&TextureViewDescriptor::default());
-                // The running sums along every line, then the window's average from them.
-                let bind = device.create_bind_group(&BindGroupDescriptor {
-                    label: Some("figcraft blur scan"),
-                    layout: scan_layout,
-                    entries: &[
-                        BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&read) },
-                        uniform(0),
-                        BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&written) },
-                    ],
-                });
+        }
+    } else {
+        for (k, radius) in radii.iter().copied().enumerate() {
+            for (d, vertical) in [false, true].into_iter().enumerate() {
+                let target = other.create_view(&TextureViewDescriptor::default());
+                let slot = u32::try_from((k * 2 + d) * align).unwrap_or(0);
+                let mut started = false;
+                // The whole pass in one dispatch, where the halo fits in shared memory.
+                if radius <= HALO_RADIUS as usize
+                    && let Some((fused, fused_layout)) = &blur.fused
                 {
-                    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor { label: Some("figcraft blur scan"), timestamp_writes: None });
-                    pass.set_pipeline(scan);
+                    let bind = device.create_bind_group(&BindGroupDescriptor {
+                        label: Some("figcraft blur box"),
+                        layout: fused_layout,
+                        entries: &[
+                            BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&read) },
+                            uniform(0),
+                            BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&target) },
+                        ],
+                    });
+                    let (len, lines) = if vertical { (h, w) } else { (w, h) };
+                    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor { label: Some("figcraft blur box"), timestamp_writes: None });
+                    pass.set_pipeline(fused);
                     pass.set_bind_group(0, &bind, &[slot]);
-                    pass.dispatch_workgroups(if vertical { w } else { h }, 1, 1);
+                    pass.dispatch_workgroups(len.div_ceil(256), lines.max(1), 1);
+                    started = true;
                 }
-                let bind = device.create_bind_group(&BindGroupDescriptor {
-                    label: Some("figcraft blur average"),
-                    layout: &blur.layout,
-                    entries: &[BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&written) }, uniform(0)],
-                });
-                let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                    label: Some("figcraft blur average"),
-                    color_attachments: &[Some(RenderPassColorAttachment {
-                        view: &target,
-                        resolve_target: None,
-                        ops: Operations { load: LoadOp::Clear(wgpu::Color::TRANSPARENT), store: StoreOp::Store },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_pipeline(average);
-                pass.set_bind_group(0, &bind, &[slot]);
-                pass.draw(0..3, 0..1);
-                started = true;
+                if !started && let (Some(scan), Some(average), Some(scan_layout), Some(sums)) = (&blur.scan, &blur.average, &blur.scan_layout, sums) {
+                    let written = sums.create_view(&TextureViewDescriptor::default());
+                    // The running sums along every line, then the window's average from them.
+                    let bind = device.create_bind_group(&BindGroupDescriptor {
+                        label: Some("figcraft blur scan"),
+                        layout: scan_layout,
+                        entries: &[
+                            BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&read) },
+                            uniform(0),
+                            BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&written) },
+                        ],
+                    });
+                    {
+                        let mut pass =
+                            encoder.begin_compute_pass(&ComputePassDescriptor { label: Some("figcraft blur scan"), timestamp_writes: None });
+                        pass.set_pipeline(scan);
+                        pass.set_bind_group(0, &bind, &[slot]);
+                        pass.dispatch_workgroups(if vertical { w } else { h }, 1, 1);
+                    }
+                    let bind = device.create_bind_group(&BindGroupDescriptor {
+                        label: Some("figcraft blur average"),
+                        layout: &blur.layout,
+                        entries: &[BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&written) }, uniform(0)],
+                    });
+                    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("figcraft blur average"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view: &target,
+                            resolve_target: None,
+                            ops: Operations { load: LoadOp::Clear(wgpu::Color::TRANSPARENT), store: StoreOp::Store },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(average);
+                    pass.set_bind_group(0, &bind, &[slot]);
+                    pass.draw(0..3, 0..1);
+                    started = true;
+                }
+                if !started {
+                    let Some(direct) = &blur.direct else { return None };
+                    let bind = device.create_bind_group(&BindGroupDescriptor {
+                        label: Some("figcraft blur"),
+                        layout: &blur.layout,
+                        entries: &[BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&read) }, uniform(0)],
+                    });
+                    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("figcraft blur"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view: &target,
+                            resolve_target: None,
+                            ops: Operations { load: LoadOp::Clear(wgpu::Color::TRANSPARENT), store: StoreOp::Store },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(direct);
+                    pass.set_bind_group(0, &bind, &[slot]);
+                    pass.draw(0..3, 0..1);
+                }
+                std::mem::swap(&mut current, &mut other);
+                read = current.create_view(&TextureViewDescriptor::default());
             }
-            if !started {
-                let Some(direct) = &blur.direct else { return None };
-                let bind = device.create_bind_group(&BindGroupDescriptor {
-                    label: Some("figcraft blur"),
-                    layout: &blur.layout,
-                    entries: &[BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&read) }, uniform(0)],
-                });
-                let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                    label: Some("figcraft blur"),
-                    color_attachments: &[Some(RenderPassColorAttachment {
-                        view: &target,
-                        resolve_target: None,
-                        ops: Operations { load: LoadOp::Clear(wgpu::Color::TRANSPARENT), store: StoreOp::Store },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_pipeline(direct);
-                pass.set_bind_group(0, &bind, &[slot]);
-                pass.draw(0..3, 0..1);
-            }
-            std::mem::swap(&mut current, &mut other);
-            read = current.create_view(&TextureViewDescriptor::default());
         }
     }
     // After the last pass the freshly written texture is `current`; the rest goes back after the

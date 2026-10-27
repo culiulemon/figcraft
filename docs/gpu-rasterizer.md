@@ -863,6 +863,12 @@ stays on the fallback list.
   full-resolution test's 0.135; `a_downscale_halves_the_layer_the_right_way_up` pins the downscale
   itself (a texel is the average of its four, the right way up, premultiplied). At 600% a rebuild
   is now 9–15 ms on the device (was 16–31) and 19–53 ms of building (was 27–81).
+- 2026-10-28: **a blur's box passes are one compute pass.** A pass a box pass was most of a
+  window-sized blur's frame: `encoder.finish` (recording 48 dispatches as 48 passes, with their
+  bind groups) took 5–28 ms at 600%, where the dispatches themselves are cheap. Every pass of a
+  level now goes into one compute pass (each dispatch is its own usage scope, so wgpu keeps their
+  reads and writes in order), and `finish` is 6–15 ms. What is left at 600% is the page's own
+  build and the canvas render: ~30 ms a frame, of which the blur is 8–15.
 - 2026-10-26: **a real drag no longer re-blurs the card (and no longer freezes it).** With a real
   mouse (the OS cursor moving at 714 px/s over a maximized 2560 × 1440 window, canvas 2280 × 1624
   device px at 100%) a drag rebuilt the blurred layer on **every** frame — 73 rebuilds in a 0.5 s
