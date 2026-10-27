@@ -138,7 +138,13 @@ impl FigApp {
 
 #[derive(Clone, PartialEq)]
 struct JobKey {
-    doc: usize,
+    /// The document and its revision, by value: a drag replaces the document every frame, and the
+    /// allocator hands the freed block back — keyed by address, the frame after a drag step looked
+    /// like the frame before it (ABA), the canvas kept its texture and the card froze for as long
+    /// as the drag lasted. The revision (bumped by every command) is what says it changed.
+    doc: (u64, u64),
+    /// The IME composition on screen, while one is being typed: it changes without a command.
+    preedit: Option<(figcraft_engine::Preedit, usize)>,
     page: NodeId,
     origin: (i64, i64),
     scale: i64,
@@ -431,6 +437,7 @@ fn request_render(app: &mut FigApp, worker: &mut Worker, ppp: f32, max_texture_s
         (ds.view.zoom * f64::from(ppp), (rect.width() * ppp).ceil().max(1.0) as u32, (rect.height() * ppp).ceil().max(1.0) as u32)
     };
     // The edited text is drawn live (an IME composition included); the caret is an overlay.
+    let preedit = app.preedit_view().map(|p| (p.key.1.clone(), p.key.2));
     let doc = app.preedit_view().map(|p| p.doc.clone()).unwrap_or_else(|| ds.doc.clone());
     let outlined = if ds.view.outlines_selection { ds.selection.clone() } else { vec![] };
     let proof = ds.view.proof_srgb && !doc.color_profile.is_srgb();
@@ -444,7 +451,8 @@ fn request_render(app: &mut FigApp, worker: &mut Worker, ppp: f32, max_texture_s
     let requested = (ox - f64::from(margin) / scale, oy - f64::from(margin) / scale);
     let size = (visible_w.saturating_add(margin * 2).min(max_texture_side), visible_h.saturating_add(margin * 2).min(max_texture_side));
     let key = JobKey {
-        doc: Arc::as_ptr(&doc) as usize,
+        doc: (ds.uid, ds.revision),
+        preedit,
         page: ds.page,
         origin: ((requested.0 * 1000.0) as i64, (requested.1 * 1000.0) as i64),
         scale: (scale * 10000.0) as i64,
@@ -532,6 +540,28 @@ fn overscan_stays_within_texture_and_pixel_budget() {
         let visible = u64::from(width) * u64::from(height);
         assert!(rendered * 5 <= visible * 8); // At most 1.6× the visible pixels.
     }
+}
+
+/// A drag step replaces the document, and the allocator hands the freed block back: a job keyed by
+/// the document's address then matches the frame before the drag, and the canvas never asks for the
+/// moved one. The key is the document and its revision by value, so a step is a new job.
+#[cfg(test)]
+#[test]
+fn a_moved_document_asks_for_a_new_frame() {
+    let mut doc = figcraft_doc::Document::new("drag");
+    let Some(page) = doc.first_page() else { return };
+    let Ok(card) = doc.create(page, figcraft_doc::NodeKind::Rectangle, "card", 10.0, 10.0, 40.0, 30.0) else { return };
+    let mut app = FigApp::new(figcraft_engine::Session::with_document(doc), Box::new(crate::NoServices));
+    app.canvas.rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(96.0, 72.0));
+    let mut worker = crate::render_worker::Worker::new(egui::Context::default());
+    request_render(&mut app, &mut worker, 1.0, 16_383);
+    let Some(first) = app.canvas.submitted.clone() else { return };
+    // Where a drag's step lands: one command, one new revision.
+    app.session.set_selection(vec![card]);
+    assert!(app.run("node.set", json!({"props": {"x": 20.0}})).is_some(), "the move");
+    request_render(&mut app, &mut worker, 1.0, 16_383);
+    let Some(second) = app.canvas.submitted.clone() else { return };
+    assert!(first != second, "the moved frame was the job before it: the canvas keeps its texture");
 }
 
 /// The zoom tool while Z is held (Alt: zoom out): a click zooms a step about the pointer, a drag

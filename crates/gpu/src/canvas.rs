@@ -578,11 +578,13 @@ impl crate::scene::Layers for GpuLayers<'_> {
     }
 
     fn progressive(&mut self, layer: &Layer, s0: f64, s1: f64, a: (f64, f64), b: (f64, f64), key: Option<(u64, u64)>) -> Option<Layer> {
-        // A level is a full layer texture and there are up to eight of them: a layer past this
-        // many pixels would cost hundreds of megabytes on the device (some drivers refuse the
-        // allocation outright), so a blur that large stays on the CPU, which has the RAM. 6 M
-        // pixels keeps a 0 → 300 blur on a 200 × 300 card on the GPU up to 200% zoom (~220 MB).
-        const MAX_PIXELS: u64 = 6_000_000;
+        // What the device pays: the layer (4 bytes a pixel), its levels (each blurred only in its
+        // band, so together a few times the layer), and the mix's output (a layer), all in flight
+        // at once — 16 M pixels is 64 MB a full-size texture, about 300 MB together, the most a
+        // card's blur should ask of a device that also draws the window. Past that the blur stays
+        // on the CPU, which has the RAM. 16 M keeps the 0 → 300 blur on a 200 × 300 card on the
+        // GPU to 244% zoom; at 300% it is 18 M and leaves the canvas on the CPU.
+        const MAX_PIXELS: u64 = 16_000_000;
         if u64::from(layer.size.0).saturating_mul(u64::from(layer.size.1)) > MAX_PIXELS {
             return None;
         }
@@ -817,7 +819,7 @@ pub(crate) fn level_crop(
         std::mem::swap(&mut lt, &mut ht);
     }
     let (lt, ht) = (lt.max(0.0), ht.min(1.0));
-    if !(ht >= lt) {
+    if ht < lt {
         // The ramp never reaches this level: nothing to blur (the blend never picks it).
         return (0, 0, 1, 1);
     }

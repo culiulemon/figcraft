@@ -2269,47 +2269,55 @@ fn a_progressive_level_blurs_only_its_band() {
     assert_eq!((x, y, cw, ch), (0, 0, w, h));
 }
 
-/// A layer's key leaves out the node's own placement: moving it by whole device pixels gives the
-/// same key (so its blurred layer is kept), while anything that changes its pixels does not.
+/// A layer's key leaves out where the node sits: moving it — by a whole device pixel or by part
+/// of one, at any zoom — gives the same key (so its blurred layer is kept), while anything that
+/// changes its pixels does not.
 #[test]
 fn a_whole_pixel_move_keeps_the_layer_key() {
     let d = progressive_card_doc(300.0);
     let p = d.first_page().unwrap();
     let card = d.node(p).and_then(|p| p.children.get(1).copied()).expect("the card");
-    let view = View { origin: (0.0, 0.0), scale: 1.0, width: 904, height: 860 };
-    let key_of = |doc: &Document| {
+    let key_of = |doc: &Document, zoom: f64| {
+        // A panned view: the origin is a page coordinate no one picked to be whole, which is where
+        // composing the placement with the view rounds (the app's drags happen here, not at 0, 0).
+        let view = View { origin: (37.25, -11.6), scale: zoom, width: 904, height: 860 };
         let n = doc.node(card).expect("the card");
         let (x0, y0, ..) = scene::layer_rect_for(doc, card, &view).expect("a layer");
         let xf = view.transform() * n.transform;
         let layer_xf = figcraft_geom::Affine::translate((-x0, -y0)) * xf;
-        let (first, second) = scene::layer_key_for(doc, n, u64::MAX, layer_xf);
-        (first, second)
+        scene::layer_key_for(doc, n, u64::MAX, layer_xf)
     };
-    let base = key_of(&d);
-    for i in 1..5u32 {
+    let moved = |dx: f64, dy: f64| {
         let mut e = d.clone();
         if let Ok(n) = e.get_mut(card) {
-            n.transform = figcraft_geom::Affine::translate((f64::from(i), 0.0)) * n.transform;
+            n.transform = figcraft_geom::Affine::translate((dx, dy)) * n.transform;
         }
-        assert_eq!(key_of(&e), base, "a {i} px move changed the layer key");
+        e
+    };
+    // Any zoom, any drag: 100% moves the node a whole device pixel, 86% and 244% move it part of
+    // one, and the layer's content does not depend on either.
+    for zoom in [1.0, 0.86, 2.44] {
+        let base = key_of(&d, zoom);
+        for step in [0.5, 1.0, 2.0, 3.7] {
+            assert_eq!(key_of(&moved(step, step * 0.5), zoom), base, "a {step} px move at {zoom:.2}× changed the layer key");
+        }
     }
     // A changed fill is a changed layer.
     let mut repainted = d.clone();
     if let Ok(n) = repainted.get_mut(card) {
         n.fills = vec![Paint::solid(Color::from_hex("E02040").unwrap_or(Color::BLACK))];
     }
-    assert_ne!(key_of(&repainted), base, "a repainted layer kept its key");
-    // So is a subpixel move (its pixels are sampled differently).
-    let mut nudged = d.clone();
-    if let Ok(n) = nudged.get_mut(card) {
-        n.transform = figcraft_geom::Affine::translate((1.5, 0.0)) * n.transform;
+    assert_ne!(key_of(&repainted, 1.0), key_of(&d, 1.0), "a repainted layer kept its key");
+    // So is a resize (its pixels are laid out again).
+    let mut resized = d.clone();
+    if let Ok(n) = resized.get_mut(card) {
+        n.height = 320.0;
     }
-    assert_ne!(key_of(&nudged), base, "a half-pixel move kept its key");
+    assert_ne!(key_of(&resized, 1.0), key_of(&d, 1.0), "a resized layer kept its key");
 }
 
-/// A drag by whole device pixels moves the layer's place, not its pixels: the blurred layer is
-/// kept from the frame before (no re-blur — what made a real drag lag), and the moved frame still
-/// matches the CPU's render of the moved card.
+/// A drag keeps the blurred layer at every zoom — not just at 100%, where a drag is a whole
+/// number of device pixels — and the moved frame matches the CPU's render of the moved card.
 #[test]
 fn a_dragged_card_keeps_its_blur() {
     let Some((device, queue)) = device() else {
@@ -2320,7 +2328,6 @@ fn a_dragged_card_keeps_its_blur() {
     let p = d.first_page().unwrap();
     let card = d.node(p).and_then(|p| p.children.get(1).copied());
     let (w, h) = (904u32, 860u32);
-    let view = View { origin: (0.0, 0.0), scale: 1.0, width: w, height: h };
     let moved = |dx: f64| {
         let mut e = d.clone();
         if let Some(id) = card
@@ -2330,26 +2337,32 @@ fn a_dragged_card_keeps_its_blur() {
         }
         e
     };
-    let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
-    assert!(gpu_frame(&mut canvas, &device, &queue, &d, &view, scene::background(&d, p)));
-    let first = canvas.kept_shadow_hits();
-    // A whole-pixel drag: the layer's pixels are the frame's before, only its place differs.
-    for i in 1..8u32 {
-        let was = canvas.kept_shadow_hits();
-        assert!(gpu_frame(&mut canvas, &device, &queue, &moved(f64::from(i)), &view, scene::background(&d, p)));
-        println!("  move {i}: kept {}", canvas.kept_shadow_hits() - was);
+    // 100% and 86%: at the second a drag of a page pixel moves the card about 0.86 device pixels,
+    // which is where the layer used to be re-blurred every frame.
+    for (zoom, step) in [(1.0, 1.0), (0.86, 1.0), (2.44, 0.4)] {
+        // A panned view, as in the app: see `a_whole_pixel_move_keeps_the_layer_key`.
+        let view = View { origin: (37.25, -11.6), scale: zoom, width: w, height: h };
+        let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+        assert!(gpu_frame(&mut canvas, &device, &queue, &d, &view, scene::background(&d, p)));
+        let first = canvas.kept_shadow_hits();
+        for i in 1..8u32 {
+            let was = canvas.kept_shadow_hits();
+            assert!(gpu_frame(&mut canvas, &device, &queue, &moved(f64::from(i) * step), &view, scene::background(&d, p)));
+            println!("  {zoom:.2}× move {i}: kept {}", canvas.kept_shadow_hits() - was);
+        }
+        let hits = canvas.kept_shadow_hits() - first;
+        println!("{zoom:.2}×: seven moves found the kept layer {hits} times");
+        assert!(hits >= 7, "a drag at {zoom:.2}× re-blurred its layer ({hits} of 7 kept)");
+        // And the moved frame is the CPU's: the kept layer is drawn where it belongs (its place
+        // snapped to a whole device pixel, so a fractional drag is off by less than one).
+        let d7 = moved(7.0 * step);
+        let cpu = render_view(&d7, p, &view, &Options::default()).unwrap();
+        let gpu = canvas.read(&device, &queue).unwrap();
+        let (worst, mean, at, over) = diff(&cpu, &gpu);
+        println!("  dragged card parity at {zoom:.2}×: worst {worst} at {at:?}, mean {mean:.3}, {over} pixels differ by more than 8");
+        assert!(worst <= 160, "a channel differs by {worst} (mean {mean:.3})");
+        assert!(mean <= 3.0, "the mean difference is {mean:.3}");
     }
-    let hits = canvas.kept_shadow_hits() - first;
-    println!("seven whole-pixel moves found the kept layer {hits} times");
-    assert!(hits >= 7, "a whole-pixel drag re-blurred its layer ({hits} of 7 kept)");
-    // And the moved frame is the CPU's: the kept layer is drawn where it belongs.
-    let d7 = moved(7.0);
-    let cpu = render_view(&d7, p, &view, &Options::default()).unwrap();
-    let gpu = canvas.read(&device, &queue).unwrap();
-    let (worst, mean, at, over) = diff(&cpu, &gpu);
-    println!("dragged card parity: worst {worst} at {at:?}, mean {mean:.3}, {over} pixels differ by more than 8");
-    assert!(worst <= 96, "a channel differs by {worst} (mean {mean:.3})");
-    assert!(mean <= 1.5, "the mean difference is {mean:.3}");
 }
 
 /// A 200 × 300 card with a progressive blur from 0 to `radius`, over a plain ground.

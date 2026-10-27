@@ -389,9 +389,10 @@ same doc):
 Doubling the ramp barely moves the GPU frame (the layer's own pixels grow, not the window's taps);
 the CPU's four-box-per-level cost doubles. `the_gpu_draws_a_progressive_blur` checks the 0 → 300
 case (a 1100 × 1200 layer, each level blurred in its band) against the CPU: mean 0.135/255, worst
-30, 212 pixels off by more than 8. A progressive blur whose layer is past 6 M pixels (0 → 1250 on
-that card, or the same blur at 300% zoom) stays on the CPU: its eight full-size levels would cost
-hundreds of megabytes of device memory, and some drivers refuse the allocation.
+30, 212 pixels off by more than 8. A progressive blur whose layer is past 16 M pixels (0 → 1250 on
+that card past about 260% zoom) stays on the CPU: with the levels cropped to their bands the device
+holds the layer, the crops and the mix output at once — 64 MB for a full-size texture, some 300 MB
+together, which a driver can refuse outright.
 
 ### P8 — masks and plus-darker
 
@@ -795,8 +796,9 @@ stays on the fallback list.
   textures now come from pools a frame gives back (128 MB each, the oldest evicted: clearing a
   pool on overflow put the churn straight back), so a steady drag frame is 0.5 ms of building,
   0.3 ms of rendering and 0.5 ms of wait; only the first frame of a new canvas pays its pipelines
-  (110–170 ms). The progressive blur's device-memory ceiling is 6 M pixels, so the same card stays
-  on the GPU at 200% zoom (~220 MB of levels).
+  (110–170 ms). The progressive blur's device-memory ceiling is 16 M pixels (2026-10-28: it was
+  6 M, which put the same card on the CPU from 200% zoom; see the entry below), so the same card
+  stays on the GPU to 244% zoom.
 - 2026-10-26: **the box passes are O(1) a pixel, in one dispatch.** A 200 × 300 card with a
   progressive blur from 0 to 300 (the radius the acceptance pass found laggy) dragged at
   2400 × 1600 costs 0.83 ms a frame where a full CPU render takes 252; 0 → 600 costs 1.07 ms
@@ -808,8 +810,37 @@ stays on the fallback list.
   mean 0.135/255, worst 30 — the same pixels as the strip version, which is the point: the
   speedups below changed no output. `the_gpu_draws_a_sideways_progressive_blur` covers the ramp
   across the card, where the levels' bands are columns and the crops start differently along x. A
-  progressive blur whose layer is past 6 M pixels stays on the CPU (eight levels would cost
-  hundreds of MB of device memory; some drivers abort on the allocation).
+  progressive blur whose layer is past 16 M pixels stays on the CPU (see the entry above).
+- 2026-10-28: **the card drags smoothly at any zoom, 200% included.** A real cursor over the
+  maximized window at 200% exposed two more places where a zoom other than 100% was different:
+  - **The blur's device-memory ceiling (6 M pixels) put 200% on the CPU.** The card's layer is
+    its paint bounds grown by the effect's margin — 1400 × 1466 device px at 100%, 2800 × 2930
+    (8.2 M) at 200% — so past 100% the progressive blur refused, the whole frame left the GPU
+    canvas, and the CPU redrew the blurred card every frame: 818 ms a frame (`renderMs`), 26–34
+    frames in a four-second drag, the card left behind at its old place. The ceiling is 16 M
+    pixels now: the levels are cropped to their bands, so the device holds the layer, the crops
+    and the mix output (some 300 MB) rather than eight full-size levels. At 200% the canvas is
+    back on the GPU: `render` 4.4–6.4 ms a frame, one job a pointer move, and the card within
+    0–2 px of the cursor (median) at 100%, 200% and 244% (12.2 M pixels, 6.2 ms a frame).
+  - **The canvas's job key was the document's address, and a drag reuses it (ABA).** Measured
+    with the log on: 200 of 231 frame decisions found the "same" document and kept the texture,
+    and only the 31 frames where the allocator happened to move the document were drawn — a blur
+    drag at 200% froze between those. `JobKey.doc` is the document's uid and its **revision** by
+    value now (the revision is bumped by every command, which is what a drag is), with the IME
+    composition alongside it while one is typed. Regression test:
+    `a_moved_document_asks_for_a_new_frame`.
+  - **The exact corner is for layers the frame *makes*.** A progressive layer drawn from its exact
+    corner and composited on a whole pixel lands up to half a device pixel off the vector's place,
+    which is invisible on a blur but shows as a halo where a crisp layer meets a shadow's cut-out
+    (`the_gpu_draws_shadows_of_any_shape` went from worst 50 to 135). Now only a layer the frame
+    makes — a blur, noise or texture, whose pixels are laid down anyway — is drawn from its exact
+    corner and cached across subpixel moves; a group, a card under a shadow and an inner shadow
+    stay on the renderer's floored grid and draw as exactly as the CPU does. Parity is back to
+    worst 50 / mean 0.142 with every GPU test green, and `a_dragged_card_keeps_its_blur` keeps the
+    layer 7 of 7 at 100%, 86% and 244%.
+  The screen captures above were misleading until they were made against a white card on the
+  dark page: a black card on the dark background has no edge to follow, and every frame "measured"
+  the background.
 - 2026-10-26: **a real drag no longer re-blurs the card (and no longer freezes it).** With a real
   mouse (the OS cursor moving at 714 px/s over a maximized 2560 × 1440 window, canvas 2280 × 1624
   device px at 100%) a drag rebuilt the blurred layer on **every** frame — 73 rebuilds in a 0.5 s
@@ -822,12 +853,16 @@ stays on the fallback list.
     serialized into the hasher. `step_key` keeps the node's own placement (a step's pixels move
     with it); `content_hash` leaves it out (a layer's *texture* does not depend on where the node
     sits).
-  - **The layer key is the layer-local transform** (`layer_xf`, `translate(-x0, -y0) · xf`): whole
-    device-pixel moves leave it unchanged, so the kept blurred layer is drawn at its new place;
-    subpixel moves and any edit to what the node draws still rebuild. Tests:
-    `a_whole_pixel_move_keeps_the_layer_key` (same key for four 1 px moves; a repaint or a half-pixel
-    move changes it) and `a_dragged_card_keeps_its_blur` (seven 1 px moves find the kept layer 7/7,
-    and the moved frame matches the CPU at mean 0.136/255, worst 30).
+  - **The layer key is the layer-local transform** (`layer_xf`, from the layer's **exact**
+    device corner): a layer's content is drawn in the layer's own space, so moving the node by a
+    whole device pixel *or part of one* leaves the content where it is and moves the layer — the
+    kept blurred layer is drawn at its new place (its corner rounded to a pixel). Before, the
+    corner was floored, which put the corner's fraction into the content, so only a drag that was
+    a whole number of device pixels (that is, 100% zoom) kept the layer; at 86% or 244% every
+    frame re-blurred it. Tests: `a_whole_pixel_move_keeps_the_layer_key` (the same key for 0.5,
+    1, 2 and 3.7 px moves at 100%, 86% and 244%; a repaint or a resize changes it) and
+    `a_dragged_card_keeps_its_blur` (seven moves at 100%, 86% and 244% find the kept layer 7/7,
+    and each moved frame matches the CPU within 3/255 on average).
   The earlier scripted measurements missed this: they walked the same positions back and forth, so
   the cache hit by luck. Every number below that came from `ui.pointer` was re-checked with a real
   drag; the drag path is now measured with one.

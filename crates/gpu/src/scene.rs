@@ -86,8 +86,8 @@ pub fn glass_setup(doc: &Document, id: NodeId, view: &View) -> Option<(figcraft_
 }
 
 /// The device rectangle of `n`'s effect layer, in whole pixels (`None` past the layer cap). The
-/// renderer's own layer rectangle: its paint bounds without its effects' margin, which is what a
-/// shadow cast by the layer is cropped to.
+/// renderer's own layer rectangle: its paint bounds floored to a pixel, without its effects'
+/// margin — the crop a backdrop effect reads, and the grid the glass geometry is built on.
 fn layer_rect_impl(doc: &Document, n: &Node, view: &View) -> Result<Option<(f64, f64, u32, u32)>, Unsupported> {
     let Some(bounds) = figcraft_render::layer_bounds(doc, n.id) else { return Ok(None) };
     let (x0f, y0f) = ((bounds.x0 - view.origin.0) * view.scale, (bounds.y0 - view.origin.1) * view.scale);
@@ -102,6 +102,27 @@ fn layer_rect_impl(doc: &Document, n: &Node, view: &View) -> Result<Option<(f64,
         return Err(Unsupported::Effect);
     }
     Ok(Some((x0, y0, w as u32, h as u32)))
+}
+
+/// The device rectangle of `n`'s layer at its **exact** device corner, with a size that does not
+/// depend on where the node sits: its paint bounds' device extent rounded up, plus a pixel of
+/// slack for the corner's fraction. A layer the frame makes (a blur, noise, texture) draws its
+/// content in the layer's own space from this corner, so a drag by part of a device pixel leaves
+/// the content where it is and moves the layer — where the floored corner put that fraction into
+/// the content, and every subpixel move re-blurred it (see `layer_pipeline`).
+fn layer_rect_exact_impl(doc: &Document, n: &Node, view: &View) -> Result<Option<(f64, f64, u32, u32)>, Unsupported> {
+    let Some(bounds) = figcraft_render::layer_bounds(doc, n.id) else { return Ok(None) };
+    let (x0f, y0f) = ((bounds.x0 - view.origin.0) * view.scale, (bounds.y0 - view.origin.1) * view.scale);
+    let (w, h) = ((bounds.x1 - bounds.x0) * view.scale, (bounds.y1 - bounds.y0) * view.scale);
+    if !(x0f.is_finite() && y0f.is_finite() && w.is_finite() && h.is_finite()) {
+        return Err(Unsupported::Structure);
+    }
+    let (w, h) = (w.max(1.0).ceil() + 1.0, h.max(1.0).ceil() + 1.0);
+    const MAX_LAYER: f64 = 8_192.0;
+    if w > MAX_LAYER || h > MAX_LAYER {
+        return Err(Unsupported::Effect);
+    }
+    Ok(Some((x0f, y0f, w as u32, h as u32)))
 }
 
 /// The page's background colour, drawn under the scene.
@@ -1049,6 +1070,12 @@ impl Builder<'_> {
         layer_rect_impl(self.doc, n, &self.view)
     }
 
+    /// [`Self::layer_rect`] at the layer's exact device corner: where its content's own transform
+    /// starts, so a subpixel move leaves the content and moves the layer.
+    fn layer_rect_exact(&self, n: &Node) -> Result<Option<(f64, f64, u32, u32)>, Unsupported> {
+        layer_rect_exact_impl(self.doc, n, &self.view)
+    }
+
     /// `n`'s backdrop effect pixels: its layer texture with its top-left at `at`, clipped to the
     /// node's shape when `clip` (a blurred layer is a rectangle; a pane carries its own coverage);
     /// then the node's content over them.
@@ -1110,11 +1137,30 @@ impl Builder<'_> {
         if n.blend == BlendMode::PlusDarker && !self.blend_as_normal.contains(&n.id) {
             return Err(Unsupported::Structure);
         }
-        let Some((x0, y0, w, h)) = self.layer_rect(n)? else { return Ok(()) };
+        let Some((x0f, y0f, w, h)) = self.layer_rect_exact(n)? else { return Ok(()) };
+        // A layer whose pixels this frame *makes* (a blur, noise, texture) is drawn from its exact
+        // corner and composited on whole pixels: its content is laid down, not sampled, wherever
+        // it lands, and it is up to half a device pixel off the vector's place — which is what lets
+        // a drag reuse it instead of blurring it again (`layer_rect_exact_impl`). Everything else
+        // (a group, a card under a shadow) stays on the renderer's floored grid, where its edges
+        // land exactly where the CPU's do.
+        let reads = n.effects.iter().any(|e| {
+            e.visible
+                && matches!(
+                    e.kind,
+                    figcraft_doc::EffectKind::LayerBlur(_) | figcraft_doc::EffectKind::Noise(_) | figcraft_doc::EffectKind::Texture(_)
+                )
+        });
+        let (bx0, by0) = if reads { (x0f, y0f) } else { (x0f.floor(), y0f.floor()) };
+        let (x0, y0) = (bx0.round(), by0.round());
+        // What is cut against the node's own pixels (a shadow's hole) follows the layer's grid.
+        let snap = Affine::translate((x0 - bx0, y0 - by0));
         let view = self.view.clone();
         let parent = n.parent.map(|p| self.doc.world_transform(p)).unwrap_or(Affine::IDENTITY);
         let xf = view.transform() * parent * n.transform;
-        let layer_xf = Affine::translate((-x0, -y0)) * xf;
+        // From the layer's corner: the content of a made layer keeps its place when the node moves
+        // by part of a device pixel (`layer_rect_exact_impl`).
+        let layer_xf = Affine::translate((-bx0, -by0)) * xf;
         let scale = view.scale;
         let effects: Vec<&figcraft_doc::Effect> = n.effects.iter().filter(|e| e.visible).collect();
         let shadows: Vec<figcraft_doc::Shadow> = effects
@@ -1168,7 +1214,7 @@ impl Builder<'_> {
             let key = self.shadow_key(n, u64::MAX, layer_xf);
             content = self.layers.kept_shadow(key);
             if content.is_none() {
-                let scene = self.content_scene(n, (x0, y0, w, h), depth)?;
+                let scene = self.content_scene(n, (bx0, by0, w, h), depth)?;
                 let mut made = self.layers.layer(&scene, w, h, None).ok_or(Unsupported::Effect)?;
                 for s in &group_inner {
                     made = self.group_inner_shadow(&made, s, scale)?;
@@ -1234,7 +1280,7 @@ impl Builder<'_> {
             // A shadow that hides behind the paints is cut where they cover (the CPU masks it by
             // its cover); one that shows behind is not.
             let hole = if s.show_behind { None } else { outside.as_ref() };
-            self.draw_shadow_image(&image, at, Some(&bounds), hole, s.blend, xf);
+            self.draw_shadow_image(&image, at, Some(&bounds), hole, s.blend, snap * xf);
         }
         // The node over its shadows: the layer the effects made, or its content drawn straight
         // into the scene when nothing had to read it.
@@ -1373,7 +1419,9 @@ impl Builder<'_> {
         }
         // A group's inner shadow is cast from its pixels: that is the CPU's for now.
         let Some((shape, rule)) = node_outline(self.doc, n) else { return Err(Unsupported::Effect) };
-        let Some((x0, y0, w, h)) = self.layer_rect(n)? else { return Ok(()) };
+        let Some((x0f, y0f, w, h)) = self.layer_rect_exact(n)? else { return Ok(()) };
+        // The renderer's floored grid, as for a layer it draws as it is (`layer_pipeline`).
+        let (x0, y0) = (x0f.floor(), y0f.floor());
         let scale = self.view.scale;
         let layer_xf = Affine::translate((-x0, -y0)) * xf;
         for (index, s) in shadows.iter().enumerate() {
@@ -1389,7 +1437,7 @@ impl Builder<'_> {
                     let pad = if reach.is_finite() { reach.ceil().clamp(0.0, 2048.0) as u32 + 2 } else { 2 };
                     (image, (x0 - f64::from(pad), y0 - f64::from(pad)))
                 }
-                None => self.inner_shadow_image(&shape, rule, (x0, y0, w, h), layer_xf, scale, s, key)?,
+                None => self.inner_shadow_image(&shape, rule, (x0f, y0f, w, h), layer_xf, scale, s, key)?,
             };
             let Some(scene) = &mut self.scene else { continue };
             let sampler = ImageSampler { x_extend: Extend::Pad, y_extend: Extend::Pad, quality: ImageQuality::Low, alpha: 1.0 };
@@ -1979,14 +2027,15 @@ fn node_hash(doc: &Document, n: &Node, depth: usize, own_transform: bool) -> u64
 }
 
 /// [`Builder::shadow_key`]: what `n` draws, its layer's placement, and the document's shape.
+#[cfg(test)]
 pub(crate) fn layer_key_for(doc: &Document, n: &Node, index: u64, xf: Affine) -> (u64, u64) {
     layer_key(doc, n, index, xf)
 }
 
-/// `id`'s layer rectangle (tests: the layer's own placement).
+/// `id`'s layer rectangle at its exact device corner (tests: the layer's own placement).
 #[cfg(test)]
 pub(crate) fn layer_rect_for(doc: &Document, id: NodeId, view: &View) -> Option<(f64, f64, u32, u32)> {
-    layer_rect_impl(doc, doc.node(id)?, view).ok().flatten()
+    layer_rect_exact_impl(doc, doc.node(id)?, view).ok().flatten()
 }
 
 fn layer_key(doc: &Document, n: &Node, index: u64, xf: Affine) -> (u64, u64) {
@@ -1999,7 +2048,12 @@ fn layer_key(doc: &Document, n: &Node, index: u64, xf: Affine) -> (u64, u64) {
     figcraft_text::layout_generation().hash(&mut first);
     doc.color_profile.hash(&mut first);
     let mut second = std::collections::hash_map::DefaultHasher::new();
-    for v in xf.as_coeffs().map(f64::to_bits) {
+    // The layer's transform, at a micro-pixel: the exact corner cancels the node's placement in
+    // the reals, but composing the matrices rounds, so the last bits of the translation drift with
+    // the node's position (at a zoom that isn't a power of two, and an origin that isn't whole).
+    // Hashing them raw re-blurred the layer every frame of a drag; a micro-pixel is far below what
+    // the layer's pixels can show.
+    for v in xf.as_coeffs().map(|v| (v * 1e6).round() as i64) {
         v.hash(&mut second);
     }
     (first.finish(), second.finish())

@@ -284,10 +284,26 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
   frame (~35–50 ms each, 73 rebuilds in a 0.5 s drag) and could even show a **stale** frame: the
   cache keys were node *addresses*, and a drag frees the previous document, so the allocator reused
   the address (ABA) and the card froze at an earlier position. Keys are now hashed by value
-  (`scene::node_hash`), and the layer key is the layer-local transform, so a whole-pixel drag keeps
-  the blurred layer: 0 rebuilds, `plan 0.0, build 0.1, render 6.5–8.3 ms` a frame, and screen
-  captures put the card within 7 px of the cursor (~10 ms behind). Tests: `a_dragged_card_keeps_its_blur`,
-  `a_whole_pixel_move_keeps_the_layer_key`.
+  (`scene::node_hash`), and a layer's key is its layer-local transform taken from the layer's
+  **exact** device corner (the layer image itself is drawn at the rounded corner), so a drag keeps
+  the blurred layer at any zoom — not only at 100%, where a drag moves the node a whole number of
+  device pixels: 0 rebuilds, `plan 0.0, build 0.1, render 6.5–8.3 ms` a frame, and screen captures
+  put the card within 7 px of the cursor (~10 ms behind). Tests: `a_dragged_card_keeps_its_blur`
+  (100%, 86% and 244%), `a_whole_pixel_move_keeps_the_layer_key`.
+- **Landed (2026-10-28), zoom:** the same card drags smoothly at 200% (and 244%) too. Two more
+  address-shaped keys and one budget were in the way. The progressive blur's device-memory ceiling
+  (6 M pixels) was smaller than the card's layer at 200% (2800 × 2930 = 8.2 M: the layer is the
+  card grown by the effect's margin), so the whole frame left the GPU canvas for the CPU — 818 ms
+  a frame, the card left behind at its old place. The ceiling is 16 M now (the levels are cropped
+  to their bands), and 200% draws on the GPU in 4.4–6.4 ms a frame. The canvas's own job key was
+  the document's *address*, which a drag reuses as the allocator hands the freed block back: 200
+  of 231 frame decisions kept a texture for a document that had changed. It is the document's uid
+  and revision by value now (`canvas::JobKey`), test
+  `a_moved_document_asks_for_a_new_frame`. Real cursor at 200%: the card within 0–2 px of the
+  cursor (median, as at 100%). The exact-corner cache is kept to layers the frame *makes* (blur,
+  noise, texture): a crisp layer composited on a whole pixel is up to half a device pixel off the
+  vector, which showed as a halo at a shadow's cut-out, so groups, shadowed cards and inner
+  shadows stay on the renderer's floored grid (parity worst 50/255, mean 0.142).
 - **Landed (2026-10-26), blur cost:** a box pass is O(1) a pixel and one dispatch (a workgroup
   scans 256 pixels of a line and their halo in shared memory), and each progressive level is
   blurred only where the ramp uses it (its band plus the blur's reach), so a blur's radius costs
@@ -297,7 +313,7 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
   canvas frames a second (116–141 frames in about 2.3 s, 154 pointer moves a second), a frame that
   rebuilds the blur costing 24–60 ms of building plus 5–25 ms of drawing, a kept one 3–7 ms. Blur
   scratch textures are kept between runs (no per-frame texture churn). A progressive blur whose
-  layer is past 6 M pixels stays on the CPU (eight levels of device memory).
+  layer is past 16 M pixels stays on the CPU.
 - **Landed (2026-10-25), P11:** a segmented page keeps each ordinary step in a canvas-sized texture
   between frames (keyed on its subtrees, the view and the zoom), each page node's encoded scene is
   kept too (so a drag encodes only the layers it changed), and a step or node that reads the page
