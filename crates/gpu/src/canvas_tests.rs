@@ -2184,6 +2184,38 @@ fn segmented_drag_timings() {
     }
 }
 
+/// A progressive blur whose layer is past the levels' budget (2 M pixels) blurs its levels at half
+/// resolution and reads them upscaled: the same picture as the CPU's, since a level is a blur.
+#[test]
+fn the_gpu_draws_a_big_progressive_blur_at_half_resolution() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    // A 0 → 420 ramp: the card's layer is 1820 × 2110 (3.8 M pixels, past the 2 M budget), and
+    // the view is panned so the view does not clip it.
+    let d = progressive_card_doc(420.0);
+    let p = d.first_page().unwrap();
+    let card = d.node(p).and_then(|p| p.children.get(1).copied()).expect("the card");
+    let (w, h) = (2000u32, 2200u32);
+    let view = View { origin: (-700.0, -800.0), scale: 1.0, width: w, height: h };
+    let (_, _, lw, lh) = scene::layer_rect_for(&d, card, &view).expect("a layer");
+    println!("the layer is {lw} × {lh} ({} pixels)", u64::from(lw) * u64::from(lh));
+    let cpu = render_view(&d, p, &view, &Options::default()).unwrap();
+    let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
+    let built = {
+        let mut layers = crate::canvas::GpuLayers { canvas: &mut canvas, device: &device, queue: &queue };
+        scene::build_with(&d, p, &view, &mut layers)
+    }
+    .expect("the GPU draws the big progressive blur");
+    assert!(canvas.render(&device, &queue, &built, scene::background(&d, p)).is_some());
+    let gpu = canvas.read(&device, &queue).unwrap();
+    let (worst, mean, at, over) = diff(&cpu, &gpu);
+    println!("big progressive blur parity: worst {worst} at {at:?}, mean {mean:.3}, {over} pixels differ by more than 8");
+    assert!(worst <= 96, "a channel differs by {worst} (mean {mean:.3})");
+    assert!(mean <= 1.5, "the mean difference is {mean:.3}");
+}
+
 /// The 0 → 300 progressive blur against the CPU: its layer is 1100 × 1200, and each level is
 /// blurred in its own band, so the crops and their blend are checked end to end.
 #[test]
@@ -2366,6 +2398,88 @@ fn a_dragged_card_keeps_its_blur() {
         assert!(worst <= 160, "a channel differs by {worst} (mean {mean:.3})");
         assert!(mean <= 3.0, "the mean difference is {mean:.3}");
     }
+}
+
+/// The downscale a large layer's blur levels are made with: a texel is the average of the four it
+/// covers, the image keeps its orientation, and premultiplied pixels stay premultiplied.
+#[test]
+fn a_downscale_halves_the_layer_the_right_way_up() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let Some(compose) = crate::compose::Compose::new(&device) else {
+        eprintln!("no compose pipelines");
+        return;
+    };
+    let (w, h) = (64u32, 48u32);
+    // Every 2 × 2 block one colour — (x / 2, y / 2) — so a half-size copy has to read back as
+    // ((x, y, 0)), and any flip, offset or extra premultiply shows.
+    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let i = ((y as usize * w as usize) + x as usize) * 4;
+            let (r, g) = ((x / 2) as u8, (y / 2) as u8);
+            // A translucent block stays as it is: the source is already premultiplied.
+            let (r, g) = if x < 2 && y < 2 { (64, 32) } else { (r, g) };
+            let a = if x < 2 && y < 2 { 128 } else { 255 };
+            pixels[i..i + 4].copy_from_slice(&[r, g, 0, a]);
+        }
+    }
+    let source = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("downscale test source"),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo { texture: &source, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        &pixels,
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
+    let (hw, hh) = (w / 2, h / 2);
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("downscale test target"),
+        size: wgpu::Extent3d { width: hw, height: hh, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let source_view = source.create_view(&wgpu::TextureViewDescriptor::default());
+    let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    compose.downscale(&device, &queue, &target_view, &source_view);
+    let out = crate::canvas::read(&device, &queue, &target, (hw, hh)).expect("the downscaled pixels");
+    for y in [0u32, 1, 6, 12, 18, 23] {
+        let i = ((y as usize * hw as usize) + 1) * 4;
+        println!("  row {y:2} at x=1: {:?} (want g {y})", out.data().get(i..i + 4));
+    }
+    let mut worst = 0u8;
+    for y in 0..hh {
+        for x in 0..hw {
+            let i = ((y as usize * hw as usize) + x as usize) * 4;
+            let got = out.data().get(i..i + 4).unwrap_or(&[0; 4]).to_vec();
+            let want: [u8; 4] = if x < 1 && y < 1 { [64, 32, 0, 128] } else { [x as u8, y as u8, 0, 255] };
+            for c in 0..4 {
+                let d = got[c].abs_diff(want[c]);
+                if d > worst {
+                    worst = d;
+                    if d > 2 {
+                        println!("  at ({x}, {y}) channel {c}: {:?}, want {want:?}", got);
+                    }
+                }
+            }
+        }
+    }
+    println!("downscale: worst channel difference {worst}");
+    assert!(worst <= 2, "a channel differs by {worst}");
 }
 
 /// A layer is clipped to the view, as the renderer clips its own: at 600% the card's layer would be

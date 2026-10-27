@@ -605,44 +605,79 @@ impl crate::scene::Layers for GpuLayers<'_> {
         let deviations = figcraft_render::blur::levels(s0.min(s1), s0.max(s1));
         let size = layer.size;
         let t0 = std::time::Instant::now();
+        // A level is a blur: past this many pixels it is computed at half resolution (a quarter of
+        // the work) and the blend reads it upscaled — the detail a box pass averages away anyway —
+        // while the layer itself, which the ramp's sharp end shows, stays at full resolution. This
+        // is what keeps a layer the size of the window (a card zoomed past the screen) smooth.
+        const LEVEL_BUDGET: u64 = 2_000_000;
+        let pixels = u64::from(size.0).saturating_mul(u64::from(size.1));
+        let level_scale = if pixels > 8_000_000 {
+            0.25
+        } else if pixels > LEVEL_BUDGET {
+            0.5
+        } else {
+            1.0
+        };
         // The levels and their blend reach the device in one submission (with their scratch kept
         // until it lands): a submit a pass made the canvas queue a dozen of them a frame, and in
         // the app each of those waited behind the window's own submits.
         let source = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // The layer at the levels' resolution (themselves), when that is smaller.
+        let small = (level_scale < 1.0).then(|| {
+            let (sw, sh) = (scale_px(size.0, level_scale), scale_px(size.1, level_scale));
+            let out = self.canvas.take_layer(self.device, "figcraft blur small", sw, sh);
+            let view = out.create_view(&wgpu::TextureViewDescriptor::default());
+            self.canvas.compose.downscale(self.device, self.queue, &view, &source);
+            (out, (sw, sh))
+        });
+        let (read, read_size) = match &small {
+            Some((out, size)) => (out.create_view(&wgpu::TextureViewDescriptor::default()), *size),
+            None => (source.clone(), size),
+        };
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("figcraft progressive blur") });
-        let mut levels: Vec<(Texture, (i32, i32))> = Vec::with_capacity(deviations.len());
+        let mut levels: Vec<(Texture, (f32, f32), f32)> = Vec::with_capacity(deviations.len());
         let mut after: Vec<Texture> = Vec::new();
         // One running-sums texture for every level: its passes run one after another, and eight of
         // its size would be most of the pool (and of the memory a drag holds).
-        let sums = self.canvas.blur.take_sums(self.device, size);
+        let sums = self.canvas.blur.take_sums(self.device, read_size);
         for (k, d) in deviations.iter().enumerate() {
             if !d.is_finite() || *d <= 0.3 {
                 // The renderer leaves a blur this small out: the layer itself is the level.
-                levels.push((texture.clone(), (0, 0)));
+                levels.push((texture.clone(), (0.0, 0.0), 1.0));
             } else {
                 // Only the pixels that use this level (plus its blur's reach) are blurred: an
                 // 0 → 300 ramp on a 200 × 300 card blurs a few hundred rows a level instead of the
                 // whole 1100 × 1200 layer eight times (the renderer crops the same way).
                 let reach = (d * 3.0).ceil().clamp(0.0, 8192.0) as u32 + 3;
                 let (x, y, w, h) = level_crop(&deviations, k, s0, s1, a, b, size, reach);
+                // The same crop of the smaller layer: its texels, its radius, and its position
+                // kept in layer pixels for the blend, so the two grids line up.
+                let (x0, y0) = (scale_px(x, level_scale), scale_px(y, level_scale));
+                let (cw, ch) = (
+                    scale_px(w, level_scale).min(read_size.0.saturating_sub(x0)).max(1),
+                    scale_px(h, level_scale).min(read_size.1.saturating_sub(y0)).max(1),
+                );
                 let (level, scratch) = crate::blur::blur_texture_in(
                     self.device,
                     self.queue,
                     &self.canvas.blur,
                     &mut encoder,
-                    &source,
-                    (x, y),
-                    (w, h),
-                    *d,
+                    &read,
+                    (x0, y0),
+                    (cw, ch),
+                    *d * level_scale,
                     sums.as_ref(),
                 )?;
-                levels.push((level.clone(), (x as i32, y as i32)));
+                // The crop's corner in layer pixels: the blend reads the level from there.
+                let at = (x0 as f32 / level_scale as f32, y0 as f32 / level_scale as f32);
+                levels.push((level.clone(), at, level_scale as f32));
                 after.push(level);
                 after.extend(scratch);
             }
         }
         after.extend(sums);
         let out = self.canvas.mix.encode(self.device, self.queue, &mut encoder, &levels, &deviations, (s0, s1, a, b), size)?;
+        let small = small.map(|(texture, _)| texture);
         let encoded = t0.elapsed().as_secs_f64() * 1000.0;
         let t1 = std::time::Instant::now();
         let cb = encoder.finish();
@@ -664,6 +699,9 @@ impl crate::scene::Layers for GpuLayers<'_> {
         // The levels and scratch are made again next frame: keep their textures for it.
         for texture in after {
             self.canvas.blur.give_back(texture);
+        }
+        if let Some(small) = small {
+            self.canvas.give_layer(small);
         }
         let made = self.canvas.as_layer(out);
         self.keep(key, &made);
@@ -776,6 +814,12 @@ impl GpuLayers<'_> {
         let glass = self.canvas.glass.paint_texture(self.device, self.queue, pane, &frosted_view)?;
         Some(self.canvas.as_layer(glass))
     }
+}
+
+/// A length in pixels at `scale` (at least one).
+fn scale_px(v: u32, scale: f64) -> u32 {
+    let scaled = (f64::from(v) * scale).round();
+    if scaled.is_finite() { (scaled.max(1.0) as u32).max(1) } else { 1 }
 }
 
 /// The pixels of a progressive blur's `k`th level (its index in `levels`) that the blend can pick,
@@ -959,7 +1003,8 @@ fn target(device: &Device, width: u32, height: u32) -> Target {
     Target { texture, view, size: (width, height) }
 }
 
-fn read(device: &Device, queue: &Queue, texture: &Texture, (width, height): (u32, u32)) -> Option<Pixmap> {
+/// Read `texture`'s pixels back (tests, screenshots and exports).
+pub(crate) fn read(device: &Device, queue: &Queue, texture: &Texture, (width, height): (u32, u32)) -> Option<Pixmap> {
     let unpadded = width.checked_mul(4)?;
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let padded = unpadded.div_ceil(align).checked_mul(align)?;

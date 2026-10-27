@@ -25,6 +25,26 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     return vec4<f32>(s.rgb * s.a, s.a);
 }
 
+// A downscale (a blur's levels of a large layer): the same triangle, with its uv handed through
+// the vertices so the target's own size needs no uniform. The source is already premultiplied.
+struct VOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_down(@builtin(vertex_index) i: u32) -> VOut {
+    let q = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    // The position is `q * 2 - 1`, so `q` runs 0..1 across the screen (the triangle's third
+    // vertex is off it). Clip space has y up, a texture's v down: the bottom takes v = 1.
+    return VOut(vec4<f32>(q * 2.0 - 1.0, 0.0, 1.0), vec2<f32>(q.x, 1.0 - q.y));
+}
+
+@fragment
+fn fs_down(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    return textureSample(src, samp, uv);
+}
+
 // A luminance mask: the content times the mask's coverage, `ceil(255 × luma × alpha) / 255` of the
 // mask's straight colour — tiny-skia's `MaskType::Luminance`, which the CPU renderer uses. The
 // content is a rendered layer (premultiplied), the mask another.

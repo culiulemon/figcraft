@@ -19,6 +19,9 @@ struct Params {
     // reach, so its texture is that crop (the blend reads it at the pixel less the crop). Two
     // levels to a `vec4`.
     offsets: array<vec4<f32>, 4>,
+    // The resolution each level was blurred at (a large layer's levels at half, the layer itself
+    // at one): the blend reads them all at the layer's own scale.
+    scales: array<vec4<f32>, 2>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -43,22 +46,39 @@ fn load(t: texture_2d<f32>, c: vec2<i32>) -> vec4<f32> {
     return textureLoad(t, clamp(c, vec2<i32>(0), max(last, vec2<i32>(0))), 0);
 }
 
-fn offset_at(k: i32) -> vec2<i32> {
+fn offset_at(k: i32) -> vec2<f32> {
     let v = params.offsets[k / 2];
-    return vec2<i32>(select(v.xy, v.zw, (k % 2) == 1));
+    return select(v.xy, v.zw, (k % 2) == 1);
+}
+
+fn scale_at(k: i32) -> f32 {
+    return params.scales[k / 4][k % 4];
+}
+
+// `p` in a level's texel coordinates (a whole number reads that texel), blended by bilinear
+// weights: a pixel of a level blurred at half resolution covers two of the layer's.
+fn sample(t: texture_2d<f32>, p: vec2<f32>) -> vec4<f32> {
+    let i = floor(p);
+    let f = p - i;
+    let at = vec2<i32>(i);
+    let c00 = load(t, at);
+    let c10 = load(t, at + vec2<i32>(1, 0));
+    let c01 = load(t, at + vec2<i32>(0, 1));
+    let c11 = load(t, at + vec2<i32>(1, 1));
+    return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
 }
 
 fn at_level(k: i32, c: vec2<i32>) -> vec4<f32> {
-    let q = c - offset_at(k);
+    let q = (vec2<f32>(c) - offset_at(k)) * scale_at(k);
     switch k {
-        case 0: { return load(level0, q); }
-        case 1: { return load(level1, q); }
-        case 2: { return load(level2, q); }
-        case 3: { return load(level3, q); }
-        case 4: { return load(level4, q); }
-        case 5: { return load(level5, q); }
-        case 6: { return load(level6, q); }
-        default: { return load(level7, q); }
+        case 0: { return sample(level0, q); }
+        case 1: { return sample(level1, q); }
+        case 2: { return sample(level2, q); }
+        case 3: { return sample(level3, q); }
+        case 4: { return sample(level4, q); }
+        case 5: { return sample(level5, q); }
+        case 6: { return sample(level6, q); }
+        default: { return sample(level7, q); }
     }
 }
 

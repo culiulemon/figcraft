@@ -311,8 +311,14 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
   (2281 × 1625) and the canvas stays on the GPU at any zoom. A drag at 600% still makes the layer
   again every frame (its content moves inside the crop): 16–31 ms of device work and 27–81 ms of
   building a frame, about 90 ms behind the cursor — down from 818 ms a frame, and much better than
-  the CPU, but the levels of a layer that big being blurred at half resolution is what is left
-  before it is silky.
+  the CPU, but the CPU fallback's floor is gone only when the blur itself is cheap.
+- **Landed (2026-10-28), large layers:** the levels of a progressive blur on a layer past 2 M
+  pixels (a quarter past 8 M) are computed from a bilinear downscale of the layer and read
+  upscaled — a quarter of the work each way — while the layer itself, which the ramp's sharp end
+  shows, stays at full resolution. Parity against the CPU is worst 28 / mean 0.041 on a
+  1461 × 1561 layer (`the_gpu_draws_a_big_progressive_blur_at_half_resolution`), and the downscale
+  has its own test (`a_downscale_halves_the_layer_the_right_way_up`). At 600% a rebuild is
+  9–15 ms on the device (was 16–31) and 19–53 ms of building (was 27–81).
 - **Landed (2026-10-26), blur cost:** a box pass is O(1) a pixel and one dispatch (a workgroup
   scans 256 pixels of a line and their halo in shared memory), and each progressive level is
   blurred only where the ramp uses it (its band plus the blur's reach), so a blur's radius costs

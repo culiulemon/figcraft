@@ -853,8 +853,16 @@ stays on the fallback list.
   content moves inside the crop): the frame is a window-sized progressive blur — measured with the
   present log, `progressive (2281, 1625)` 16–31 ms on the device a rebuild, `build` 27–81 ms and
   `render` 9–20 ms, against 4–5 ms for a frame that keeps it; a real cursor at 600% leaves the card
-  about 90 ms behind (it was 818 ms a frame on the CPU, when the frame fell back at all). The
-  levels of a layer that big being blurred at half resolution is the next slice.
+  about 90 ms behind (it was 818 ms a frame on the CPU, when the frame fell back at all).
+- 2026-10-28: **a large layer's blur levels are computed at half resolution.** The levels are the
+  blur: the detail a box pass averages away is the detail a smaller texture would have had, so past
+  2 M pixels (and at a quarter past 8 M) they are blurred from a bilinear downscale of the layer —
+  a quarter of the work each way — and the blend reads them upscaled, while the layer itself, which
+  the ramp's sharp end shows, stays at full resolution. `the_gpu_draws_a_big_progressive_blur_at_half_resolution`
+  (a 1461 × 1561 layer, levels at half) is worst 28 / mean 0.041 against the CPU, as good as the
+  full-resolution test's 0.135; `a_downscale_halves_the_layer_the_right_way_up` pins the downscale
+  itself (a texel is the average of its four, the right way up, premultiplied). At 600% a rebuild
+  is now 9–15 ms on the device (was 16–31) and 19–53 ms of building (was 27–81).
 - 2026-10-26: **a real drag no longer re-blurs the card (and no longer freezes it).** With a real
   mouse (the OS cursor moving at 714 px/s over a maximized 2560 × 1440 window, canvas 2280 × 1624
   device px at 100%) a drag rebuilt the blurred layer on **every** frame — 73 rebuilds in a 0.5 s
