@@ -304,6 +304,15 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
   noise, texture): a crisp layer composited on a whole pixel is up to half a device pixel off the
   vector, which showed as a halo at a shadow's cut-out, so groups, shadowed cards and inner
   shadows stay on the renderer's floored grid (parity worst 50/255, mean 0.142).
+- **Landed (2026-10-28), any zoom:** effect layers are clipped to the view, as the renderer clips
+  its own. At 600% the 0 → 300 card's layer is 6600 × 7200 (47 M pixels) — past the blur's 16 M
+  budget, so the frame fell back to the CPU (818 ms a frame) and its allocations saturated the
+  device (a maximized window then failed `Surface::configure`). Clipped, the layer is the window
+  (2281 × 1625) and the canvas stays on the GPU at any zoom. A drag at 600% still makes the layer
+  again every frame (its content moves inside the crop): 16–31 ms of device work and 27–81 ms of
+  building a frame, about 90 ms behind the cursor — down from 818 ms a frame, and much better than
+  the CPU, but the levels of a layer that big being blurred at half resolution is what is left
+  before it is silky.
 - **Landed (2026-10-26), blur cost:** a box pass is O(1) a pixel and one dispatch (a workgroup
   scans 256 pixels of a line and their halo in shared memory), and each progressive level is
   blurred only where the ramp uses it (its band plus the blur's reach), so a blur's radius costs

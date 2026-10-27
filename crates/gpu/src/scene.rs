@@ -62,13 +62,16 @@ pub fn backdrop_of_node(doc: &Document, id: NodeId) -> Option<Backdrop> {
 
 /// A background-blurred node's layer: the device rectangle of its backdrop (the layer grown by
 /// `pad` each way) — what the CPU blurs, and therefore the region the canvas crops and blurs.
+/// Clipped to the view: the crop reads the accumulated page, which is the view.
 pub fn blur_rect(doc: &Document, id: NodeId, view: &View) -> Option<((f64, f64), (u32, u32))> {
     let n = doc.node(id)?;
     let (x0, y0, w, h) = layer_rect_impl(doc, n, view).ok()??;
     let pad = f64::from(figcraft_render::backdrop::pad(n, view.scale));
-    let w = (f64::from(w) + 2.0 * pad).clamp(1.0, 16_384.0) as u32;
-    let h = (f64::from(h) + 2.0 * pad).clamp(1.0, 16_384.0) as u32;
-    Some(((x0 - pad, y0 - pad), (w, h)))
+    let x = (x0 - pad).max(0.0);
+    let y = (y0 - pad).max(0.0);
+    let w = ((x0 + f64::from(w) + pad).min(f64::from(view.width)) - x).clamp(1.0, 16_384.0) as u32;
+    let h = ((y0 + f64::from(h) + pad).min(f64::from(view.height)) - y).clamp(1.0, 16_384.0) as u32;
+    Some(((x, y), (w, h)))
 }
 
 /// A glass node's pane geometry and its layer's device position, for the canvas's crop.
@@ -87,7 +90,8 @@ pub fn glass_setup(doc: &Document, id: NodeId, view: &View) -> Option<(figcraft_
 
 /// The device rectangle of `n`'s effect layer, in whole pixels (`None` past the layer cap). The
 /// renderer's own layer rectangle: its paint bounds floored to a pixel, without its effects'
-/// margin — the crop a backdrop effect reads, and the grid the glass geometry is built on.
+/// margin — the crop a backdrop effect reads, and the grid the glass geometry is built on. Clipped
+/// to the view, as the renderer clips its layers: what is off the window is not drawn.
 fn layer_rect_impl(doc: &Document, n: &Node, view: &View) -> Result<Option<(f64, f64, u32, u32)>, Unsupported> {
     let Some(bounds) = figcraft_render::layer_bounds(doc, n.id) else { return Ok(None) };
     let (x0f, y0f) = ((bounds.x0 - view.origin.0) * view.scale, (bounds.y0 - view.origin.1) * view.scale);
@@ -95,8 +99,11 @@ fn layer_rect_impl(doc: &Document, n: &Node, view: &View) -> Result<Option<(f64,
     if !(x0f.is_finite() && y0f.is_finite() && x1f.is_finite() && y1f.is_finite()) {
         return Err(Unsupported::Structure);
     }
-    let (x0, y0) = (x0f.floor(), y0f.floor());
-    let (w, h) = ((x1f.ceil() - x0).max(1.0), (y1f.ceil() - y0).max(1.0));
+    let (x0, y0) = (x0f.floor().max(0.0), y0f.floor().max(0.0));
+    // A backdrop node off the view still crops a pixel of it: its effect draws where the node is
+    // (off the canvas), and refusing here would leave the whole frame on the CPU.
+    let (x1, y1) = (x1f.ceil().min(f64::from(view.width)).max(x0 + 1.0), y1f.ceil().min(f64::from(view.height)).max(y0 + 1.0));
+    let (w, h) = (x1 - x0, y1 - y0);
     const MAX_LAYER: f64 = 8_192.0;
     if w > MAX_LAYER || h > MAX_LAYER {
         return Err(Unsupported::Effect);
@@ -110,19 +117,30 @@ fn layer_rect_impl(doc: &Document, n: &Node, view: &View) -> Result<Option<(f64,
 /// content in the layer's own space from this corner, so a drag by part of a device pixel leaves
 /// the content where it is and moves the layer — where the floored corner put that fraction into
 /// the content, and every subpixel move re-blurred it (see `layer_pipeline`).
+///
+/// Clipped to the view, as the renderer clips its layers: a layer bigger than the window is mostly
+/// offscreen, and blurring it would cost the device pixels that never show. This is what keeps any
+/// zoom within budget — a 200 × 300 card's layer is 1400 × 1466 at 100%, 8400 × 9000 at 600%, and
+/// 2280 × 1624 (the view) or less at 600% now.
 fn layer_rect_exact_impl(doc: &Document, n: &Node, view: &View) -> Result<Option<(f64, f64, u32, u32)>, Unsupported> {
     let Some(bounds) = figcraft_render::layer_bounds(doc, n.id) else { return Ok(None) };
     let (x0f, y0f) = ((bounds.x0 - view.origin.0) * view.scale, (bounds.y0 - view.origin.1) * view.scale);
-    let (w, h) = ((bounds.x1 - bounds.x0) * view.scale, (bounds.y1 - bounds.y0) * view.scale);
-    if !(x0f.is_finite() && y0f.is_finite() && w.is_finite() && h.is_finite()) {
+    let (x1f, y1f) = ((bounds.x1 - view.origin.0) * view.scale, (bounds.y1 - view.origin.1) * view.scale);
+    if !(x0f.is_finite() && y0f.is_finite() && x1f.is_finite() && y1f.is_finite()) {
         return Err(Unsupported::Structure);
     }
-    let (w, h) = (w.max(1.0).ceil() + 1.0, h.max(1.0).ceil() + 1.0);
+    let (x0, y0) = (x0f.max(0.0), y0f.max(0.0));
+    let (x1, y1) = (x1f.min(f64::from(view.width)), y1f.min(f64::from(view.height)));
+    if !(x1 > x0 && y1 > y0) {
+        return Ok(None);
+    }
+    // The corner stays exact (a clipped corner is the view's edge); the slack pixel may stick out.
+    let (w, h) = ((x1 - x0).ceil() + 1.0, (y1 - y0).ceil() + 1.0);
     const MAX_LAYER: f64 = 8_192.0;
     if w > MAX_LAYER || h > MAX_LAYER {
         return Err(Unsupported::Effect);
     }
-    Ok(Some((x0f, y0f, w as u32, h as u32)))
+    Ok(Some((x0, y0, w as u32, h as u32)))
 }
 
 /// The page's background colour, drawn under the scene.

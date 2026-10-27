@@ -1,4 +1,4 @@
-﻿//! The GPU canvas against the CPU renderer: pixel parity, the fallback predicate, read-back and
+//! The GPU canvas against the CPU renderer: pixel parity, the fallback predicate, read-back and
 //! frame timings (see `docs/gpu-rasterizer.md`).
 
 use std::sync::Arc;
@@ -2278,9 +2278,10 @@ fn a_whole_pixel_move_keeps_the_layer_key() {
     let p = d.first_page().unwrap();
     let card = d.node(p).and_then(|p| p.children.get(1).copied()).expect("the card");
     let key_of = |doc: &Document, zoom: f64| {
-        // A panned view: the origin is a page coordinate no one picked to be whole, which is where
-        // composing the placement with the view rounds (the app's drags happen here, not at 0, 0).
-        let view = View { origin: (37.25, -11.6), scale: zoom, width: 904, height: 860 };
+        // A panned view, big enough that it does not clip the card's layer (see
+        // `a_layer_bigger_than_the_view_is_cropped_to_it`): the origin is a page coordinate no one
+        // picked to be whole, which is where composing the placement with the view rounds.
+        let view = View { origin: (-321.37, -371.11), scale: zoom, width: (1143.0 * zoom).ceil() as u32, height: (1243.0 * zoom).ceil() as u32 };
         let n = doc.node(card).expect("the card");
         let (x0, y0, ..) = scene::layer_rect_for(doc, card, &view).expect("a layer");
         let xf = view.transform() * n.transform;
@@ -2327,7 +2328,6 @@ fn a_dragged_card_keeps_its_blur() {
     let d = progressive_card_doc(300.0);
     let p = d.first_page().unwrap();
     let card = d.node(p).and_then(|p| p.children.get(1).copied());
-    let (w, h) = (904u32, 860u32);
     let moved = |dx: f64| {
         let mut e = d.clone();
         if let Some(id) = card
@@ -2338,10 +2338,13 @@ fn a_dragged_card_keeps_its_blur() {
         e
     };
     // 100% and 86%: at the second a drag of a page pixel moves the card about 0.86 device pixels,
-    // which is where the layer used to be re-blurred every frame.
-    for (zoom, step) in [(1.0, 1.0), (0.86, 1.0), (2.44, 0.4)] {
+    // which is where the layer used to be re-blurred every frame. The view holds the card's layer
+    // (its bounds grown by the blur's margin) at each zoom, as a real one does while the card is
+    // on screen: a layer the view crops is drawn again as the node moves.
+    for (zoom, step) in [(1.0f64, 1.0f64), (0.86, 1.0), (2.0, 0.5)] {
+        let (w, h) = ((1143.0 * zoom).ceil() as u32, (1243.0 * zoom).ceil() as u32);
         // A panned view, as in the app: see `a_whole_pixel_move_keeps_the_layer_key`.
-        let view = View { origin: (37.25, -11.6), scale: zoom, width: w, height: h };
+        let view = View { origin: (-321.37, -371.11), scale: zoom, width: w, height: h };
         let mut canvas = CanvasGpu::new(&device, w, h).unwrap();
         assert!(gpu_frame(&mut canvas, &device, &queue, &d, &view, scene::background(&d, p)));
         let first = canvas.kept_shadow_hits();
@@ -2363,6 +2366,22 @@ fn a_dragged_card_keeps_its_blur() {
         assert!(worst <= 160, "a channel differs by {worst} (mean {mean:.3})");
         assert!(mean <= 3.0, "the mean difference is {mean:.3}");
     }
+}
+
+/// A layer is clipped to the view, as the renderer clips its own: at 600% the card's layer would be
+/// 6600 × 7200 (47 M pixels, past any budget and bigger than the window), and only what the window
+/// shows is ever drawn.
+#[test]
+fn a_layer_bigger_than_the_view_is_cropped_to_it() {
+    let d = progressive_card_doc(300.0);
+    let p = d.first_page().unwrap();
+    let card = d.node(p).and_then(|p| p.children.get(1).copied()).expect("the card");
+    let view = View { origin: (10.0, -20.0), scale: 6.0, width: 2280, height: 1624 };
+    let (x0, y0, w, h) = scene::layer_rect_for(&d, card, &view).expect("a layer");
+    println!("600%: the layer is {w} × {h} at ({x0}, {y0})");
+    assert_eq!((x0, y0), (0.0, 0.0), "the near edges are the view's");
+    assert!(u64::from(w) * u64::from(h) <= 2281 * 1625, "the layer is {w} × {h}, past the view");
+    assert!(w as f64 >= 2280.0 && h as f64 >= 1624.0, "the layer misses part of the view: {w} × {h}");
 }
 
 /// A 200 × 300 card with a progressive blur from 0 to `radius`, over a plain ground.

@@ -841,6 +841,20 @@ stays on the fallback list.
   The screen captures above were misleading until they were made against a white card on the
   dark page: a black card on the dark background has no edge to follow, and every frame "measured"
   the background.
+- 2026-10-28: **effect layers are clipped to the view.** At 600% the 0 → 300 card's layer is
+  6600 × 7200 device pixels (47 M) — past the 16 M blur budget, so the whole frame went back to
+  the CPU, and the allocations it made saturated the device (a maximized window then failed
+  `Surface::configure`, "failed to wait for GPU to come idle"). The renderer clips its own layers
+  to the view (`int_rect` against the pixmap), and now so does the canvas: a layer is its paint
+  bounds ∩ the view (plus a pixel of slack), a backdrop blur's crop likewise. At 600% the layer
+  is 2281 × 1625 — the window — and the canvas stays on the GPU (`gpuRefusal` none). Test:
+  `a_layer_bigger_than_the_view_is_cropped_to_it`. What is left at that zoom is that the layer's
+  near edge is the window's, so the layer is made again for every frame the card moves (its
+  content moves inside the crop): the frame is a window-sized progressive blur — measured with the
+  present log, `progressive (2281, 1625)` 16–31 ms on the device a rebuild, `build` 27–81 ms and
+  `render` 9–20 ms, against 4–5 ms for a frame that keeps it; a real cursor at 600% leaves the card
+  about 90 ms behind (it was 818 ms a frame on the CPU, when the frame fell back at all). The
+  levels of a layer that big being blurred at half resolution is the next slice.
 - 2026-10-26: **a real drag no longer re-blurs the card (and no longer freezes it).** With a real
   mouse (the OS cursor moving at 714 px/s over a maximized 2560 × 1440 window, canvas 2280 × 1624
   device px at 100%) a drag rebuilt the blurred layer on **every** frame — 73 rebuilds in a 0.5 s
