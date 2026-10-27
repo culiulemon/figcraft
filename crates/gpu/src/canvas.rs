@@ -681,7 +681,10 @@ impl crate::scene::Layers for GpuLayers<'_> {
             }
         }
         after.extend(sums);
-        let out = self.canvas.mix.encode(self.device, self.queue, &mut encoder, &levels, &deviations, (s0, s1, a, b), size)?;
+        // The blend's output comes from the layer pool too: a fresh window-sized texture a frame
+        // was an allocation the driver charged 5–15 ms for.
+        let blended = self.canvas.take_layer(self.device, "figcraft progressive blur", size.0, size.1);
+        let out = self.canvas.mix.encode(self.device, self.queue, &mut encoder, &levels, &deviations, (s0, s1, a, b), size, blended)?;
         let small = small.map(|(texture, _)| texture);
         let encoded = t0.elapsed().as_secs_f64() * 1000.0;
         let t1 = std::time::Instant::now();

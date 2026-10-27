@@ -3,10 +3,9 @@
 
 use wgpu::{
     BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BufferDescriptor,
-    BufferUsages, ColorTargetState, ColorWrites, CommandEncoder, Device, Extent3d, FragmentState, LoadOp, Operations, PipelineCompilationOptions,
+    BufferUsages, ColorTargetState, ColorWrites, CommandEncoder, Device, FragmentState, LoadOp, Operations, PipelineCompilationOptions,
     PipelineLayoutDescriptor, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor,
-    ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, Texture, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
-    TextureViewDescriptor, VertexState,
+    ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, Texture, TextureFormat, TextureViewDescriptor, VertexState,
 };
 
 /// The most blur levels a progressive blur draws (the renderer's own cap).
@@ -85,6 +84,7 @@ impl Mix {
         deviations: &[f64],
         (s0, s1, a, b): (f64, f64, (f64, f64), (f64, f64)),
         size: (u32, u32),
+        out: Texture,
     ) -> Option<Texture> {
         let (w, h) = size;
         if w == 0 || h == 0 || levels.is_empty() {
@@ -126,20 +126,6 @@ impl Mix {
             .extend(views.iter().enumerate().map(|(i, v)| BindGroupEntry { binding: 1 + i as u32, resource: wgpu::BindingResource::TextureView(v) }));
         let bind =
             device.create_bind_group(&BindGroupDescriptor { label: Some("figcraft progressive blur"), layout: &self.layout, entries: &entries });
-        let out = device.create_texture(&TextureDescriptor {
-            label: Some("figcraft progressive blur"),
-            size: Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba8Unorm,
-            usage: TextureUsages::TEXTURE_BINDING
-                | TextureUsages::RENDER_ATTACHMENT
-                | TextureUsages::COPY_DST
-                | TextureUsages::COPY_SRC
-                | TextureUsages::STORAGE_BINDING,
-            view_formats: &[],
-        });
         let target = out.create_view(&TextureViewDescriptor::default());
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {

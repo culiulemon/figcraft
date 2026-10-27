@@ -867,8 +867,10 @@ stays on the fallback list.
   window-sized blur's frame: `encoder.finish` (recording 48 dispatches as 48 passes, with their
   bind groups) took 5–28 ms at 600%, where the dispatches themselves are cheap. Every pass of a
   level now goes into one compute pass (each dispatch is its own usage scope, so wgpu keeps their
-  reads and writes in order), and `finish` is 6–15 ms. What is left at 600% is the page's own
-  build and the canvas render: ~30 ms a frame, of which the blur is 8–15.
+  reads and writes in order), and `finish` is 6–15 ms. The blend's output texture comes from the
+  layer pool too (a fresh window-sized texture a frame was 5–15 ms of driver work): at 600% a
+  rebuild's `build` is 19–23 ms (was 36–53) and its `finish` 0.7–3 ms. What is left is the canvas
+  render itself (13–18 ms for 2280 × 1624) and the page's own build.
 - 2026-10-26: **a real drag no longer re-blurs the card (and no longer freezes it).** With a real
   mouse (the OS cursor moving at 714 px/s over a maximized 2560 × 1440 window, canvas 2280 × 1624
   device px at 100%) a drag rebuilt the blurred layer on **every** frame — 73 rebuilds in a 0.5 s
