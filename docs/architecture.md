@@ -69,9 +69,11 @@ before such a node accumulate in a texture, the node's effect is made from that 
 CPU's pane geometry through the GPU's glass shader) and its content goes over it, so the page under
 two panes is drawn once. vello's textures hold straight alpha, so a segment is premultiplied as it
 is laid over the accumulation and an effect layer before a blur or the glass shader reads it.
-Every other page — inner shadows, grain, a shadow cast by a group or an ellipse, images,
-masks, outline modes, soft proof — is drawn by the CPU renderer and uploaded as before; the choice is made per
-frame and reported by `ui.inspect`. The
+Everything else — a paint's own plus-darker, a plus-darker layer under a backdrop effect, an
+animated image, a progressive blur whose layer is past 16 M pixels, a skewed linear-gradient
+handle (imported files only) — stays on the CPU renderer and is uploaded as before, as do the
+editor's own views (outline modes, skipped layers, the focus view, soft proof, Display P3
+documents); the choice is made per frame and reported by `ui.inspect`. The
 CPU renderer is the single source of pixels for exports and the browser. The desktop canvas
 renders on a worker thread at the device pixel ratio and keeps its last image, re-rendering only
 the region a pan uncovers or an edit touches; overlays (selection, handles, guides, labels) are

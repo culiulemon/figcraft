@@ -14,9 +14,10 @@ use crate::i18n::{tr, trf, trn};
 use crate::render_worker::{Done, Job, Worker};
 use crate::theme::{COMPONENT, Tokens, doc_c32, regular, semibold};
 
-/// A canvas texture registered with egui: its generation, egui's id and its size.
+/// A canvas texture registered with egui: its generation, egui's id, its size and the filter it
+/// was registered with.
 #[cfg(not(target_arch = "wasm32"))]
-type GpuTexture = (u64, egui::TextureId, (u32, u32));
+type GpuTexture = (u64, egui::TextureId, (u32, u32), wgpu::FilterMode);
 
 mod builder;
 mod input;
@@ -413,19 +414,20 @@ fn register_gpu_texture(app: &mut FigApp, frame: &figcraft_gpu::canvas::Frame, f
     // The texture's own size, not the frame's: a preview fills part of the same canvas texture
     // (and says which part in `frame.uv`), so registering it once per generation is enough.
     let size = frame.texture_size;
-    if let Some((generation, id, cached)) = app.canvas.gpu_ids.get(slot).copied().flatten()
+    if let Some((generation, id, cached, cached_filter)) = app.canvas.gpu_ids.get(slot).copied().flatten()
         && generation == frame.generation
         && cached == size
+        && cached_filter == filter
     {
         return Some(id);
     }
     let mut renderer = state.renderer.write();
-    if let Some((_, old, _)) = app.canvas.gpu_ids.get(slot).copied().flatten() {
+    if let Some((_, old, _, _)) = app.canvas.gpu_ids.get(slot).copied().flatten() {
         renderer.free_texture(&old);
     }
     let id = renderer.register_native_texture(&state.device, &frame.texture, filter);
     if let Some(slot) = app.canvas.gpu_ids.get_mut(slot) {
-        *slot = Some((frame.generation, id, size));
+        *slot = Some((frame.generation, id, size, filter));
     }
     Some(id)
 }

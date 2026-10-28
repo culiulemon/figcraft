@@ -585,8 +585,11 @@ fn draw_layer(ctx: &Ctx, pix: &mut Pixmap, n: &Node, parent_xf: Affine, depth: u
     // that moved, not every layer in the damaged area.
     let page_xf = Affine::translate((ctx.page_at.0, ctx.page_at.1)) * xf;
     let key = layers::cacheable(ctx, n).then(|| layers::key(ctx, n, page_xf));
-    if let Some(key) = key
-        && let Some(hit) = layers::get(key)
+    // The kept entry holds this node, so its address can't be reused by another one (see
+    // [`layers::key`]).
+    let root = key.and_then(|_| ctx.doc.node_arc(id)).cloned();
+    if let (Some(key), Some(root)) = (key, &root)
+        && let Some(hit) = layers::get(key, root)
     {
         let at = (hit.anchor.0 - ctx.page_at.0.round() as i32, hit.anchor.1 - ctx.page_at.1.round() as i32);
         for sh in &hit.shadows {
@@ -596,9 +599,12 @@ fn draw_layer(ctx: &Ctx, pix: &mut Pixmap, n: &Node, parent_xf: Affine, depth: u
         return;
     }
     // Drawn a second time unchanged, a layer is kept whole; the first sight of it (and a layer
-    // changing every frame, a drag) is cut to what this render needs, as it always was.
-    let kept = key.filter(|k| layers::settled(*k));
-    let whole = kept.and_then(|_| whole_layer(dev));
+    // changing every frame, a drag) is cut to what this render needs, as it always was. A layer
+    // too big to keep is always cut to the view, so keeping that crop would leave the rest of it
+    // missing once the view moves over it.
+    let settled = key.filter(|k| root.is_some() && layers::settled(*k));
+    let whole = settled.and_then(|_| whole_layer(dev));
+    let kept = settled.filter(|_| whole.is_some());
     let (rx0, ry0, rw, rh) = match whole {
         Some(r) => r,
         None => {
@@ -704,9 +710,9 @@ fn draw_layer(ctx: &Ctx, pix: &mut Pixmap, n: &Node, parent_xf: Affine, depth: u
         }
         layer_effects(ctx, &mut layer, n, id, lxf);
     }
-    if let Some(key) = kept {
+    if let (Some(key), Some(root)) = (kept, root) {
         let made = Arc::new(layers::Layer { pix: layer, anchor, shadows });
-        layers::put(key, Arc::clone(&made));
+        layers::put(key, root, Arc::clone(&made));
         for sh in &made.shadows {
             composite(pix, (lx, ly), &sh.pix, sh.opacity, sh.blend);
         }
