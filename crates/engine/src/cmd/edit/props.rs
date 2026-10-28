@@ -362,7 +362,7 @@ pub(super) fn paint_copy(s: &mut Session, p: &Value, fills: bool) -> Result<Valu
 /// stroke's copied settings go onto each target too.
 pub(super) fn paint_paste(s: &mut Session, p: &Value, fills: bool) -> Result<Value> {
     let cmd = if fills { "fill.paste" } else { "stroke.paste" };
-    let Some((copied_fills, paint)) = s.clipboard.paint.clone() else {
+    let Some((copied_fills, mut paint)) = s.clipboard.paint.clone() else {
         return Err(EngineError::Disabled(cmd.into(), "no copied fill or stroke".into()));
     };
     if copied_fills != fills {
@@ -383,10 +383,15 @@ pub(super) fn paint_paste(s: &mut Session, p: &Value, fills: bool) -> Result<Val
         }
     }
     // An image paint names its data by key; a copy from another file brings the data with it.
-    if let figcraft_color::PaintKind::Image(img) = &paint.kind {
-        let key = img.image.clone();
-        if let Some(d) = s.clipboard.paint_images.get(&key).cloned() {
-            s.doc_mut()?.images.entry(key).or_insert(d);
+    if let figcraft_color::PaintKind::Image(img) = &mut paint.kind {
+        let copied = img.image.clone();
+        if let Some(d) = s.clipboard.paint_images.get(&copied).cloned() {
+            let doc = s.doc_mut()?;
+            // The destination may already use that key for different data (other layers keep
+            // that image): the pasted paint takes the copied data's content hash instead.
+            let key = if doc.images.get(&copied).is_some_and(|existing| existing != &d) { figcraft_format::image_hash(&d.bytes) } else { copied };
+            doc.images.entry(key.clone()).or_insert(d);
+            img.image = key;
         }
     }
     let mut q = json!({"ids": ids, "paint": serde_json::to_value(paint).map_err(|e| bad(cmd, e.to_string()))?});
