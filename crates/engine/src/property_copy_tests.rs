@@ -114,7 +114,7 @@ fn a_copied_image_fill_brings_its_image_to_another_file() {
     // Another file has no image under that key: the copy brings the data with it.
     ex(&mut s, "file.new", json!({}));
     let b = rect(&mut s);
-    assert!(s.doc().unwrap().images.get("img-key").is_none());
+    assert!(!s.doc().unwrap().images.contains_key("img-key"));
     ex(&mut s, "fill.paste", json!({"ids": [b], "index": 0}));
     assert_eq!(s.doc().unwrap().images.get("img-key"), Some(&data));
     assert!(matches!(node(&s, b).fills[0].kind, figcraft_color::PaintKind::Image(_)));

@@ -457,6 +457,21 @@ fn a_layer_stacked_below_the_selection_doesnt_take_a_drag_from_inside_it() {
 }
 
 #[test]
+fn a_click_where_nothing_is_hit_inside_a_multiple_selection_keeps_it() {
+    let mut s = Session::new();
+    let a = rect(&mut s, 100.0, 300.0, None);
+    let b = rect(&mut s, 220.0, 300.0, None);
+    for i in [a, b] {
+        ex(&mut s, "node.set", json!({"ids": [i], "props": {"fills": [], "strokes": ["#000000"], "strokeWeight": 1}}));
+    }
+    ex(&mut s, "select.set", json!({"ids": [a, b]}));
+    // The press is inside `a` but its unfilled inside hits nothing: `a` is only the drag fallback,
+    // not a clicked layer, so a click keeps the selection.
+    click(&mut s, 120.0, 320.0, NONE);
+    assert_eq!(sorted(s.selection()), sorted(vec![a, b]));
+}
+
+#[test]
 fn alt_shift_drag_on_a_selected_layer_duplicates_it() {
     let mut s = Session::new();
     let k = scene(&mut s);
