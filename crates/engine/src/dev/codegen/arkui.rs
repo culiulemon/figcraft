@@ -82,12 +82,13 @@ fn arkui_layer(ctx: &Ctx, n: &Node, depth: usize, out: &mut String, extra: &[Str
             }
             match s.line_height {
                 LineHeight::Pixels(v) => mods.push(format!(".lineHeight({})", num(v))),
-                LineHeight::Percent(p) => mods.push(format!(".lineHeight('{}%')", num(p))),
+                // ArkUI takes a number of vp, not a percent string: a percent is of the font size.
+                LineHeight::Percent(p) => mods.push(format!(".lineHeight({})", num(s.font_size * p / 100.0))),
                 LineHeight::Auto => {}
             }
             match s.letter_spacing {
                 LetterSpacing::Pixels(v) if v != 0.0 => mods.push(format!(".letterSpacing({})", num(v))),
-                LetterSpacing::Percent(p) if p != 0.0 => mods.push(format!(".letterSpacing('{}%')", num(p))),
+                LetterSpacing::Percent(p) if p != 0.0 => mods.push(format!(".letterSpacing({})", num(s.font_size * p / 100.0))),
                 _ => {}
             }
             match t.align_h {

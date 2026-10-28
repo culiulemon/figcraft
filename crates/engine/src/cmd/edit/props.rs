@@ -343,6 +343,16 @@ pub(super) fn paint_copy(s: &mut Session, p: &Value, fills: bool) -> Result<Valu
         let paint = list.get(at).cloned().ok_or_else(|| bad(cmd, format!("no {} at index {at}", if fills { "fill" } else { "stroke" })))?;
         (paint, (!fills).then(|| n.stroke.clone()))
     };
+    // An image paint names its data by key: take the data along, so a paste into another file has
+    // it too. A pattern names a layer in this file, so the file is recorded with the copy.
+    let mut images = std::collections::BTreeMap::new();
+    if let figcraft_color::PaintKind::Image(img) = &paint.kind
+        && let Some(d) = s.doc()?.images.get(&img.image)
+    {
+        images.insert(img.image.clone(), d.clone());
+    }
+    s.clipboard.paint_images = images;
+    s.clipboard.paint_source_doc = s.ds()?.uid;
     s.clipboard.paint = Some((fills, paint.clone()));
     s.clipboard.stroke = stroke;
     serde_json::to_value(&paint).map_err(|e| bad(cmd, e.to_string()))
@@ -361,11 +371,22 @@ pub(super) fn paint_paste(s: &mut Session, p: &Value, fills: bool) -> Result<Val
     }
     let ids = req_targets(cmd, s, p)?;
     // A copied pattern pointing at a target or a layer inside it would make the layer pattern
-    // itself; `fill.pattern` refuses the same, and the renderer would drop the pattern.
+    // itself; `fill.pattern` refuses the same, and the renderer would drop the pattern. Its node id
+    // only names something in the file it was copied from, where it may be an unrelated layer.
     if let figcraft_color::PaintKind::Pattern(pt) = &paint.kind {
+        if s.ds()?.uid != s.clipboard.paint_source_doc {
+            return Err(bad(cmd, "a pattern can't be pasted into another file"));
+        }
         let doc = s.doc()?;
         if ids.iter().any(|t| doc.is_ancestor(*t, NodeId(pt.source))) {
             return Err(bad(cmd, "a layer can't be filled with itself or a layer inside it"));
+        }
+    }
+    // An image paint names its data by key; a copy from another file brings the data with it.
+    if let figcraft_color::PaintKind::Image(img) = &paint.kind {
+        let key = img.image.clone();
+        if let Some(d) = s.clipboard.paint_images.get(&key).cloned() {
+            s.doc_mut()?.images.entry(key).or_insert(d);
         }
     }
     let mut q = json!({"ids": ids, "paint": serde_json::to_value(paint).map_err(|e| bad(cmd, e.to_string()))?});

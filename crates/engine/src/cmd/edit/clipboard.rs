@@ -109,6 +109,8 @@ pub(super) fn paste_design_layers(s: &mut Session, p: &Value) -> Result<Value> {
     let props = s.clipboard.props.take();
     let paint = s.clipboard.paint.take();
     let stroke = s.clipboard.stroke.take();
+    let paint_images = std::mem::take(&mut s.clipboard.paint_images);
+    let paint_source_doc = s.clipboard.paint_source_doc;
     let effect = s.clipboard.effect.take();
     // No open file has id 0. So paste treats this copy as a copy from a different file.
     let layers_generation = s.clipboard.layers_generation.wrapping_add(1);
@@ -118,6 +120,8 @@ pub(super) fn paste_design_layers(s: &mut Session, p: &Value) -> Result<Value> {
         props,
         paint,
         stroke,
+        paint_images,
+        paint_source_doc,
         effect,
         bounds,
         source_doc: 0,

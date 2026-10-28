@@ -179,6 +179,21 @@ pub(super) fn input(app: &mut FigApp, ui: &mut Ui, resp: &egui::Response) -> boo
     let primary_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
     let primary_down = ctx.input(|i| i.pointer.primary_down());
     let primary_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+    // The press and the release carry their own positions: both in one frame (a quick click or a
+    // slow frame) would otherwise send the press from the hover position the pointer ended at.
+    let (press_pos, release_pos) = ctx.input(|i| {
+        let (mut press, mut release) = (None, None);
+        for e in &i.events {
+            if let egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, .. } = e {
+                if *pressed {
+                    press = Some(*pos);
+                } else {
+                    release = Some(*pos);
+                }
+            }
+        }
+        (press, release)
+    });
     let kind = if primary_pressed && resp.hovered() {
         app.canvas.dragging = true;
         app.ui.context_menu = None;
@@ -217,13 +232,14 @@ pub(super) fn input(app: &mut FigApp, ui: &mut Ui, resp: &egui::Response) -> boo
         app.canvas.pressure = force;
     }
     if let Some(k) = kind {
-        send(app, k, pos, &mods);
+        let at = if matches!(k, PointerKind::Down) { press_pos.unwrap_or(pos) } else { pos };
+        send(app, k, at, &mods);
         // The pointer also let go within this frame (a quick click, or a slow frame): the tools get
         // the release too, so the press's gesture ends — a quick click with a shape tool still
         // draws and returns to Move, and a double-click right after drawing finds the Move tool.
         if matches!(k, PointerKind::Down) && primary_released {
             app.canvas.dragging = false;
-            send(app, PointerKind::Up, pos, &mods);
+            send(app, PointerKind::Up, release_pos.unwrap_or(pos), &mods);
         }
     }
     true

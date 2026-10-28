@@ -164,6 +164,10 @@ pub struct Clipboard {
     pub paint: Option<(bool, figcraft_color::Paint)>,
     /// The stroke settings (`weight`, alignment, sides…) copied with a stroke's paint.
     pub stroke: Option<figcraft_doc::StrokeProps>,
+    /// The image data the copied paint names, carried so a paste into another file has it.
+    pub paint_images: std::collections::BTreeMap<String, figcraft_doc::ImageData>,
+    /// The file the copied paint came from: a pattern's node id only means anything there.
+    pub paint_source_doc: u64,
     /// A copied effect row (`effect.copy`).
     pub effect: Option<figcraft_doc::Effect>,
     /// The page-space bounds of the copied selection.

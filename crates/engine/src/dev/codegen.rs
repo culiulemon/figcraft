@@ -518,6 +518,21 @@ mod tests {
     }
 
     #[test]
+    fn arkui_percent_line_height_and_letter_spacing_are_absolute_numbers() {
+        // ArkUI's `letterSpacing` falls back to the default for a percent string, and `lineHeight`
+        // takes no percent at all: both are numbers of vp, a percent being of the font size.
+        let mut s = Session::new();
+        let f = id_of(&s.execute("frame.create", &json!({"x": 0, "y": 0, "width": 200, "height": 100})).unwrap()["id"]).unwrap();
+        let t = id_of(&s.execute("text.create", &json!({"text": "Hi", "x": 0, "y": 0, "parent": f})).unwrap()["id"]).unwrap();
+        s.execute("node.set", &json!({"id": t, "props": {"fontSize": 20.0, "lineHeight": "150%", "letterSpacing": "10%"}})).unwrap();
+        let doc = s.doc().unwrap();
+        let ark = code_for(doc, f, CodeLang::ArkUi);
+        assert!(ark.contains(".lineHeight(30)"), "{ark}");
+        assert!(ark.contains(".letterSpacing(2)"), "{ark}");
+        assert!(!ark.contains('%'), "no percent strings: {ark}");
+    }
+
+    #[test]
     fn arkui_places_a_child_that_ignores_its_auto_layout_parent() {
         let mut s = Session::new();
         let f = id_of(&s.execute("frame.create", &json!({"x": 0, "y": 0, "width": 200, "height": 100})).unwrap()["id"]).unwrap();

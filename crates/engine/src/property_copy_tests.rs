@@ -104,6 +104,36 @@ fn pasting_design_layers_keeps_a_copied_row() {
 }
 
 #[test]
+fn a_copied_image_fill_brings_its_image_to_another_file() {
+    let mut s = Session::new();
+    let a = rect(&mut s);
+    ex(&mut s, "fill.add", json!({"ids": [a], "paint": {"type": "image", "image": "img-key"}}));
+    let data = figcraft_doc::ImageData { bytes: std::sync::Arc::new(vec![1, 2, 3]), width: 2, height: 2 };
+    s.doc_mut().unwrap().images.insert("img-key".into(), data.clone());
+    ex(&mut s, "fill.copy", json!({"id": a, "index": 1}));
+    // Another file has no image under that key: the copy brings the data with it.
+    ex(&mut s, "file.new", json!({}));
+    let b = rect(&mut s);
+    assert!(s.doc().unwrap().images.get("img-key").is_none());
+    ex(&mut s, "fill.paste", json!({"ids": [b], "index": 0}));
+    assert_eq!(s.doc().unwrap().images.get("img-key"), Some(&data));
+    assert!(matches!(node(&s, b).fills[0].kind, figcraft_color::PaintKind::Image(_)));
+}
+
+#[test]
+fn a_copied_pattern_does_not_paste_into_another_file() {
+    let mut s = Session::new();
+    let source = rect(&mut s);
+    let patterned = rect(&mut s);
+    ex(&mut s, "fill.pattern", json!({"ids": [patterned], "source": source}));
+    ex(&mut s, "fill.copy", json!({"id": patterned}));
+    // Its node id means nothing in another file, where it may name an unrelated layer.
+    ex(&mut s, "file.new", json!({}));
+    let b = rect(&mut s);
+    assert!(s.execute("fill.paste", &json!({"ids": [b], "index": 0})).is_err(), "a pattern stays in its file");
+}
+
+#[test]
 fn a_copied_pattern_cannot_paste_into_a_layer_it_draws() {
     let mut s = Session::new();
     let outer = id(ex(&mut s, "frame.create", json!({"x": 0, "y": 0, "width": 100, "height": 100})));
