@@ -21,8 +21,9 @@ pub const SEP: &str = "-";
 pub static MENU: &[MenuItem] = &[
     // File
     m!("File", "New design file", "file.new"),
-    // FigCraft's own: starter templates (not counted by `parity`, like the other items of its own
-    // listed in `OWN`).
+    m!("File", "New board", "file.newBoard"),
+    // FigCraft's own: boards and starter templates (not counted by `parity`, like the other items
+    // of its own listed in `OWN`).
     m!("File", "New from template…", "file.newFromTemplate"),
     m!("File", "New window", "window.new"),
     m!("File", "Open…", "file.open"),
@@ -289,7 +290,7 @@ pub fn items() -> impl Iterator<Item = &'static MenuItem> {
 }
 
 /// Items of FigCraft's own that the parity count leaves out (as it does the `collab.` ones).
-const OWN: [&str; 3] = ["file.newFromTemplate", "help.gettingStarted", "text.missingFonts"];
+const OWN: [&str; 4] = ["file.newFromTemplate", "file.newBoard", "help.gettingStarted", "text.missingFonts"];
 
 /// Coverage: (implemented, total, missing ids). `extra` lists ids implemented by the UI layer.
 pub fn parity(extra: &[&str]) -> (usize, usize, Vec<&'static str>) {

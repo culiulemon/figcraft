@@ -896,6 +896,18 @@ fn the_mapper_stops_at_the_layer_cap_it_is_given() {
 }
 
 #[test]
+fn scalar_fields_count_against_the_value_budget() {
+    // A message of 1000 scalar fields (id 1, `true`) is 1001 values: a budget of 10 refuses it.
+    let fields = vec![Field { name: "b".into(), ty: Some(Type::Bool), array: false, value: 1 }];
+    let sc = Schema { defs: vec![Def { name: "Message".into(), kind: Kind::Message, fields }] };
+    let mut data = [1u8, 1].repeat(1000);
+    data.push(0);
+    let e = sc.decode_message_within(0, &data, 10).unwrap_err();
+    assert_eq!(e.0, "message: too many values");
+    assert!(sc.decode_message_within(0, &data, 1001).is_ok());
+}
+
+#[test]
 fn hostile_input_is_refused() {
     // A message that contains itself, nested past the depth cap.
     let field = |ty, array| vec![Field { name: "m".into(), ty: Some(ty), array, value: 1 }];

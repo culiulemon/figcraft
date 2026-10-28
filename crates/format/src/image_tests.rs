@@ -86,3 +86,29 @@ fn many_lost_images_are_counted_not_listed_one_by_one() {
     assert_eq!(issues.len(), MAX_IMAGE_ISSUES + 1, "{issues:?}");
     assert_eq!(issues.last().map(String::as_str), Some("20 more images couldn't be loaded"));
 }
+
+#[test]
+fn image_members_with_path_like_names_are_dropped_and_not_saved_back() {
+    let (d, hash) = doc_with_image();
+    let bytes = save_bytes(&d, None).unwrap();
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
+    let doc_json = read_member(&mut z, "document.json", u64::MAX).unwrap();
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let mut w = zip::ZipWriter::new(&mut buf);
+    let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    w.start_file("document.json", opts).unwrap();
+    w.write_all(&doc_json).unwrap();
+    for n in ["images/../../x", "images/a/b"] {
+        w.start_file(n, opts).unwrap();
+        w.write_all(&png()).unwrap();
+    }
+    w.finish().unwrap();
+    let hostile = buf.into_inner();
+    let loaded = load_bytes_with_versions(&hostile).unwrap();
+    assert!(loaded.doc.images.keys().all(|k| k != "../../x" && k != "a/b"), "{:?}", loaded.doc.images.keys());
+    assert!(!loaded.issues.is_empty());
+    let saved = save_bytes_with_history(&loaded.doc, None, &loaded.versions, &loaded.branches).unwrap();
+    let z = zip::ZipArchive::new(std::io::Cursor::new(saved)).unwrap();
+    assert!(z.file_names().all(|n| !n.contains("..") && n.matches('/').count() <= 1), "{:?}", z.file_names().collect::<Vec<_>>());
+    let _ = hash;
+}

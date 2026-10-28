@@ -60,10 +60,13 @@ fn arrows_and_deletes_step_over_whole_clusters() {
     key(&mut s, "Right", true, false, false).unwrap();
     assert_eq!(caret(&s), (1, 6));
     key(&mut s, "Left", false, false, false).unwrap();
-    // Delete and Backspace remove a whole cluster.
+    // Delete removes a whole cluster; Backspace takes a letter's marks one at a time (#1220) and
+    // an emoji cluster whole.
     key(&mut s, "Delete", false, false, false).unwrap();
     assert_eq!(chars(&s, t), "ab\u{1F1EF}\u{1F1F5}e\u{0301}");
     key(&mut s, "Right", false, false, true).unwrap(); // to the end
+    key(&mut s, "Backspace", false, false, false).unwrap();
+    assert_eq!(chars(&s, t), "ab\u{1F1EF}\u{1F1F5}e");
     key(&mut s, "Backspace", false, false, false).unwrap();
     assert_eq!(chars(&s, t), "ab\u{1F1EF}\u{1F1F5}");
     key(&mut s, "Backspace", false, false, false).unwrap();
@@ -134,6 +137,63 @@ fn ime_composition_with_cjk() {
     assert!(s.ds().unwrap().text_edit.as_ref().unwrap().preedit.is_none());
 }
 
+/// Asserts `delete_surrounding_bytes` removes an exact UTF-8 byte range across CJK and a
+/// supplementary emoji, leaves nothing past the start, and the whole edit is one undo step.
+#[test]
+fn ime_delete_surrounding_bytes_is_exact_and_one_undo_step() {
+    // 0.37's `DeleteSurroundingBytes` counts UTF-8 bytes around the selection, before the paired
+    // commit. Multibyte CJK and a supplementary emoji must be removed exactly, not as tofu or
+    // extended to grapheme clusters, and the whole edit remains one undo step.
+    let mut s = Session::new();
+    let t = text(&mut s, "ab\u{4F60}\u{597D}c\u{1F600}d", json!({"fontSize": 24}));
+    begin(&mut s, t, Some(4), false).unwrap();
+    assert!(crate::textedit::delete_surrounding_bytes(&mut s, 6, 1).unwrap(), "你好 before and c after");
+    assert_eq!(chars(&s, t), "ab\u{1F600}d");
+    assert_eq!(caret(&s), (2, 2));
+    crate::textedit::set_caret(&mut s, 3, false).unwrap();
+    assert!(crate::textedit::delete_surrounding_bytes(&mut s, 4, 0).unwrap(), "the emoji is four bytes");
+    assert_eq!(chars(&s, t), "abd");
+    assert_eq!(caret(&s), (2, 2));
+    // Past the start of the text: nothing more to delete, not an error.
+    assert!(!crate::textedit::delete_surrounding_bytes(&mut s, 0, 0).unwrap());
+    crate::textedit::end(&mut s).unwrap();
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(chars(&s, t), "ab\u{4F60}\u{597D}c\u{1F600}d", "one undo restores the whole session");
+}
+
+/// Asserts a byte range that only partly covers a character leaves it in place, while an
+/// exact range deletes it, and a selection survives for the paired commit with its
+/// direction preserved.
+#[test]
+fn ime_delete_surrounding_bytes_keeps_partial_characters_and_selection() {
+    // The fork deletes the byte range exactly and leaves a character the range only partly
+    // covers. FigCraft's editor counts characters with the same rule (mirroring egui's
+    // `surrounding_bytes_to_chars`), including around a selection.
+    let mut s = Session::new();
+    let t = text(&mut s, "\u{e9}x\u{1F600}", json!({"fontSize": 24}));
+    let del = |s: &mut Session, b: usize, a: usize| crate::textedit::delete_surrounding_bytes(s, b, a).unwrap();
+    begin(&mut s, t, Some(1), false).unwrap();
+    assert!(!del(&mut s, 1, 0), "one byte ends inside 'é' (two bytes): leave it");
+    assert_eq!(chars(&s, t), "\u{e9}x\u{1F600}");
+    crate::textedit::set_caret(&mut s, 2, false).unwrap();
+    assert!(!del(&mut s, 0, 2), "two bytes start inside the four-byte emoji: leave it");
+    assert_eq!(chars(&s, t), "\u{e9}x\u{1F600}");
+    assert!(del(&mut s, 0, 4), "its four bytes cover it exactly");
+    assert_eq!(chars(&s, t), "\u{e9}x");
+    assert_eq!(caret(&s), (2, 2));
+    // Complete bytes before the selection go; a character the range only partly covers stays,
+    // and the selection itself is kept for the paired commit.
+    crate::textedit::set_caret(&mut s, 1, false).unwrap();
+    crate::textedit::set_caret(&mut s, 1, true).unwrap();
+    crate::textedit::set_caret(&mut s, 2, true).unwrap();
+    assert!(del(&mut s, 2, 2), "é before (two bytes); two bytes start inside the four-byte emoji");
+    // The selected 'x' is kept for the paired commit, as in stock `TextEdit`; the caret moves left
+    // with the deleted prefix and the selection direction is preserved.
+    assert_eq!(chars(&s, t), "x");
+    assert_eq!(caret(&s), (0, 1));
+    crate::textedit::end(&mut s).unwrap();
+}
+
 #[test]
 fn vertical_trim_through_node_set() {
     let mut s = Session::new();
@@ -177,20 +237,19 @@ fn vertical_trim_through_node_set() {
 
 #[test]
 fn paragraph_indent_only_moves_left_aligned_text() {
+    figcraft_text::scan_system_fonts();
     let mut s = Session::new();
     let t = text(&mut s, "Indented paragraph", json!({"fontSize": 20, "paragraphIndent": 30}));
     let first_x = |s: &Session| {
         let (l, _) = figcraft_text::layout_node(s.doc().unwrap().node(t).unwrap()).unwrap();
-        (l.glyphs.first().map_or(0.0, |g| g.x), l.width)
+        (l.glyphs.first().map(|g| g.x), l.width)
     };
-    let (x, w) = first_x(&s);
-    if w <= 0.0 {
-        return;
-    }
+    // Without any font there are no glyphs, but the indent alone still gives the box a width.
+    let (Some(x), w) = first_x(&s) else { return };
     assert!((x - 30.0).abs() < 1e-6, "left: indented");
     s.execute("node.set", &json!({"id": t, "props": {"textAlign": "center"}})).unwrap();
     let (x, w2) = first_x(&s);
-    assert!((w2 - (w - 30.0)).abs() < 1e-6 && x.abs() < 1e-6, "centered auto-width text: no indent, the box shrinks by it");
+    assert!((w2 - (w - 30.0)).abs() < 1e-6 && x.is_some_and(|x| x.abs() < 1e-6), "centered auto-width text: no indent, the box shrinks by it");
 }
 
 /// A new text made with the Text tool by a press at `from`, a drag to `to` and a release, holding
@@ -228,4 +287,86 @@ fn a_drag_with_the_text_tool_makes_a_fixed_size_box() {
     // A flat drag still makes a box one line tall.
     let (b3, _) = text_tool((100.0, 100.0), (180.0, 101.0), "A");
     assert_eq!((b3.width(), b3.height()), (80.0, line.height()));
+}
+
+#[test]
+fn new_text_starts_in_the_builds_default_font() {
+    // `text.create` without a fontFamily and a click with the Text tool both start in
+    // `figcraft_doc::DEFAULT_FONT` (Inter, unless the build names another with
+    // `FIGCRAFT_DEFAULT_FONT`), and the family is written with the text.
+    use crate::tools::{PointerEvent, PointerKind, ToolId};
+    let mut s = Session::new();
+    let made = text(&mut s, "Text", json!({}));
+    s.set_tool(ToolId::Text);
+    s.pointer(&PointerEvent::at(PointerKind::Down, 300.0, 300.0, 1.0)).unwrap();
+    s.pointer(&PointerEvent::at(PointerKind::Up, 300.0, 300.0, 1.0)).unwrap();
+    crate::textedit::insert(&mut s, "Tool").unwrap();
+    let typed = s.ds().unwrap().text_edit.as_ref().unwrap().id;
+    assert_ne!(made, typed);
+    let doc = s.doc().unwrap();
+    for t in [made, typed] {
+        let td = doc.node(t).unwrap().kind.text().unwrap();
+        assert_eq!(td.style.font_family, figcraft_doc::DEFAULT_FONT);
+        assert_eq!(serde_json::to_value(td).unwrap()["style"]["font_family"], figcraft_doc::DEFAULT_FONT);
+    }
+}
+
+fn resize_mode(s: &Session, t: NodeId) -> figcraft_doc::TextAutoResize {
+    s.doc().unwrap().node(t).unwrap().kind.text().unwrap().auto_resize
+}
+
+#[test]
+fn a_truncated_text_keeps_truncating_when_its_box_is_resized() {
+    // #1376: a truncating text is already fixed both ways, so an explicit size changes its box only.
+    use figcraft_doc::TextAutoResize;
+    let mut s = Session::new();
+    let t = text(&mut s, "Lorem consectetur", json!({"textAutoResize": "truncate", "width": 100, "height": 24}));
+    assert_eq!(resize_mode(&s, t), TextAutoResize::Truncate);
+    for (cmd, p, why) in [
+        ("node.set", json!({"id": t, "props": {"height": 24}}), "node.set height (the value it has)"),
+        ("node.set", json!({"id": t, "props": {"width": 120, "height": 30}}), "node.set width and height"),
+        ("transform.resize", json!({"ids": [t], "height": 40}), "transform.resize height"),
+        ("transform.resize", json!({"ids": [t], "width": 90}), "transform.resize width"),
+        ("node.set", json!({"id": t, "props": {"sizingV": "fixed"}}), "fixed vertical sizing"),
+    ] {
+        s.execute(cmd, &p).unwrap();
+        assert_eq!(resize_mode(&s, t), TextAutoResize::Truncate, "{why}");
+    }
+    // Text that doesn't truncate still turns fixed size.
+    let plain = text(&mut s, "Lorem consectetur", json!({"textAutoResize": "height", "width": 100}));
+    s.execute("node.set", &json!({"id": plain, "props": {"height": 24}})).unwrap();
+    assert_eq!(resize_mode(&s, plain), TextAutoResize::None);
+}
+
+#[test]
+fn max_lines_on_auto_height_text_hugs_that_many_lines() {
+    // #1377: an auto-height text with max lines grows up to that many lines and ends in an
+    // ellipsis; the layer reports its max lines.
+    use figcraft_doc::TextAutoResize;
+    figcraft_text::scan_system_fonts();
+    let mut s = Session::new();
+    let t = text(&mut s, "Lorem ipsum dolor sit amet consectetur", json!({"fontSize": 16, "lineHeight": 24}));
+    s.execute("node.set", &json!({"id": t, "props": {"textAutoResize": "height", "width": 100}})).unwrap();
+    assert!(crate::inspect::node_json(s.doc().unwrap(), t, 0).get("maxLines").is_none(), "no limit: not reported");
+    // Wrapping needs a font (CI may have none).
+    if size(&s, t).1 < 48.0 {
+        return;
+    }
+    s.execute("text.maxLines", &json!({"ids": [t], "lines": 1})).unwrap();
+    assert_eq!(resize_mode(&s, t), TextAutoResize::Height, "max lines keep auto height");
+    assert_eq!(size(&s, t), (100.0, 24.0), "one line tall");
+    assert_eq!(crate::inspect::node_json(s.doc().unwrap(), t, 0)["maxLines"], json!(1));
+    s.execute("node.set", &json!({"id": t, "props": {"maxLines": 2}})).unwrap();
+    assert_eq!(size(&s, t).1, 48.0, "two lines tall");
+    // No limit: it grows to all of its lines again.
+    s.execute("node.set", &json!({"id": t, "props": {"maxLines": 0}})).unwrap();
+    assert!(size(&s, t).1 > 48.0);
+    // An explicit height on a text that truncates makes a truncating box.
+    s.execute("node.set", &json!({"id": t, "props": {"maxLines": 1}})).unwrap();
+    s.execute("node.set", &json!({"id": t, "props": {"height": 30}})).unwrap();
+    assert_eq!((resize_mode(&s, t), size(&s, t).1), (TextAutoResize::Truncate, 30.0));
+    // Other text still becomes a truncating box with max lines.
+    let fixed = text(&mut s, "Lorem", json!({"textAutoResize": "none", "width": 100, "height": 100}));
+    s.execute("text.maxLines", &json!({"ids": [fixed], "lines": 2})).unwrap();
+    assert_eq!(resize_mode(&s, fixed), TextAutoResize::Truncate);
 }

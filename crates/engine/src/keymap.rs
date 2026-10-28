@@ -193,6 +193,15 @@ pub static KEYS: &[Binding] = &[
     k(Tools, "tool.text", &["T"]),
     k(Tools, "tool.comment", &["C"]),
     k(Tools, "tool.shapeBuilder", &["Shift+M"]),
+    // Board tools (on boards only), on keys nothing else uses.
+    k(Tools, "tool.sticky", &["Q"]),
+    k(Tools, "tool.shape", &["B"]),
+    k(Tools, "tool.connector", &["X"]),
+    k(Tools, "tool.marker", &["M"]),
+    k(Tools, "tool.highlighter", &["U"]),
+    k(Tools, "tool.eraser", &["E"]),
+    k(Tools, "tool.stamp", &["W"]),
+    k(Tools, "board.nextSticky", &["Shift+Cmd+Enter"]).label("Board: a new sticky beside the selected one").both(),
     // View
     // The documentation gives both keys for the pixel grid in different places.
     k(View, "view.pixelGrid", &["Shift+'", "Cmd+'"]),
@@ -220,8 +229,10 @@ pub static KEYS: &[Binding] = &[
     k(View, "view.prevPage", &["PageUp"]),
     k(View, "view.nextPage", &["PageDown"]),
     // Zoom
-    k(Zoom, "view.zoomIn", &["Cmd+=", "Shift+=", "Shift+Cmd+="]),
-    k(Zoom, "view.zoomOut", &["Cmd+-", "-", "Shift+-"]),
+    // Each zoom-in key has its zoom-out twin on the key beside it: `-` alone zooms out, so `=`
+    // alone (the `+` key without Shift) zooms in (#973).
+    k(Zoom, "view.zoomIn", &["Cmd+=", "Shift+=", "Shift+Cmd+=", "="]),
+    k(Zoom, "view.zoomOut", &["Cmd+-", "-", "Shift+-", "Shift+Cmd+-"]),
     k(Zoom, "view.zoom100", &["Shift+0", "Cmd+0"]),
     k(Zoom, "view.zoomFit", &["Shift+1"]),
     k(Zoom, "view.zoomSelection", &["Shift+2"]),

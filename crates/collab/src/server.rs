@@ -7,7 +7,7 @@ use figcraft_doc::{Document, NodeId};
 use serde::{Deserialize, Serialize};
 
 use crate::change::{Change, Entry, Prop, Target};
-use crate::message::{Accepted, Access, CatchUp, ClientMsg, Hello, PROTOCOL, Peer, Presence, Processed, ServerMsg, Signal, reads_signals};
+use crate::message::{Accepted, Access, CatchUp, ClientMsg, Hello, PROTOCOL, Peer, Presence, Processed, Resume, ServerMsg, Signal, reads_signals};
 use crate::replica::{Mode, Replica, create_change};
 use crate::{Error, Limits, docprops, same_secret};
 
@@ -61,6 +61,9 @@ pub struct Server {
     /// Every client id handed out (a reconnecting client keeps its id) and what was done with
     /// its batches.
     issued: BTreeMap<u32, Processed>,
+    /// The secret each client id resumes with (sent only in that client's welcome). Not saved:
+    /// after a restart, the first to come back for an id that isn't connected sets it.
+    secrets: BTreeMap<u32, u64>,
     /// The latest accepted batches, oldest first (a reconnecting client gets what it missed).
     log: VecDeque<Accepted>,
     /// Changes in `log`, and about how many bytes it holds ([`weight`]).
@@ -116,6 +119,7 @@ impl Server {
             deleted: BTreeSet::new(),
             removed: BTreeSet::new(),
             issued: BTreeMap::new(),
+            secrets: BTreeMap::new(),
             log: VecDeque::new(),
             log_changes: 0,
             log_bytes: 0,
@@ -219,6 +223,7 @@ impl Server {
             && let Some(old) = self.issued.keys().copied().find(|k| !self.peers.contains_key(k))
         {
             self.issued.remove(&old);
+            self.secrets.remove(&old);
         }
     }
 
@@ -266,7 +271,7 @@ impl Server {
         if !same_secret(&hello.token, &self.token) {
             return Err(refuse("wrong session token"));
         }
-        let resume = hello.resume.filter(|r| r.session == self.session && self.issued.contains_key(&r.client_id));
+        let resume = hello.resume.filter(|r| r.session == self.session && self.issued.contains_key(&r.client_id) && self.may_resume(r));
         if self.peers.len() >= self.limits.max_peers && resume.is_none_or(|r| !self.peers.contains_key(&r.client_id)) {
             return Err(refuse("the session is full"));
         }
@@ -282,15 +287,17 @@ impl Server {
             Some(r) if r.seq <= self.seq && r.seq >= floor => CatchUp::Delta(self.log.iter().filter(|a| a.seq > r.seq).cloned().collect()),
             _ => CatchUp::Snapshot(self.state.snapshot().map_err(|e| refuse(&e.to_string()))?),
         };
-        let id = match resume {
-            Some(r) => r.client_id,
+        let (id, secret) = match resume {
+            Some(r) => (r.client_id, *self.secrets.entry(r.client_id).or_insert(r.secret)),
             None => {
                 let id = self.next_client;
                 self.next_client += 1;
                 self.issued.insert(id, Processed::default());
+                let secret = new_session_id().max(1);
+                self.secrets.insert(id, secret);
                 self.forget_oldest();
                 self.note(Journal::Issued { client: id });
-                id
+                (id, secret)
             }
         };
         let processed = self.issued.get(&id).cloned().unwrap_or_default();
@@ -298,7 +305,7 @@ impl Server {
         let signals = reads_signals(&hello.client_version);
         let peer = Peer { client_id: id, name: hello.name, color: hello.color };
         let others = self.peers.values().filter(|p| p.client_id != id).cloned().collect();
-        let welcome = ServerMsg::Welcome { session: self.session, client_id: id, seq: self.seq, catch_up, processed, peers: others, access };
+        let welcome = ServerMsg::Welcome { session: self.session, client_id: id, seq: self.seq, catch_up, processed, peers: others, access, secret };
         self.peers.insert(id, peer.clone());
         if access == Access::View {
             self.viewers.insert(id);
@@ -316,6 +323,16 @@ impl Server {
             self.signals.remove(&id);
         }
         Ok((id, outs))
+    }
+
+    /// Whether `r` may take its client id back: it carries the secret that id was given with, or
+    /// (after a restart, which forgets secrets) a secret for an id nobody is connected as.
+    fn may_resume(&self, r: &Resume) -> bool {
+        r.secret != 0
+            && match self.secrets.get(&r.client_id) {
+                Some(s) => *s == r.secret,
+                None => !self.peers.contains_key(&r.client_id),
+            }
     }
 
     /// Client `id`'s connection closed.
@@ -541,11 +558,14 @@ impl Server {
                 nodes.extend(t.write(self.state.value(&t)?.as_ref()));
             }
         }
+        let mut restored = std::collections::BTreeSet::new();
         for id in gone {
             match doc.node(id) {
                 Some(_) => {
                     for d in doc.subtree(id) {
-                        if let Some(n) = doc.node(d) {
+                        if restored.insert(d)
+                            && let Some(n) = doc.node(d)
+                        {
                             nodes.push(create_change(n, self.state.key(d))?);
                         }
                     }

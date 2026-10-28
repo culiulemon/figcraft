@@ -47,6 +47,13 @@ pub fn start() {
                         let link = js_sys::decode_uri_component(link).ok().and_then(|s| s.as_string()).unwrap_or_else(|| link.to_string());
                         figcraft_ui_egui::live::open_invite(&mut fig, &link);
                     }
+                    // `?control`: `window.figcraft`, the page's control channel (crate::api), opt-in.
+                    if crate::query::control(&query()) {
+                        crate::api::connect(cc.egui_ctx.clone());
+                        if let Err(e) = crate::api::install() {
+                            log::error!("couldn't install window.figcraft: {e:?}");
+                        }
+                    }
                     Ok(Box::new(WebShell { fig }))
                 }),
             )
@@ -69,9 +76,19 @@ struct WebShell {
 }
 
 impl eframe::App for WebShell {
-    // `FigApp::ui` runs its own per-frame logic first (fonts, theme), like the desktop app.
+    // eframe runs `logic` for visible tabs and, with only `run_logic`, for hidden ones: keep
+    // autosave/live/control deadlines moving without a paint. `FigApp::ui` does not repeat it.
+    /// Run the browser shell's eframe logic callback: guard `background_tick` so hidden tabs
+    /// still advance autosave, live and control deadlines without painting. `FigApp::ui` does
+    /// not repeat it.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        figcraft_ui_egui::windows::guard(&mut self.fig, ctx, |fig| fig.background_tick(ctx));
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.fig.control_queue.extend(crate::api::take_requests());
         self.fig.ui(ui);
+        crate::api::poll_replies();
     }
 }
 
@@ -101,6 +118,9 @@ impl Services for WebServices {
     }
     /// A Blob behind a temporary `<a download>` link, clicked and removed.
     fn download(&mut self, name: &str, bytes: &[u8]) -> bool {
+        if crate::api::capture(name, bytes) {
+            return true;
+        }
         match download(name, bytes) {
             Ok(()) => true,
             Err(e) => {
@@ -117,7 +137,7 @@ impl Services for WebServices {
     }
     fn open_url(&mut self, url: &str) {
         let Some(window) = web_sys::window() else { return };
-        if let Err(e) = window.open_with_url_and_target(url, "_blank") {
+        if let Err(e) = window.open_with_url_and_target_and_features(url, "_blank", "noopener,noreferrer") {
             log::error!("couldn't open {url}: {e:?}");
         }
     }

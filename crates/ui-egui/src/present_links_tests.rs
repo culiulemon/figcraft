@@ -1,7 +1,9 @@
 //! A prototype's Open link action carries a URL from the document and fires from whatever trigger
 //! the prototype sets, including a delay, so the player hands the opener only a web link
 //! ([`figcraft_engine::doc_urls`]). Without that, a saved document opens `javascript:` in the web
-//! build's own origin (stored XSS) and `smb:`/`ms-…:` through the desktop's handlers.
+//! build's own origin (stored XSS) and `smb:`/`ms-…:` through the desktop's handlers. A link to a
+//! website then waits behind a notice that it leaves the prototype, unless the viewer chose to skip
+//! the notice.
 
 use std::sync::{Arc, Mutex};
 
@@ -11,14 +13,20 @@ use serde_json::{Value, json};
 use crate::Services;
 use crate::present_tests::{Ui as Harness, id};
 
-/// Records every URL the player asks the platform to open.
+/// Records every URL the player asks the platform to open, and every save of the preferences.
 #[derive(Default)]
-struct Opened(Arc<Mutex<Vec<String>>>);
+struct Opened(Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<figcraft_engine::Prefs>>>);
 
 impl Services for Opened {
     fn open_url(&mut self, url: &str) {
         if let Ok(mut v) = self.0.lock() {
             v.push(url.to_string());
+        }
+    }
+
+    fn save_prefs(&mut self, prefs: &figcraft_engine::Prefs) {
+        if let Ok(mut v) = self.1.lock() {
+            v.push(prefs.clone());
         }
     }
 }
@@ -27,9 +35,16 @@ fn ex(s: &mut Session, cmd: &str, p: Value) -> Value {
     s.execute(cmd, &p).unwrap_or_else(|e| panic!("{cmd} {p}: {e}"))
 }
 
-/// A presented frame whose layer opens `url` 100ms after the screen appears — no click anywhere.
-fn opens_after_a_delay(url: &str) -> Vec<String> {
+/// A presented frame whose layer opens `url` 100ms after the screen appears, with no click
+/// anywhere, and with the notice skipped or not. Returns the harness and what the player opened.
+fn presented(url: &str, skip_notice: bool) -> (Harness, Opened) {
+    played("proto.present", url, skip_notice)
+}
+
+/// [`presented`], played by `cmd` (`proto.present` or `proto.preview`).
+fn played(cmd: &str, url: &str, skip_notice: bool) -> (Harness, Opened) {
     let mut s = Session::new();
+    s.prefs.link_notice_skipped = skip_notice;
     let f = id(&ex(&mut s, "frame.create", json!({"x": 0, "y": 0, "width": 300, "height": 400, "name": "A"})));
     let layer = id(&ex(&mut s, "shape.rectangle", json!({"x": 10, "y": 10, "width": 30, "height": 30, "parent": f})));
     ex(
@@ -37,19 +52,154 @@ fn opens_after_a_delay(url: &str) -> Vec<String> {
         "proto.interaction.add",
         json!({"id": layer, "trigger": {"type": "afterDelay", "ms": 100}, "action": {"type": "openUrl", "url": url}, "transition": {"type": "instant"}}),
     );
-    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen = Opened::default();
     let mut u = Harness::new(s);
-    u.app.services = Box::new(Opened(seen.clone()));
-    u.run("proto.present", json!({"start": f}));
+    u.app.services = Box::new(Opened(seen.0.clone(), seen.1.clone()));
+    u.ctx.enable_accesskit();
+    u.run(cmd, json!({"start": f}));
     // Well past the delay.
     u.frames(40, Vec::new);
-    seen.lock().map(|v| v.clone()).unwrap_or_default()
+    (u, seen)
+}
+
+fn opened(seen: &Opened) -> Vec<String> {
+    seen.0.lock().map(|v| v.clone()).unwrap_or_default()
+}
+
+fn opens_after_a_delay(url: &str) -> Vec<String> {
+    opened(&presented(url, true).1)
+}
+
+/// The URL the presenter's notice waits to open.
+fn notice(u: &Harness) -> Value {
+    u.app.inspect()["presenter"]["linkNotice"].clone()
+}
+
+/// Clicks the control labeled `label`.
+fn click(u: &mut Harness, label: &str) {
+    let tree = u.frame_output(vec![]).platform_output.accesskit_update.unwrap().nodes;
+    let n = tree.into_iter().map(|(_, n)| n).find(|n| n.label() == Some(label)).unwrap_or_else(|| panic!("no {label:?}"));
+    let b = n.bounds().unwrap();
+    let at = egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32);
+    u.button(at, true);
+    u.button(at, false);
 }
 
 #[test]
 fn a_prototype_opens_web_links() {
     assert_eq!(opens_after_a_delay("https://example.com/a"), ["https://example.com/a"]);
     assert_eq!(opens_after_a_delay("mailto:a@b.c"), ["mailto:a@b.c"]);
+    // A mail link opens the mail app without the notice.
+    assert_eq!(opened(&presented("mailto:a@b.c", false).1), ["mailto:a@b.c"]);
+}
+
+#[test]
+fn a_link_to_a_website_waits_for_the_notice() {
+    let (mut u, seen) = presented("https://example.com/a", false);
+    assert!(opened(&seen).is_empty(), "the link waits for the viewer");
+    assert_eq!(notice(&u), "https://example.com/a");
+    click(&mut u, "Open link");
+    assert_eq!(opened(&seen), ["https://example.com/a"]);
+    assert!(notice(&u).is_null());
+    assert!(!u.app.session.prefs.link_notice_skipped && seen.1.lock().unwrap().is_empty(), "the notice shows next time");
+}
+
+#[test]
+fn the_preview_pane_shows_the_notice_too() {
+    let (mut u, seen) = played("proto.preview", "https://example.com/a", false);
+    assert!(opened(&seen).is_empty());
+    assert_eq!(u.app.inspect()["preview"]["linkNotice"], "https://example.com/a");
+    click(&mut u, "Open link");
+    assert_eq!(opened(&seen), ["https://example.com/a"]);
+}
+
+#[test]
+fn cancel_or_escape_drops_the_link() {
+    let (mut u, seen) = presented("https://example.com/a", false);
+    click(&mut u, "Cancel");
+    assert!(notice(&u).is_null() && opened(&seen).is_empty());
+    let (mut u, seen) = presented("https://example.com/a", false);
+    u.key(egui::pos2(700.0, 450.0), egui::Key::Escape);
+    assert!(notice(&u).is_null() && opened(&seen).is_empty());
+    assert!(u.app.ui.present.is_some(), "Escape closes the notice, not the presentation");
+}
+
+#[test]
+fn the_prototype_takes_no_keys_while_the_notice_shows() {
+    let mut s = Session::new();
+    let a = id(&ex(&mut s, "frame.create", json!({"x": 0, "y": 0, "width": 300, "height": 400, "name": "A"})));
+    let b = id(&ex(&mut s, "frame.create", json!({"x": 400, "y": 0, "width": 300, "height": 400, "name": "B"})));
+    let layer = id(&ex(&mut s, "shape.rectangle", json!({"x": 10, "y": 10, "width": 30, "height": 30, "parent": a})));
+    let link = json!({"type": "openUrl", "url": "https://example.com/a"});
+    ex(&mut s, "proto.interaction.add", json!({"id": layer, "trigger": {"type": "afterDelay", "ms": 100}, "action": link}));
+    let to_b = json!({"type": "navigate", "dest": b});
+    ex(&mut s, "proto.interaction.add", json!({"id": a, "trigger": {"type": "keyPress", "key": "Escape"}, "action": to_b}));
+    let mut u = Harness::new(s);
+    u.app.services = Box::new(Opened::default());
+    u.run("proto.present", json!({"start": a}));
+    u.frames(40, Vec::new);
+    assert_eq!(notice(&u), "https://example.com/a");
+    u.key(egui::pos2(700.0, 450.0), egui::Key::Escape);
+    assert!(notice(&u).is_null(), "Escape cancels the notice");
+    assert_eq!(u.app.inspect()["presenter"]["current"], json!(a), "the prototype's Escape trigger did not run");
+}
+
+#[test]
+fn the_presenter_keys_wait_while_the_notice_shows() {
+    let (mut u, _) = presented("https://example.com/a", false);
+    assert_eq!(notice(&u), "https://example.com/a");
+    let press = |key, modifiers| {
+        let k = |pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers };
+        vec![k(true), k(false)]
+    };
+    let out = u.frame_output(press(egui::Key::F, egui::Modifiers::NONE));
+    let cmds = out.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.commands.clone()).unwrap_or_default();
+    assert!(!cmds.iter().any(|c| matches!(c, egui::ViewportCommand::Fullscreen(_))), "F: {cmds:?}");
+    u.frame(press(egui::Key::C, egui::Modifiers::NONE));
+    assert_eq!(u.app.inspect()["presenter"]["comments"], false, "C");
+    u.frame(press(egui::Key::C, egui::Modifiers::SHIFT));
+    assert_eq!(u.app.inspect()["presenter"]["comments"], false, "Shift+C");
+    assert_eq!(notice(&u), "https://example.com/a");
+}
+
+#[test]
+fn the_prototype_takes_no_controller_buttons_while_the_notice_shows() {
+    let mut s = Session::new();
+    let a = id(&ex(&mut s, "frame.create", json!({"x": 0, "y": 0, "width": 300, "height": 400, "name": "A"})));
+    let b = id(&ex(&mut s, "frame.create", json!({"x": 400, "y": 0, "width": 300, "height": 400, "name": "B"})));
+    let layer = id(&ex(&mut s, "shape.rectangle", json!({"x": 10, "y": 10, "width": 30, "height": 30, "parent": a})));
+    let link = json!({"type": "openUrl", "url": "https://example.com/a"});
+    ex(&mut s, "proto.interaction.add", json!({"id": layer, "trigger": {"type": "afterDelay", "ms": 100}, "action": link}));
+    let to_b = json!({"type": "navigate", "dest": b});
+    ex(&mut s, "proto.interaction.add", json!({"id": a, "trigger": {"type": "keyPress", "key": "Gamepad A"}, "action": to_b}));
+    let mut u = Harness::new(s);
+    u.app.services = Box::new(Opened::default());
+    u.ctx.enable_accesskit();
+    u.run("proto.present", json!({"start": a}));
+    u.frames(40, Vec::new);
+    assert_eq!(notice(&u), "https://example.com/a");
+    let ctx = u.ctx.clone();
+    crate::control::handle(&mut u.app, &ctx, "ui.input", &json!({"events": [{"gamepad": "A"}]})).unwrap();
+    u.frames(2, Vec::new);
+    assert_eq!(u.app.inspect()["presenter"]["current"], json!(a), "the Gamepad A trigger did not run");
+    assert_eq!(notice(&u), "https://example.com/a");
+    click(&mut u, "Cancel");
+    assert!(notice(&u).is_null());
+    crate::control::handle(&mut u.app, &ctx, "ui.input", &json!({"events": [{"gamepad": "A"}]})).unwrap();
+    u.frames(2, Vec::new);
+    assert_eq!(u.app.inspect()["presenter"]["current"], json!(b), "the button plays once the notice closes");
+}
+
+#[test]
+fn dont_show_this_again_is_saved_with_the_preferences() {
+    let (mut u, seen) = presented("https://example.com/a", false);
+    click(&mut u, "Don't show this again");
+    click(&mut u, "Open link");
+    assert_eq!(opened(&seen), ["https://example.com/a"]);
+    assert!(u.app.session.prefs.link_notice_skipped);
+    assert!(seen.1.lock().unwrap().last().is_some_and(|p| p.link_notice_skipped), "the choice is saved");
+    assert_eq!(u.run("proto.linkNotice", json!({})), json!({"shown": true}));
+    assert!(!u.app.session.prefs.link_notice_skipped);
 }
 
 #[test]
@@ -68,4 +218,36 @@ fn a_prototype_cannot_open_a_script_or_handler_url() {
     ] {
         assert!(opens_after_a_delay(url).is_empty(), "{url:?} must never reach the opener");
     }
+}
+
+#[test]
+fn the_prototype_takes_no_clicks_while_the_notice_shows() {
+    let mut s = Session::new();
+    let a = id(&ex(&mut s, "frame.create", json!({"x": 0, "y": 0, "width": 300, "height": 400, "name": "A"})));
+    let b = id(&ex(&mut s, "frame.create", json!({"x": 400, "y": 0, "width": 300, "height": 400, "name": "B"})));
+    let layer = id(&ex(&mut s, "shape.rectangle", json!({"x": 10, "y": 10, "width": 30, "height": 30, "parent": a})));
+    let link = json!({"type": "openUrl", "url": "https://example.com/a"});
+    ex(&mut s, "proto.interaction.add", json!({"id": layer, "trigger": {"type": "afterDelay", "ms": 100}, "action": link}));
+    let to_b = json!({"type": "navigate", "dest": b});
+    ex(&mut s, "proto.interaction.add", json!({"id": a, "trigger": {"type": "onClick"}, "action": to_b, "transition": {"type": "instant"}}));
+    let mut u = Harness::new(s);
+    u.app.services = Box::new(Opened::default());
+    u.run("proto.present", json!({"start": a}));
+    u.frames(40, Vec::new);
+    assert_eq!(notice(&u), "https://example.com/a");
+    // On the frame, above the notice.
+    let at = egui::pos2(700.0, 290.0);
+    u.button(at, true);
+    u.button(at, false);
+    u.frames(5, Vec::new);
+    assert_eq!(u.app.inspect()["presenter"]["current"], json!(a), "the click behind the notice did not navigate");
+    assert_eq!(notice(&u), "https://example.com/a", "the notice still waits");
+    let shapes = crate::live_tests::flat(&u.frame_output(vec![]).shapes);
+    crate::live_tests::text_center(&shapes, "Open link");
+    u.key(egui::pos2(700.0, 450.0), egui::Key::Escape);
+    assert!(notice(&u).is_null());
+    u.button(at, true);
+    u.button(at, false);
+    u.frames(5, Vec::new);
+    assert_eq!(u.app.inspect()["presenter"]["current"], json!(b), "with the notice gone the same click navigates");
 }

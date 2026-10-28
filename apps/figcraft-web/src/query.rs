@@ -1,4 +1,4 @@
-//! The page's URL: the invite link its fragment names.
+//! The page's URL: the invite link its fragment names, and the flags its query sets.
 
 /// The invite link in `#join=<link>` (`fragment` is `location.hash`, with or without its `#`), still
 /// escaped. The fragment, unlike the query, never leaves the browser, so the link's secret stays out
@@ -12,4 +12,11 @@ pub fn join_link(fragment: &str) -> Option<&str> {
     let fragment = fragment.strip_prefix('#').unwrap_or(fragment);
     let start = if fragment.starts_with("join=") { 0 } else { fragment.find("&join=")? + 1 };
     fragment.get(start + "join=".len()..).filter(|link| !link.is_empty() && link.len() <= MAX)
+}
+
+/// Whether `search` (`location.search`, with or without its `?`) has a `control` entry (`?control`,
+/// or `?control=…` with any value): the page's control channel, `window.figcraft`, is installed only
+/// when it is asked for.
+pub fn control(search: &str) -> bool {
+    search.strip_prefix('?').unwrap_or(search).split('&').any(|entry| entry.split('=').next() == Some("control"))
 }

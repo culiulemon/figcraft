@@ -9,7 +9,7 @@ pub fn run<T>(cmd: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
         Err(payload) => {
             let msg = payload
                 .downcast_ref::<&str>()
-                .map(|s| s.to_string())
+                .map(ToString::to_string)
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "panic".to_string());
             log::error!("command `{cmd}` panicked: {msg}");

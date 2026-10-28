@@ -189,9 +189,9 @@ pub(crate) enum Taken {
 /// in answer must go out on this connection.
 pub(crate) fn take(m: ServerMsg, cfg: &GuestConfig, inbox: &Inbox, seen: &mut Seen, resume: &Resuming, welcomed: &dyn Fn()) -> Taken {
     match m {
-        ServerMsg::Welcome { session, client_id, seq, ref peers, access, .. } => {
+        ServerMsg::Welcome { session, client_id, seq, ref peers, access, secret, .. } => {
             if let Ok(mut r) = resume.lock() {
-                *r = Some(Resume { session, client_id, seq });
+                *r = Some(Resume { session, client_id, seq, secret });
             }
             // The sync client opens the document (and fills in its name and pages).
             let peers = peers.clone();

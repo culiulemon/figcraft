@@ -262,17 +262,21 @@ fn the_limits_on_codes_over_time() {
     let t0 = Instant::now();
     let me = ip("198.51.100.9");
     let mut abuse = Abuse::new(AbuseConfig { open: false, connects_per_minute: 30, publishes_per_hour: 10, messages_per_second: 200 });
-    // A right code forgives the wrong ones before it.
+    // A right code, even from a neighbour in the same /64, doesn't forgive the wrong ones.
+    let a = ip("2001:db8:1:2::1");
+    let b = ip("2001:db8:1:2::2");
     for _ in 0..WRONG_CODES - 1 {
+        abuse.code_tried(a, false, t0);
+    }
+    abuse.code_tried(b, true, t0);
+    abuse.code_tried(a, true, t0);
+    assert_eq!(abuse.code_locked(a, t0), None);
+    abuse.code_tried(a, false, t0);
+    assert_eq!(abuse.code_locked(a, t0), Some(CODE_LOCKOUT));
+    // Wrong codes: locked for the lockout, then free again.
+    for _ in 0..WRONG_CODES {
         abuse.code_tried(me, false, t0);
     }
-    abuse.code_tried(me, true, t0);
-    for _ in 0..WRONG_CODES - 1 {
-        abuse.code_tried(me, false, t0);
-    }
-    assert_eq!(abuse.code_locked(me, t0), None);
-    // One more: locked for the lockout, then free again.
-    abuse.code_tried(me, false, t0);
     assert_eq!(abuse.code_locked(me, t0), Some(CODE_LOCKOUT));
     assert!(abuse.code_locked(me, t0 + CODE_LOCKOUT - Duration::from_secs(1)).is_some());
     assert_eq!(abuse.code_locked(me, t0 + CODE_LOCKOUT), None);

@@ -35,6 +35,9 @@ impl Effect {
 impl TextStyle {
     pub fn for_each_color_mut(&mut self, f: &mut ColorVisitor) {
         self.fills.iter_mut().flatten().for_each(|p| p.for_each_color_mut(f));
+        if let Some(c) = self.decoration_look.as_deref_mut().and_then(|l| l.color.as_mut()) {
+            f(c);
+        }
     }
 }
 

@@ -28,8 +28,9 @@ fn reply(reader: &mut BufReader<TcpStream>) -> Value {
     serde_json::from_str(&line).unwrap()
 }
 
+/// Build a `ui.inspect` control request with a throwaway reply channel.
 fn request() -> ControlRequest {
-    ControlRequest { id: json!(0), method: "ui.inspect".into(), params: json!({}), reply: mpsc::channel().0, cancelled: Default::default() }
+    ControlRequest { id: json!(0), method: "ui.inspect".into(), params: json!({}), reply: mpsc::channel().0, state: Default::default() }
 }
 
 #[test]
@@ -115,6 +116,52 @@ fn full_queue_rejects_before_dispatch_and_ui_queue_stays_bounded() {
     worker.join().unwrap().unwrap();
 }
 
+/// Asserts a commit that writes the file and queues its reply wins the gate: the transport's
+/// timeout branch consumes that reply and leaves the state `Replied`.
+#[test]
+fn a_committed_reply_wins_over_the_transport_timeout() {
+    let dir = std::env::temp_dir().join(format!("figcraft-control-commit-{}", std::process::id()));
+    let path = dir.join("shot.png");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let gate = RequestGate::new();
+    let (tx, rx) = mpsc::channel();
+    // The UI's final commit gets the gate first: the file and reply are both committed before the
+    // transport's timeout branch can look at the gate.
+    let committed = gate.commit(|| {
+        std::fs::write(&path, b"png").unwrap();
+        tx.send(ControlReply { id: json!(7), result: Ok(json!({"path": path.to_string_lossy()})) }).unwrap();
+    });
+    assert!(committed.is_some());
+    assert!(path.is_file());
+    let reply = after_timeout(&rx, &gate).expect("the queued commit is consumed");
+    assert_eq!(reply.id, json!(7));
+    assert!(reply.result.is_ok());
+    assert_eq!(gate.state(), RequestState::Replied, "the timeout must not overwrite a commit");
+    assert!(path.is_file(), "a winning commit keeps its file");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Asserts a zero-duration wait reports `Timeout` and cancels the open gate.
+#[test]
+fn a_timeout_cancels_an_open_request() {
+    let gate = RequestGate::new();
+    let (_tx, rx) = mpsc::channel::<ControlReply>();
+    assert!(matches!(wait_for_reply(&rx, &gate, Duration::ZERO), Err(WaitFailure::Timeout)));
+    assert_eq!(gate.state(), RequestState::Cancelled, "nothing may write after the timeout");
+}
+
+/// Asserts a closed reply channel reports `Disconnected` and leaves the gate `Open`, not
+/// cancelled.
+#[test]
+fn a_disconnected_reply_channel_is_not_reported_as_a_timeout() {
+    let gate = RequestGate::new();
+    let (tx, rx) = mpsc::channel::<ControlReply>();
+    drop(tx);
+    assert!(matches!(wait_for_reply(&rx, &gate, Duration::from_secs(1)), Err(WaitFailure::Disconnected)));
+    assert_eq!(gate.state(), RequestState::Open, "a closed app is not a cancel decision");
+}
+
 #[test]
 fn idle_and_partial_frame_connections_expire() {
     for bytes in [b"".as_slice(), b"{\"id\":"] {
@@ -129,6 +176,18 @@ fn idle_and_partial_frame_connections_expire() {
         assert!(pending.lock().unwrap().is_empty());
         worker.join().unwrap().unwrap();
     }
+}
+
+/// A failed accept is followed by a wait before the next one, so a listener that keeps failing
+/// does not spin, and the connections around the failures still come through.
+#[test]
+fn a_failed_accept_waits_before_the_next() {
+    let failed = || Err(std::io::Error::other("no file descriptors left"));
+    let incoming = vec![failed(), Ok(1), failed(), failed(), Ok(2)];
+    let mut waits = 0;
+    let connections: Vec<i32> = accepted(incoming.into_iter(), || waits += 1).collect();
+    assert_eq!(connections, [1, 2]);
+    assert_eq!(waits, 3, "one wait per failed accept");
 }
 
 #[test]
@@ -215,6 +274,9 @@ fn a_limit_sized_frame_is_accepted_at_eof() {
     worker.join().unwrap().unwrap();
 }
 
+/// Asserts expired requests stop occupying the UI queue cap, a later request is admitted
+/// and answered, and a window that finally draws discards its expired command before
+/// dispatch.
 #[test]
 fn timed_out_requests_release_a_full_deferred_ui_queue() {
     use figcraft_ui_egui::{FigApp, NoServices, control, windows};
@@ -250,7 +312,7 @@ fn timed_out_requests_release_a_full_deferred_ui_queue() {
     // Include expired requests in the socket queue, too: admission must reclaim their slots.
     pending.lock().unwrap().extend((0..MAX_QUEUED_REQUESTS).map(|_| {
         let r = request();
-        r.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        r.state.cancel_if_open();
         r
     }));
     let (mut client, server) = pair();

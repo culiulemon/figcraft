@@ -237,6 +237,17 @@ pub struct DevResource {
     pub name: String,
 }
 
+/// A measurement kept on the canvas for developers, stored on the layer it starts from: to another
+/// layer (`to`), or across one of the layer's own sides (`side`). Dev Mode draws it from the layers'
+/// current bounds, so it follows them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Measurement {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<NodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<crate::Side>,
+}
+
 /// A kind of annotation (Development, Accessibility…): its stable id, name and the colour its
 /// callouts are drawn in.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -386,6 +397,11 @@ impl NodeKind {
         self.has_corner_radius() && !matches!(self, NodeKind::Polygon { .. } | NodeKind::Star { .. } | NodeKind::Vector { .. })
     }
 
+    /// Kinds whose rounded corners are drawn with corner smoothing (a vector's rounded points are drawn without it).
+    pub fn has_corner_smoothing(&self) -> bool {
+        self.has_corner_radius() && !matches!(self, NodeKind::Vector { .. })
+    }
+
     pub fn text(&self) -> Option<&TextData> {
         match self {
             NodeKind::Text(t) => Some(t),
@@ -518,6 +534,12 @@ pub struct Node {
     /// Dev resources: links for developers (docs, code, tickets…), in the order they were added.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dev_resources: Vec<DevResource>,
+    /// Dev Mode measurements that start from this layer, in the order they were added.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub measurements: Vec<Measurement>,
+    /// On a board: what this object is (a sticky note, a connector, a stamp…).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<crate::BoardItem>,
 }
 
 pub(crate) fn yes() -> bool {
@@ -628,6 +650,8 @@ impl Node {
             annotations: Vec::new(),
             code_links: Vec::new(),
             dev_resources: Vec::new(),
+            measurements: Vec::new(),
+            board: None,
         }
     }
 
@@ -651,6 +675,11 @@ impl Node {
 
     pub fn is_page(&self) -> bool {
         matches!(self.kind, NodeKind::Page { .. })
+    }
+
+    /// A board object selected and moved as a whole (a sticky, a shape with text, a stamp…).
+    pub fn is_board_atom(&self) -> bool {
+        self.board.as_ref().is_some_and(crate::BoardItem::is_atom)
     }
 
     /// A section whose contents are hidden: only its name and outline show; its children are

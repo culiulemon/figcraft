@@ -6,11 +6,20 @@
 //! where it faces `light_angle`, half as bright on the opposite side, spread wider by `splay`.
 //! `frost` blurs the backdrop first. Distances to the outline come from an exact Euclidean
 //! distance transform of the shape's coverage.
+//!
+//! The shape's coverage, distances and normals depend only on the shape and the zoom. Once a
+//! later render asks for the same shape at the same zoom they are worked out for the whole shape,
+//! in its own pixel frame, and kept in a cache of at most [`MAX_CACHED_BYTES`]: moving or editing
+//! what lies under the glass, dragging its sliders, panning and patching the canvas reuse them.
+//! Zooming doesn't (each zoom is new).
 
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use figcraft_doc::Glass;
 use figcraft_geom::Affine;
+use figcraft_geom::kurbo::Shape as _;
 use tiny_skia::Pixmap;
 
 use crate::fx;
@@ -98,61 +107,24 @@ pub fn inside_distance(cov: &Pixmap) -> Vec<f32> {
     g.iter().map(|s| if *s > 0.0 { (s.sqrt() - 0.5).max(0.0) as f32 } else { 0.0 }).collect()
 }
 
-/// Running-sum box blur of a `w` × `h` field along its rows, radius `r`, zero outside.
-fn box_pass(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize) {
+/// Running-sum box blur of a `w` × `h` field along rows (`stride` 1) or columns (`stride` `w`),
+/// radius `r`, zero outside.
+fn box_pass(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize, rows: bool) {
+    let (lines, len, step, across) = if rows { (h, w, 1, w) } else { (w, h, w, 1) };
     let norm = 1.0 / (2 * r + 1) as f32;
-    for l in 0..h {
-        let base = l * w;
-        let at = |i: usize| src.get(base + i).copied().unwrap_or(0.0);
-        let mut acc: f32 = (0..=r.min(w.saturating_sub(1))).map(at).sum();
-        for i in 0..w {
-            if let Some(o) = dst.get_mut(base + i) {
+    for l in 0..lines {
+        let base = l * across;
+        let at = |i: usize| src.get(base + i * step).copied().unwrap_or(0.0);
+        let mut acc: f32 = (0..=r.min(len.saturating_sub(1))).map(at).sum();
+        for i in 0..len {
+            if let Some(o) = dst.get_mut(base + i * step) {
                 *o = acc * norm;
             }
-            if i + r + 1 < w {
+            if i + r + 1 < len {
                 acc += at(i + r + 1);
             }
             if i >= r {
                 acc -= at(i - r);
-            }
-        }
-    }
-}
-
-/// [`box_pass`] down the columns: a running sum per column, row by row, so every read and write is
-/// a row in memory (a pass down a column would take a cache miss per pixel).
-fn box_pass_cols(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize) {
-    let norm = 1.0 / (2 * r + 1) as f32;
-    let mut acc = vec![0f32; w];
-    for y in 0..=r.min(h.saturating_sub(1)) {
-        let base = y * w;
-        for x in 0..w {
-            if let (Some(a), Some(s)) = (acc.get_mut(x), src.get(base + x)) {
-                *a += *s;
-            }
-        }
-    }
-    for y in 0..h {
-        let base = y * w;
-        for x in 0..w {
-            if let (Some(a), Some(d)) = (acc.get(x), dst.get_mut(base + x)) {
-                *d = a * norm;
-            }
-        }
-        if y + r + 1 < h {
-            let add = (y + r + 1) * w;
-            for x in 0..w {
-                if let (Some(a), Some(s)) = (acc.get_mut(x), src.get(add + x)) {
-                    *a += *s;
-                }
-            }
-        }
-        if y >= r {
-            let sub = (y - r) * w;
-            for x in 0..w {
-                if let (Some(a), Some(s)) = (acc.get_mut(x), src.get(sub + x)) {
-                    *a -= *s;
-                }
             }
         }
     }
@@ -176,8 +148,8 @@ fn smooth_normals(dist: &[f32], w: usize, h: usize, r: usize) -> Vec<(f32, f32)>
     let mut tmp = vec![0f32; w * h];
     for g in [&mut gx, &mut gy] {
         for _ in 0..2 {
-            box_pass(g, &mut tmp, w, h, r);
-            box_pass_cols(&tmp, g, w, h, r);
+            box_pass(g, &mut tmp, w, h, r, true);
+            box_pass(&tmp, g, w, h, r, false);
         }
     }
     gx.iter()
@@ -189,136 +161,8 @@ fn smooth_normals(dist: &[f32], w: usize, h: usize, r: usize) -> Vec<(f32, f32)>
         .collect()
 }
 
-/// The part of a pane's pixels that depends only on its shape, its size and the zoom — not on
-/// where it sits or what is behind it: its coverage's distance field and the normals smoothed from
-/// it. A drag moves a pane without changing any of that, so every frame after the first finds them
-/// (a render from scratch would work them out again).
-struct Geometry {
-    /// What it was worked out from, compared exactly on the way in.
-    shape: Outline,
-    key: Key,
-    /// Which geometry this is, for an accelerator keeping it as textures.
-    id: u64,
-    /// The coverage's alpha, `cw` × `ch`.
-    cw: usize,
-    ch: usize,
-    alpha: Vec<u8>,
-    dist: Vec<f32>,
-    normals: Vec<(f32, f32)>,
-    /// What it takes, for the cache's budget.
-    bytes: usize,
-}
-
-/// Kept geometry, least recently used first.
-static GEOMETRY: OnceLock<Mutex<Vec<Arc<Geometry>>>> = OnceLock::new();
-
-/// Keys worked out lately: a pane's geometry is kept once it is asked for again, so a resize or a
-/// zoom (a new shape every frame) doesn't fill the cache with what is never reused.
-static SEEN: OnceLock<Mutex<std::collections::VecDeque<Key>>> = OnceLock::new();
-
-/// The most keys remembered (a few panes' bands, a few frames back).
-const SEEN_MAX: usize = 64;
-
-/// What a pane's geometry is keyed by: its coverage's size, the margin and smoothing, and the grid
-/// it is rasterised on.
-type Key = (u32, u32, u32, usize, [u64; 6]);
-
-/// The most the kept geometry may take (bytes; an entry is about 12 bytes a pixel).
-const GEOMETRY_BUDGET: usize = 64 << 20;
-
-// How many geometries this thread worked out (tests: a moved pane works out none).
-#[cfg(test)]
-thread_local! {
-    static COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-fn computed() -> usize {
-    COMPUTED.with(|c| c.get())
-}
-
-/// The transform a pane's pixels are rasterised with, bit for bit: a render that cuts the pane
-/// (a band, a patch) shifts it, while moving the pane leaves it alone.
-fn grid(xf: Affine) -> [u64; 6] {
-    xf.as_coeffs().map(f64::to_bits)
-}
-
-/// The geometry of a pane with `cov`erage (its shape through `xf`, grown by `m` each way, smoothed
-/// over `r` pixels), from the cache when this pane was drawn before.
-fn geometry(shape: &Outline, xf: Affine, m: u32, r: usize, cov: &Pixmap) -> Arc<Geometry> {
-    let (cw, ch) = (cov.width(), cov.height());
-    let key: Key = (cw, ch, m, r, grid(xf));
-    let cache = GEOMETRY.get_or_init(|| Mutex::new(Vec::new()));
-    if let Ok(mut kept) = cache.lock()
-        && let Some(i) = kept.iter().position(|g| g.key == key && g.shape == *shape)
-    {
-        let g = kept.remove(i);
-        kept.push(g.clone());
-        return g;
-    }
-    let dist = inside_distance(cov);
-    let normals = smooth_normals(&dist, cw as usize, ch as usize, r);
-    #[cfg(test)]
-    COMPUTED.with(|c| c.set(c.get() + 1));
-    let alpha: Vec<u8> = cov.data().chunks_exact(4).map(|p| p.get(3).copied().unwrap_or(0)).collect();
-    let bytes = alpha.len() + dist.len() * std::mem::size_of::<f32>() + normals.len() * std::mem::size_of::<(f32, f32)>();
-    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let g = Arc::new(Geometry { shape: shape.clone(), key, id, cw: cw as usize, ch: ch as usize, alpha, dist, normals, bytes });
-    // Kept from the second sight on: a moving pane asks for its geometry every frame, while a
-    // resize or a zoom never asks twice (keeping those would only fill memory).
-    if seen(&key)
-        && bytes <= GEOMETRY_BUDGET
-        && let Ok(mut kept) = cache.lock()
-    {
-        let mut total: usize = kept.iter().map(|g| g.bytes).sum();
-        while total.saturating_add(bytes) > GEOMETRY_BUDGET && !kept.is_empty() {
-            total = total.saturating_sub(kept.remove(0).bytes);
-        }
-        kept.push(g.clone());
-    }
-    g
-}
-
-/// Whether `key` was worked out before (remembering it for the next time).
-fn seen(key: &Key) -> bool {
-    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::VecDeque::new()));
-    let Ok(mut seen) = seen.lock() else { return false };
-    if seen.contains(key) {
-        return true;
-    }
-    if seen.len() >= SEEN_MAX {
-        seen.pop_front();
-    }
-    seen.push_back(*key);
-    false
-}
-
-/// Empty the kept geometry (tests).
-#[cfg(test)]
-fn clear_geometry() {
-    if let Some(cache) = GEOMETRY.get()
-        && let Ok(mut kept) = cache.lock()
-    {
-        kept.clear();
-    }
-    if let Some(seen) = SEEN.get()
-        && let Ok(mut seen) = seen.lock()
-    {
-        seen.clear();
-    }
-}
-
-/// The kept geometry is one cache for the whole process: the tests that empty it take turns.
-#[cfg(test)]
-fn geometry_turn() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 /// Bilinear sample of premultiplied `p` at pixel coordinates `(x, y)` (centres at +0.5), each
 /// channel 0..=255; transparent outside.
-#[inline]
 fn sample(p: &Pixmap, x: f32, y: f32) -> [f32; 4] {
     let (w, h) = (p.width() as i64, p.height() as i64);
     let (x, y) = (x - 0.5, y - 0.5);
@@ -326,25 +170,6 @@ fn sample(p: &Pixmap, x: f32, y: f32) -> [f32; 4] {
     let (tx, ty) = (x - x0, y - y0);
     let (x0, y0) = (x0 as i64, y0 as i64);
     let data = p.data();
-    // Wholly inside (the common case): two rows of two texels, read in one piece each.
-    if x0 >= 0 && y0 >= 0 && x0 + 1 < w && y0 + 1 < h {
-        let i = ((y0 * w + x0) * 4) as usize;
-        let j = i + w as usize * 4;
-        if let (Some(r0), Some(r1)) = (data.get(i..i + 8), data.get(j..j + 8)) {
-            let lerp = |a: u8, b: u8, c: u8, d: u8| {
-                let (a, b, c, d) = (f32::from(a), f32::from(b), f32::from(c), f32::from(d));
-                let top = a + (b - a) * tx;
-                let bot = c + (d - c) * tx;
-                top + (bot - top) * ty
-            };
-            return [
-                lerp(r0[0], r0[4], r1[0], r1[4]),
-                lerp(r0[1], r0[5], r1[1], r1[5]),
-                lerp(r0[2], r0[6], r1[2], r1[6]),
-                lerp(r0[3], r0[7], r1[3], r1[7]),
-            ];
-        }
-    }
     let px = |xi: i64, yi: i64| -> [f32; 4] {
         if xi < 0 || yi < 0 || xi >= w || yi >= h {
             return [0.0; 4];
@@ -373,6 +198,303 @@ fn light_reach(band: f64, intensity: f64) -> f64 {
 /// The light reaches no further in than this many pixels (a wide light on a deep pane at a high
 /// zoom would otherwise need a huge margin of coverage around every cut).
 const MAX_LIGHT_PX: f64 = 512.0;
+
+/// A shape's coverage (alpha), distance to its edge and smoothed inward normals over a window of
+/// pixels whose top-left pixel is (`x0`, `y0`).
+struct Fields {
+    x0: i64,
+    y0: i64,
+    w: usize,
+    h: usize,
+    cov: Vec<u8>,
+    dist: Vec<f32>,
+    normals: Vec<(f32, f32)>,
+}
+
+/// Bytes a field pixel holds: coverage, distance and a normal.
+const FIELD_PX_BYTES: u64 = 1 + 4 + 8;
+
+impl Fields {
+    /// The fields of `cov`, the shape's coverage on the window at (`x0`, `y0`), normals smoothed
+    /// over `r` pixels.
+    fn new(cov: &Pixmap, x0: i64, y0: i64, r: usize) -> Fields {
+        FIELDS_COMPUTED.with(|n| n.set(n.get() + 1));
+        let dist = inside_distance(cov);
+        let (w, h) = (cov.width() as usize, cov.height() as usize);
+        let normals = smooth_normals(&dist, w, h, r);
+        let cov = cov.data().chunks_exact(4).map(|p| p.get(3).copied().unwrap_or(0)).collect();
+        Fields { x0, y0, w, h, cov, dist, normals }
+    }
+
+    /// Coverage (0–1), distance and inward normal at pixel (`x`, `y`); `None` outside the window.
+    fn at(&self, x: i64, y: i64) -> Option<(f32, f32, (f32, f32))> {
+        let (fx, fy) = (x.checked_sub(self.x0)?, y.checked_sub(self.y0)?);
+        if fx < 0 || fy < 0 || fx >= self.w as i64 || fy >= self.h as i64 {
+            return None;
+        }
+        let i = fy as usize * self.w + fx as usize;
+        Some((f32::from(*self.cov.get(i)?) / 255.0, *self.dist.get(i)?, *self.normals.get(i)?))
+    }
+}
+
+thread_local! {
+    static FIELDS_COMPUTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread has worked out a glass shape's fields: what a cache miss costs. For
+/// tests and benchmarks.
+pub fn glass_fields_computed() -> u64 {
+    FIELDS_COMPUTED.with(std::cell::Cell::get)
+}
+
+/// What a glass shape's fields depend on, with the transform's translation reduced to its fraction
+/// of a pixel: the same shape at the same zoom has the same key wherever it is and however a render
+/// cuts it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ShapeKey {
+    path: u64,
+    linear: [u64; 4],
+    frac: (i64, i64),
+    margin: u32,
+    r: usize,
+}
+
+/// The cached fields of a shape whose window holds at most this many pixels; bigger shapes (a
+/// pane far larger than the view) are worked out for the part a render shows each time.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_SHAPE_PX: u64 = 4 << 20;
+#[cfg(target_arch = "wasm32")]
+const MAX_SHAPE_PX: u64 = 1 << 20;
+/// Bytes the glass shape cache holds at most (less on the web, where memory never shrinks).
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_CACHED_BYTES: u64 = 128 << 20;
+#[cfg(target_arch = "wasm32")]
+const MAX_CACHED_BYTES: u64 = 32 << 20;
+
+/// A shape's fields once worked out; parallel bands wanting the same shape wait for one of them.
+type Slot = Arc<OnceLock<Option<Arc<Fields>>>>;
+
+/// The shapes' fields by key, at most `budget` bytes; the least recently used go first. A shape is
+/// kept from the second render that asks for it: one asked for once (each step of a zoom, a pane
+/// dragged by fractions of a pixel) is cheaper worked out for just the part a render shows.
+struct ShapeCache {
+    map: HashMap<ShapeKey, (Slot, u64, u64)>,
+    /// Shapes asked for but not kept, by the render that first asked.
+    seen: HashMap<ShapeKey, u64>,
+    held: u64,
+    tick: u64,
+    budget: u64,
+}
+
+/// Shapes remembered as asked for once; past this many they are forgotten.
+const MAX_SEEN: usize = 256;
+
+impl ShapeCache {
+    fn new(budget: u64) -> Self {
+        Self { map: HashMap::new(), seen: HashMap::new(), held: 0, tick: 0, budget }
+    }
+
+    /// The slot for `key` (filled or about to be) asked for in render number `render`, making room
+    /// for `bytes`; `None` when it isn't kept (first asked for in this render, or too big).
+    fn slot(&mut self, key: &ShapeKey, bytes: u64, render: u64) -> Option<Slot> {
+        self.tick += 1;
+        if let Some((slot, _, used)) = self.map.get_mut(key) {
+            *used = self.tick;
+            return Some(slot.clone());
+        }
+        if bytes > self.budget {
+            return None;
+        }
+        match self.seen.get(key) {
+            Some(first) if *first < render => {
+                self.seen.remove(key);
+            }
+            Some(_) => return None,
+            None => {
+                if self.seen.len() >= MAX_SEEN {
+                    self.seen.clear();
+                }
+                self.seen.insert(key.clone(), render);
+                return None;
+            }
+        }
+        while self.held + bytes > self.budget {
+            let oldest = self.map.iter().min_by_key(|(_, (_, _, used))| *used).map(|(k, _)| k.clone())?;
+            if let Some((_, b, _)) = self.map.remove(&oldest) {
+                self.held -= b;
+            }
+        }
+        let slot = Slot::default();
+        self.map.insert(key.clone(), (slot.clone(), bytes, self.tick));
+        self.held += bytes;
+        Some(slot)
+    }
+}
+
+fn shape_cache() -> &'static Mutex<ShapeCache> {
+    static C: OnceLock<Mutex<ShapeCache>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(ShapeCache::new(MAX_CACHED_BYTES)))
+}
+
+/// The fields `glass` reads for a `w` × `h` layer whose `shape` maps through `xf` (local → layer
+/// pixels), exact for distances up to the margin `m`, normals smoothed over `r` pixels, and the
+/// shift from layer pixels to the fields' pixels.
+///
+/// A shape asked for again in a later render, whose window fits [`MAX_SHAPE_PX`], is worked out
+/// whole, in its own frame (the translation's fraction of a pixel), and kept: a band, a canvas
+/// patch or the next frame of a drag reads the same fields. Otherwise it is worked out for the part
+/// shown plus the margin.
+fn shape_fields(shape: &Outline, xf: Affine, w: u32, h: u32, m: u32, r: usize) -> Option<(Arc<Fields>, (i64, i64))> {
+    if let Some(whole) = whole_shape(shape, xf, m, r) {
+        return Some(whole);
+    }
+    let cov = spread_alpha(std::slice::from_ref(shape), 0.0, Affine::translate((f64::from(m), f64::from(m))) * xf, w + 2 * m, h + 2 * m)?;
+    Some((Arc::new(Fields::new(&cov, -i64::from(m), -i64::from(m), r)), (0, 0)))
+}
+
+/// [`shape_fields`] for a whole shape, from the cache; `None` when it isn't kept (first asked for
+/// in this render, too big, or its transform too far out).
+fn whole_shape(shape: &Outline, xf: Affine, m: u32, r: usize) -> Option<(Arc<Fields>, (i64, i64))> {
+    let [a, b, c, d, e, f] = xf.as_coeffs();
+    // The translation in steps of 1/65536 px (far finer than the rasteriser's 1/64, coarse enough
+    // that rounding errors in where a render starts land on the same step), its whole pixels (the
+    // shift) and the fraction left; rounding first carries 99.9999999 over to 100.
+    const STEPS: f64 = 65536.0;
+    let q = |v: f64| {
+        let q = (v * STEPS).round();
+        (q.is_finite() && q.abs() < 1e15).then_some(q as i64)
+    };
+    let (qe, qf) = (q(e)?, q(f)?);
+    let shift = (qe.div_euclid(STEPS as i64), qf.div_euclid(STEPS as i64));
+    let frac = (qe.rem_euclid(STEPS as i64), qf.rem_euclid(STEPS as i64));
+    let own = Affine::new([a, b, c, d, frac.0 as f64 / STEPS, frac.1 as f64 / STEPS]);
+    let bb = (own * shape.0.clone()).bounding_box();
+    let (x0, y0, x1, y1) = (bb.x0.floor(), bb.y0.floor(), bb.x1.ceil(), bb.y1.ceil());
+    if ![x0, y0, x1, y1].iter().all(|v| v.is_finite() && v.abs() < 1e9) {
+        return None;
+    }
+    // The margin in steps of 32 px, so dragging a slider that widens it a little keeps the same
+    // fields (a wider margin only adds exact distances further out: the same pixels).
+    let margin = m.div_ceil(32).checked_mul(32)?;
+    let (rw, rh) = ((x1 - x0) as u64 + 2, (y1 - y0) as u64 + 2);
+    let (ww, wh) = (rw + 2 * u64::from(margin), rh + 2 * u64::from(margin));
+    if ww.checked_mul(wh)? > MAX_SHAPE_PX {
+        return None;
+    }
+    let mut hasher = DefaultHasher::new();
+    crate::draw::hash_path(&shape.0, &mut hasher);
+    matches!(shape.1, tiny_skia::FillRule::EvenOdd).hash(&mut hasher);
+    let key = ShapeKey { path: hasher.finish(), linear: [a, b, c, d].map(f64::to_bits), frac, margin, r };
+    let compute = || {
+        // Rastered against the shape's own bounds (not the window), so the margin can't move a
+        // coverage value.
+        let raster = spread_alpha(std::slice::from_ref(shape), 0.0, Affine::translate((1.0 - x0, 1.0 - y0)) * own, rw as u32, rh as u32)?;
+        let mut win = Pixmap::new(ww as u32, wh as u32)?;
+        let (row, at) = (raster.width() as usize * 4, (margin as usize, margin as usize));
+        let stride = win.width() as usize * 4;
+        for (y, src) in raster.data().chunks_exact(row).enumerate() {
+            let start = (y + at.1) * stride + at.0 * 4;
+            win.data_mut().get_mut(start..start + row)?.copy_from_slice(src);
+        }
+        let origin = (x0 as i64 - 1 - i64::from(margin), y0 as i64 - 1 - i64::from(margin));
+        Some(Fields::new(&win, origin.0, origin.1, r))
+    };
+    let slot =
+        shape_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner).slot(&key, ww * wh * FIELD_PX_BYTES, crate::render_number())?;
+    Some((slot.get_or_init(|| compute().map(Arc::new)).clone()?, shift))
+}
+
+/// The part of a pane's pixels that depends only on its shape, its size and the zoom — not on
+/// where it sits or what is behind it: its coverage's distance field and the normals smoothed from
+/// it. A drag moves a pane without changing any of that, so every frame after the first finds them
+/// (a render from scratch would work them out again). An accelerator keeps them as textures.
+struct Geometry {
+    /// What it was worked out from, compared exactly on the way in.
+    shape: Outline,
+    key: Key,
+    /// Which geometry this is, for an accelerator keeping it as textures.
+    id: u64,
+    /// The coverage's alpha, `cw` × `ch`.
+    cw: usize,
+    ch: usize,
+    alpha: Vec<u8>,
+    dist: Vec<f32>,
+    normals: Vec<(f32, f32)>,
+    /// What it takes, for the cache's budget.
+    bytes: usize,
+}
+
+/// Kept geometry, least recently used first.
+static GEOMETRY: OnceLock<Mutex<Vec<Arc<Geometry>>>> = OnceLock::new();
+
+/// Keys worked out lately: a pane's geometry is kept once it is asked for again, so a resize or a
+/// zoom (a new shape every frame) doesn't fill the cache with what is never reused.
+static SEEN_GEOMETRY: OnceLock<Mutex<std::collections::VecDeque<Key>>> = OnceLock::new();
+
+/// The most keys remembered (a few panes' bands, a few frames back).
+const SEEN_MAX: usize = 64;
+
+/// What a pane's geometry is keyed by: its coverage's size, the margin and smoothing, and the grid
+/// it is rasterised on.
+type Key = (u32, u32, u32, usize, [u64; 6]);
+
+/// The most the kept geometry may take (bytes; an entry is about 12 bytes a pixel).
+const GEOMETRY_BUDGET: usize = 64 << 20;
+
+/// The transform a pane's pixels are rasterised with, bit for bit: a render that cuts the pane
+/// (a band, a patch) shifts it, while moving the pane leaves it alone.
+fn grid(xf: Affine) -> [u64; 6] {
+    xf.as_coeffs().map(f64::to_bits)
+}
+
+/// The geometry of a pane with `cov`erage (its shape through `xf`, grown by `m` each way, smoothed
+/// over `r` pixels), from the cache when this pane was drawn before.
+fn geometry(shape: &Outline, xf: Affine, m: u32, r: usize, cov: &Pixmap) -> Arc<Geometry> {
+    let (cw, ch) = (cov.width(), cov.height());
+    let key: Key = (cw, ch, m, r, grid(xf));
+    let cache = GEOMETRY.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(mut kept) = cache.lock()
+        && let Some(i) = kept.iter().position(|g| g.key == key && g.shape == *shape)
+    {
+        let g = kept.remove(i);
+        kept.push(g.clone());
+        return g;
+    }
+    let dist = inside_distance(cov);
+    let normals = smooth_normals(&dist, cw as usize, ch as usize, r);
+    let alpha: Vec<u8> = cov.data().chunks_exact(4).map(|p| p.get(3).copied().unwrap_or(0)).collect();
+    let bytes = alpha.len() + dist.len() * std::mem::size_of::<f32>() + normals.len() * std::mem::size_of::<(f32, f32)>();
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let g = Arc::new(Geometry { shape: shape.clone(), key, id, cw: cw as usize, ch: ch as usize, alpha, dist, normals, bytes });
+    // Kept from the second sight on: a moving pane asks for its geometry every frame, while a
+    // resize or a zoom never asks twice (keeping those would only fill memory).
+    if seen_geometry(&key)
+        && bytes <= GEOMETRY_BUDGET
+        && let Ok(mut kept) = cache.lock()
+    {
+        let mut total: usize = kept.iter().map(|g| g.bytes).sum();
+        while total.saturating_add(bytes) > GEOMETRY_BUDGET && !kept.is_empty() {
+            total = total.saturating_sub(kept.remove(0).bytes);
+        }
+        kept.push(g.clone());
+    }
+    g
+}
+
+/// Whether `key` was worked out before (remembering it for the next time).
+fn seen_geometry(key: &Key) -> bool {
+    let seen = SEEN_GEOMETRY.get_or_init(|| Mutex::new(std::collections::VecDeque::new()));
+    let Ok(mut seen) = seen.lock() else { return false };
+    if seen.contains(key) {
+        return true;
+    }
+    if seen.len() >= SEEN_MAX {
+        seen.pop_front();
+    }
+    seen.push_back(*key);
+    false
+}
 
 /// A pane's shape-only part — kept between frames by [`geometry`] — and the shader's parameters:
 /// everything but the frosted backdrop. The GPU canvas draws it from a backdrop texture; the CPU
@@ -476,116 +598,68 @@ pub fn pane(g: &Glass, shape: &Outline, w: u32, h: u32, xf: Affine, scale: f64) 
 /// `back`, its backdrop padded by `pad` pixels each way, at `scale` device pixels per unit.
 #[allow(clippy::too_many_arguments)]
 pub fn glass(g: &Glass, shape: &Outline, back: &Pixmap, pad: u32, w: u32, h: u32, xf: Affine, scale: f64) -> Option<Pixmap> {
-    let mut pane = pane(g, shape, w, h, xf, scale)?;
-    pane.pad = pad;
+    let g = g.sanitized();
+    let depth = (g.depth * scale).clamp(1.0, 1024.0);
+    let band = (depth * (0.15 + 0.35 * g.splay)).max(1.0);
+    let reach = light_reach(band, g.light_intensity);
+    let r = (depth * 0.1).clamp(1.0, 8.0) as usize;
+    // Coverage with a margin, so wherever the layer is cut every distance the pixels read is
+    // exact: the bend's (within `depth`), the light's (within `reach`) and those the normals are
+    // smoothed from (2r + 1 further).
+    let m = depth.max(reach).ceil() as u32 + 4 * r as u32 + 4;
+    let (fields, shift) = shape_fields(shape, xf, w, h, m, r)?;
     let mut frosted = back.clone();
-    fx::blur(&mut frosted, pane.frost_sigma);
-    let paint = fx::GlassPaint {
-        alpha: pane.alpha(),
-        dist: pane.dist(),
-        normals: pane.normals(),
-        cw: pane.cw(),
-        ch: pane.ch(),
-        m: pane.m,
-        frosted: &frosted,
-        w,
-        h,
-        pad,
-        depth: pane.depth,
-        bend_max: pane.bend_max,
-        fringe: pane.fringe,
-        power: pane.power,
-        band: pane.band,
-        reach: pane.reach,
-        floor: pane.floor,
-        fall: pane.fall,
-        intensity: pane.intensity,
-        light: pane.light,
-        geometry: pane.geometry_id(),
-    };
+    fx::blur(&mut frosted, g.frost / 2.0 * scale);
+    // The canvas's GPU, when one is installed, paints the pane from the shape it keeps as
+    // textures; the CPU path below draws the same pixels.
     if let Some(accelerator) = fx::accelerator()
-        && let Some(out) = accelerator.glass(&paint)
+        && let Some(mut pane) = pane(&g, shape, w, h, xf, scale)
     {
-        return Some(out);
-    }
-    let mut out = Pixmap::new(w, h)?;
-    let pane = Pane {
-        cov: pane.coverage.data(),
-        dist: pane.dist(),
-        normals: pane.normals(),
-        frosted: &frosted,
-        w: w as usize,
-        cw: pane.cw(),
-        m: pane.m as usize,
-        pad: pad as usize,
-        depth: paint.depth,
-        bend_max: paint.bend_max,
-        fringe: paint.fringe,
-        power: paint.power,
-        band: paint.band,
-        reach: paint.reach,
-        floor: paint.floor,
-        fall: paint.fall,
-        intensity: paint.intensity,
-        light: paint.light,
-    };
-    let row = w as usize * 4;
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use rayon::prelude::*;
-        // Rows are independent: one thread per band of rows, same pixels as one thread would draw.
-        if (w as usize).saturating_mul(h as usize) >= fx::PARALLEL_PIXELS {
-            out.data_mut().par_chunks_mut(row).enumerate().for_each(|(y, dst)| pane.row(y, dst));
-        } else {
-            for (y, dst) in out.data_mut().chunks_mut(row).enumerate() {
-                pane.row(y, dst);
-            }
+        pane.pad = pad;
+        let paint = fx::GlassPaint {
+            alpha: pane.alpha(),
+            dist: pane.dist(),
+            normals: pane.normals(),
+            cw: pane.cw(),
+            ch: pane.ch(),
+            m: pane.m,
+            frosted: &frosted,
+            w,
+            h,
+            pad,
+            depth: pane.depth,
+            bend_max: pane.bend_max,
+            fringe: pane.fringe,
+            power: pane.power,
+            band: pane.band,
+            reach: pane.reach,
+            floor: pane.floor,
+            fall: pane.fall,
+            intensity: pane.intensity,
+            light: pane.light,
+            geometry: pane.geometry_id(),
+        };
+        if let Some(out) = accelerator.glass(&paint) {
+            return Some(out);
         }
     }
-    #[cfg(target_arch = "wasm32")]
-    for (y, dst) in out.data_mut().chunks_mut(row).enumerate() {
-        pane.row(y, dst);
-    }
-    Some(out)
-}
-
-/// Everything a pane's pixels are computed from; one row at a time, so rows can run side by side.
-struct Pane<'a> {
-    cov: &'a [u8],
-    dist: &'a [f32],
-    normals: &'a [(f32, f32)],
-    frosted: &'a Pixmap,
-    w: usize,
-    cw: usize,
-    m: usize,
-    pad: usize,
-    depth: f32,
-    bend_max: f32,
-    fringe: f32,
-    power: f32,
-    band: f32,
-    reach: f32,
-    floor: f32,
-    fall: f32,
-    intensity: f32,
-    light: (f32, f32),
-}
-
-impl Pane<'_> {
-    /// Row `y` of the pane's pixels (premultiplied RGBA bytes, `w` pixels).
-    fn row(&self, y: usize, dst: &mut [u8]) {
-        let Pane { cov, dist, normals, frosted, w, cw, m, pad, depth, bend_max, fringe, power, band, reach, floor, fall, intensity, light } = *self;
-        // The three fields this row reads, as rows of their own: no per-pixel row arithmetic.
-        let my = y + m;
-        let (Some(cov_row), Some(dist_row), Some(norm_row)) =
-            (cov.get(my * cw * 4..(my + 1) * cw * 4), dist.get(my * cw..(my + 1) * cw), normals.get(my * cw..(my + 1) * cw))
-        else {
-            return;
-        };
-        for x in 0..w {
-            let i = x + m;
-            let (Some(&c), Some(&d), Some(&inward)) = (cov_row.get(i * 4 + 3), dist_row.get(i), norm_row.get(i)) else { continue };
-            let c = f32::from(c) / 255.0;
+    let ang = g.light_angle.to_radians();
+    let light = (ang.sin() as f32, -ang.cos() as f32);
+    let bend_max = (g.refraction * depth) as f32;
+    let fringe = (g.dispersion * 0.25) as f32;
+    let power = (6.0 - 5.0 * g.splay) as f32;
+    let (band, reach) = (band as f32, reach as f32);
+    // The falloff, lowered by its value at `reach` and scaled back to 1 at the edge, so the light
+    // fades out to 0 at `reach` instead of stopping there.
+    let floor = (-reach / band).exp();
+    let fall = 1.0 - floor;
+    let intensity = g.light_intensity as f32;
+    let depth = depth as f32;
+    let mut out = Pixmap::new(w, h)?;
+    let dst = out.data_mut();
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let Some((c, d, inward)) = fields.at(x as i64 - shift.0, y as i64 - shift.1) else { continue };
             if c <= 0.0 {
                 continue;
             }
@@ -595,10 +669,10 @@ impl Pane<'_> {
             let base = if bend == 0.0 {
                 // Nothing bends (past `depth`, or no refraction): the three channels' samples are
                 // at the same point, so one sample.
-                let s = sample(frosted, bx, by);
+                let s = sample(&frosted, bx, by);
                 [s[0].min(s[3]), s[1].min(s[3]), s[2].min(s[3]), s[3]]
             } else {
-                let at = |k: f32| sample(frosted, bx + inward.0 * bend * k, by + inward.1 * bend * k);
+                let at = |k: f32| sample(&frosted, bx + inward.0 * bend * k, by + inward.1 * bend * k);
                 let (rs, gs, bs) = (at(1.0 - fringe), at(1.0), at(1.0 + fringe));
                 let a = rs[3].max(gs[3]).max(bs[3]);
                 [rs[0].min(a), gs[1].min(a), bs[2].min(a), a]
@@ -612,14 +686,15 @@ impl Pane<'_> {
             } else {
                 0.0
             };
-            let at = x * 4;
-            if let Some(p) = dst.get_mut(at..at + 4) {
+            let i = (y * w as usize + x) * 4;
+            if let Some(p) = dst.get_mut(i..i + 4) {
                 for (o, v) in p.iter_mut().zip(base) {
                     *o = ((v * (1.0 - hl) + 255.0 * hl) * c).round().clamp(0.0, 255.0) as u8;
                 }
             }
         }
     }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -641,6 +716,28 @@ mod tests {
     }
 
     #[test]
+    fn the_shape_cache_stays_within_its_bytes() {
+        let key = |i: u64| ShapeKey { path: i, linear: [0; 4], frac: (0, 0), margin: 0, r: 1 };
+        let mut c = ShapeCache::new(100);
+        // Kept from the second render that asks, not the first (nor again within the first).
+        assert!(c.slot(&key(1), 40, 1).is_none());
+        assert!(c.slot(&key(1), 40, 1).is_none());
+        assert!(c.slot(&key(1), 40, 2).is_some());
+        for k in [2, 3] {
+            assert!(c.slot(&key(k), 40, 2).is_none());
+        }
+        assert!(c.slot(&key(2), 40, 3).is_some());
+        // Using 1 again makes 2 the least recently used: 2 goes to make room for 3.
+        assert!(c.slot(&key(1), 40, 3).is_some());
+        assert!(c.slot(&key(3), 40, 3).is_some());
+        assert!(c.held <= 100, "{}", c.held);
+        assert!(c.map.contains_key(&key(1)) && c.map.contains_key(&key(3)) && !c.map.contains_key(&key(2)));
+        // More than it holds in all: never kept.
+        assert!(c.slot(&key(4), 101, 3).is_none() && c.slot(&key(4), 101, 4).is_none());
+        assert!(c.held <= 100 && !c.map.contains_key(&key(4)));
+    }
+
+    #[test]
     fn light_reach_is_where_the_light_falls_under_half_a_level() {
         let r = light_reach(10.0, 1.0);
         assert!((255.0 * (-r / 10.0).exp() - 0.5).abs() < 1e-9, "{r}");
@@ -649,82 +746,5 @@ mod tests {
             assert_eq!(light_reach(band, intensity), 0.0, "{band} {intensity}");
         }
         assert_eq!(light_reach(1e6, 1.0), MAX_LIGHT_PX);
-    }
-
-    /// A rounded pane's outline and its coverage (for the geometry cache).
-    fn pane(w: u32, h: u32) -> (Outline, Pixmap) {
-        let mut path = figcraft_geom::kurbo::BezPath::new();
-        path.move_to((4.0, 4.0));
-        path.line_to((f64::from(w) - 4.0, 4.0));
-        path.line_to((f64::from(w) - 4.0, f64::from(h) - 4.0));
-        path.line_to((4.0, f64::from(h) - 4.0));
-        path.close_path();
-        let mut cov = Pixmap::new(w, h).unwrap();
-        let r = tiny_skia::Rect::from_xywh(4.0, 4.0, (w - 8) as f32, (h - 8) as f32).unwrap();
-        let paint = tiny_skia::Paint { shader: tiny_skia::Shader::SolidColor(tiny_skia::Color::WHITE), ..Default::default() };
-        cov.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
-        ((path, tiny_skia::FillRule::Winding), cov)
-    }
-
-    #[test]
-    fn the_geometry_of_a_pane_is_kept_between_frames() {
-        let _turn = geometry_turn();
-        clear_geometry();
-        let (a, cov) = pane(100, 80);
-        let (b, _) = pane(100, 80);
-        let xf = Affine::scale(1.0);
-        // The first sight is worked out, the second keeps it for the frames after.
-        let first = geometry(&a, xf, 8, 2, &cov);
-        let kept = geometry(&a, xf, 8, 2, &cov);
-        assert!(!Arc::ptr_eq(&first, &kept), "the first sight isn't kept yet");
-        assert!(Arc::ptr_eq(&kept, &geometry(&b, xf, 8, 2, &cov)), "the same pane finds its geometry");
-        // Another shape, zoom, margin or rasterised offset is worked out anew.
-        let mut other = pane(100, 80).0;
-        other.0.line_to((90.0, 70.0));
-        assert!(!Arc::ptr_eq(&kept, &geometry(&other, xf, 8, 2, &cov)), "another shape");
-        assert!(!Arc::ptr_eq(&kept, &geometry(&a, Affine::scale(2.0), 8, 2, &cov)), "another zoom");
-        assert!(!Arc::ptr_eq(&kept, &geometry(&a, Affine::translate((3.0, 5.0)) * xf, 8, 2, &cov)), "another offset");
-        assert!(!Arc::ptr_eq(&kept, &geometry(&a, xf, 9, 2, &cov)), "another margin");
-        assert!(!Arc::ptr_eq(&kept, &geometry(&a, xf, 8, 3, &cov)), "another smoothing");
-    }
-
-    #[test]
-    fn a_dragged_pane_reuses_its_geometry_and_draws_what_a_fresh_one_does() {
-        use crate::{Options, View, render_view};
-        use figcraft_color::{Color, Paint};
-        use figcraft_doc::{Document, Effect, EffectKind, NodeKind};
-
-        let _turn = geometry_turn();
-        let mut d = Document::new("glass");
-        let p = d.first_page().unwrap();
-        // Stripes under the pane, so where it sits shows in what it bends.
-        for (i, hex) in ["#e03030", "#2040e0", "#20c060"].into_iter().enumerate() {
-            let s = d.create(p, NodeKind::Rectangle, "Stripe", 8.0 + i as f64 * 20.0, 8.0, 20.0, 60.0).unwrap();
-            d.get_mut(s).unwrap().fills = vec![Paint::solid(Color::from_hex(hex).unwrap())];
-        }
-        let pane = d.create(p, NodeKind::Rectangle, "Glass", 0.0, 0.0, 60.0, 40.0).unwrap();
-        {
-            let n = d.get_mut(pane).unwrap();
-            n.transform = Affine::translate((20.0, 20.0));
-            n.corners.radii = [8.0; 4];
-            n.fills = vec![Paint::solid(Color { a: 0.2, ..Color::WHITE })];
-            n.effects = vec![Effect { kind: EffectKind::Glass(Glass::default()), visible: true }];
-        }
-        let view = View { origin: (0.0, 0.0), scale: 1.0, width: 120, height: 100 };
-        clear_geometry();
-        let before = render_view(&d, p, &view, &Options::default()).unwrap();
-        // The frame after works it out once more, and keeps it from then on.
-        let _ = render_view(&d, p, &view, &Options::default()).unwrap();
-        let settled = computed();
-        assert!(settled > 0, "the first frames work the geometry out");
-        // Seven pixels on: the pane's own geometry is the one kept from the frame before.
-        d.get_mut(pane).unwrap().transform = Affine::translate((27.0, 20.0));
-        let moved = render_view(&d, p, &view, &Options::default()).unwrap();
-        assert_eq!(computed(), settled, "the moved pane reused its geometry");
-        assert_ne!(before.data(), moved.data(), "the pane moved over its backdrop");
-        // Emptied, the cache draws the same pixels as the kept geometry did.
-        clear_geometry();
-        let fresh = render_view(&d, p, &view, &Options::default()).unwrap();
-        assert_eq!(moved.data(), fresh.data(), "kept geometry draws what a fresh one does");
     }
 }

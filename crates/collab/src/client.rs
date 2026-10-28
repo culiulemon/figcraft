@@ -41,6 +41,8 @@ pub struct Client {
     /// The session joined (see [`ServerMsg::Welcome`]).
     session: u64,
     id: u32,
+    /// What this client resumes its id with (see [`Resume::secret`]).
+    secret: u64,
     /// The server's state as of `seq`.
     confirmed: Replica,
     seq: u64,
@@ -84,7 +86,7 @@ impl Client {
 
     /// Start from the server's `Welcome` (which must carry a snapshot).
     pub fn join(welcome: ServerMsg) -> Result<Client, Error> {
-        let ServerMsg::Welcome { session, client_id, seq, catch_up: CatchUp::Snapshot(snapshot), processed, peers, access } = welcome else {
+        let ServerMsg::Welcome { session, client_id, seq, catch_up: CatchUp::Snapshot(snapshot), processed, peers, access, secret } = welcome else {
             return Err(Error::Protocol("expected a welcome with the document".into()));
         };
         let mut confirmed = Replica::from_snapshot(&snapshot)?;
@@ -93,6 +95,7 @@ impl Client {
         Ok(Client {
             session,
             id: client_id,
+            secret,
             view: confirmed.clone(),
             confirmed,
             seq,
@@ -415,9 +418,10 @@ impl Client {
         ClientMsg::Hello(Hello { resume: Some(self.resume()), ..hello })
     }
 
-    /// What a reconnect resumes with: this client's session, id and last sequence number.
+    /// What a reconnect resumes with: this client's session, id, last sequence number and the
+    /// secret its id was given with.
     pub fn resume(&self) -> Resume {
-        Resume { session: self.session, client_id: self.id, seq: self.seq }
+        Resume { session: self.session, client_id: self.id, seq: self.seq, secret: self.secret }
     }
 
     /// Handle a message from the server. Returns messages to send: batches that were waiting for
@@ -458,10 +462,11 @@ impl Client {
                 Ok(Vec::new())
             }
             ServerMsg::Welcome { .. } if self.online => Err(Error::Protocol("already joined".into())),
-            ServerMsg::Welcome { session, client_id, seq, catch_up, processed, peers, access } => {
+            ServerMsg::Welcome { session, client_id, seq, catch_up, processed, peers, access, secret } => {
                 if session != self.session || client_id != self.id {
-                    return self.restart(ServerMsg::Welcome { session, client_id, seq, catch_up, processed, peers, access });
+                    return self.restart(ServerMsg::Welcome { session, client_id, seq, catch_up, processed, peers, access, secret });
                 }
+                self.secret = secret;
                 self.access = access;
                 self.rejoin(seq, catch_up, &processed, peers, recompute)
             }

@@ -8,6 +8,7 @@
 pub mod backdrop;
 pub mod blur;
 pub mod boolean;
+pub mod dots;
 pub mod draw;
 mod export_depth;
 pub mod fx;
@@ -22,6 +23,7 @@ pub mod pattern;
 pub mod retained;
 pub mod shadow;
 
+pub use dots::Dots;
 pub use draw::{layer_bounds, node_outline, paint_bounds, stroke_area, stroke_fill, stroke_rule, subtree_outline, ts_path};
 pub use export_depth::{ExportDepthError, MAX_EXPORT_DEPTH, check_export_depth};
 pub use fx::{Accelerator, GlassPaint, set_accelerator};
@@ -85,6 +87,10 @@ pub struct Options {
     /// layers that didn't change be kept between renders (see [`layers`]). `0` draws every render
     /// from the document, as exports and thumbnails must.
     pub doc_id: u64,
+    pub magnified_image_pixels: bool,
+    /// A dot grid over the background, under the layers (a board's canvas; drawn only where the
+    /// background is).
+    pub dots: Option<Dots>,
 }
 
 fn new_pixmap(w: u32, h: u32) -> Option<Pixmap> {
@@ -105,8 +111,23 @@ pub(crate) fn backdrop_reach(radius: f64, scale: f64) -> f64 {
     if radius > 0.0 { radius * 1.5 * scale + 3.0 } else { 0.0 }
 }
 
+/// Renders started (bands of one render count once): glass keeps the shapes a later render asks
+/// for again.
+static RENDERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The number of the render that just started.
+fn start_render() -> u64 {
+    RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// The number of the latest render started.
+pub(crate) fn render_number() -> u64 {
+    RENDERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Render a page region, splitting it into horizontal bands rendered in parallel (desktop).
 pub fn render_view(doc: &Document, page: NodeId, view: &View, opts: &Options) -> Option<Pixmap> {
+    start_render();
     #[cfg(not(target_arch = "wasm32"))]
     {
         let threads = rayon::current_num_threads().clamp(1, 16) as u32;
@@ -126,7 +147,7 @@ pub fn render_view(doc: &Document, page: NodeId, view: &View, opts: &Options) ->
             return Some(p);
         }
     }
-    render_view_single(doc, page, view, opts)
+    render_one(doc, page, view, opts)
 }
 
 /// Whether the page has a layer whose effects read its backdrop (glass, background blur).
@@ -156,7 +177,7 @@ fn render_bands(doc: &Document, page: NodeId, view: &View, opts: &Options, bands
             let top = y0.saturating_sub(overlap);
             let bottom = (y0 + h + overlap).min(view.height).max(y0 + h);
             let v = View { origin: (view.origin.0, view.origin.1 + f64::from(top) / s), scale: view.scale, width: view.width, height: bottom - top };
-            let part = render_view_single(doc, page, &v, opts);
+            let part = render_one(doc, page, &v, opts);
             let own = tiny_skia::IntRect::from_xywh(0, (y0 - top) as i32, view.width.clamp(1, 16_384), h);
             (y0, if overlap == 0 { part } else { part.zip(own).and_then(|(p, r)| p.clone_rect(r)) })
         })
@@ -180,6 +201,12 @@ fn render_bands(doc: &Document, page: NodeId, view: &View, opts: &Options, bands
 
 /// Render a page region on the calling thread.
 pub fn render_view_single(doc: &Document, page: NodeId, view: &View, opts: &Options) -> Option<Pixmap> {
+    start_render();
+    render_one(doc, page, view, opts)
+}
+
+/// [`render_view_single`] as part of a render already started (one of its bands).
+fn render_one(doc: &Document, page: NodeId, view: &View, opts: &Options) -> Option<Pixmap> {
     let mut pix = new_pixmap(view.width, view.height)?;
     let bg = opts.background.or_else(|| match doc.node(page).map(|p| &p.kind) {
         Some(NodeKind::Page { background, .. }) => Some(*background),
@@ -187,6 +214,9 @@ pub fn render_view_single(doc: &Document, page: NodeId, view: &View, opts: &Opti
     });
     if let Some(bg) = bg {
         pix.fill(paint::ts_color(bg));
+        if let Some(d) = &opts.dots {
+            dots::draw(&mut pix, view, d);
+        }
     }
     let lod = opts.lod && !opts.outline_mode && view.scale <= lod::MAX_SCALE;
     let bounds = draw::Bounds::default();
@@ -198,6 +228,7 @@ pub fn render_view_single(doc: &Document, page: NodeId, view: &View, opts: &Opti
         outlined: &opts.outlined,
         skip: &opts.skip,
         lod,
+        magnified_image_pixels: opts.magnified_image_pixels,
         under: None,
         time: 0.0,
         bounds: &bounds,
@@ -233,6 +264,7 @@ fn nodes_into(doc: &Document, ids: &[NodeId], view: &View, pix: &mut Pixmap, tim
         outlined: &[],
         skip: &[],
         lod: false,
+        magnified_image_pixels: false,
         under: None,
         time,
         bounds: &bounds,
@@ -417,7 +449,7 @@ pub fn encode_webp(p: &Pixmap) -> Result<Vec<u8>, String> {
 /// Encode an export in `format` (PNG, JPEG over white, WebP) tagged with the document's colour
 /// `profile`. An sRGB PNG gets an `sRGB` chunk; a Display P3 PNG gets the profile as `iCCP` plus
 /// `cICP` code points; Display P3 JPEG and WebP files embed the ICC profile (untagged files are read
-/// as sRGB). SVG and PDF are not pixel formats: an error.
+/// as sRGB). SVG, PDF and Vector Drawable are not pixel formats: an error.
 pub fn encode_export(p: &Pixmap, format: ExportFormat, profile: ColorProfile) -> Result<Vec<u8>, String> {
     let icc = (!profile.is_srgb()).then(|| profile.icc());
     match format {
@@ -427,7 +459,7 @@ pub fn encode_export(p: &Pixmap, format: ExportFormat, profile: ColorProfile) ->
         }
         ExportFormat::Jpg => jpeg_with(p, Color::WHITE, 90, icc),
         ExportFormat::Webp => webp_with(p, icc),
-        ExportFormat::Svg | ExportFormat::Pdf => Err(format!("{} is not a pixel format", format.label())),
+        ExportFormat::Svg | ExportFormat::Pdf | ExportFormat::VectorDrawable => Err(format!("{} is not a pixel format", format.label())),
     }
 }
 
@@ -463,6 +495,8 @@ mod boolean_cache_tests;
 #[cfg(test)]
 mod bounds_memo_tests;
 #[cfg(test)]
+mod dots_tests;
+#[cfg(test)]
 mod effect_order_tests;
 #[cfg(test)]
 mod effects_behaviour_tests;
@@ -484,6 +518,8 @@ mod image_profile_tests;
 mod layers_tests;
 #[cfg(test)]
 mod lod_tests;
+#[cfg(test)]
+mod magnified_image_tests;
 #[cfg(test)]
 mod paint_behaviour_tests;
 #[cfg(test)]

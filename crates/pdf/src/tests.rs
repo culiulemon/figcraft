@@ -271,3 +271,30 @@ fn sample_files() {
         std::fs::write(format!("{stem}-{}.pdf", i + 1), export_pdf(&d, &[*f], &PdfOptions::default()).unwrap()).unwrap();
     }
 }
+
+/// A tiny PNG whose header claims 30,000 × 30,000 RGBA (3.6 GB decoded) is refused when it is read,
+/// before anything is decoded: the PDF writer is craft-libs' patched krilla.
+#[test]
+fn a_png_that_decodes_too_large_is_refused() {
+    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+        let mut crc = flate2::Crc::new();
+        crc.update(kind);
+        crc.update(data);
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        out.extend_from_slice(&crc.sum().to_be_bytes());
+    }
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&30_000u32.to_be_bytes());
+    ihdr.extend_from_slice(&30_000u32.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut z, &[0; 64]).unwrap();
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    chunk(&mut png, b"IHDR", &ihdr);
+    chunk(&mut png, b"IDAT", &z.finish().unwrap());
+    chunk(&mut png, b"IEND", &[]);
+    const { assert!(krilla::CRAFT_UNWIND_SAFE_DROP) };
+    assert!(krilla::image::Image::from_png(krilla::Data::from(png), true).is_err());
+}

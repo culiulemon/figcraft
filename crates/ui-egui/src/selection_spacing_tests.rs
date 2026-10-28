@@ -43,10 +43,11 @@ fn drag(u: &mut Ui, p: Pos2, by: egui::Vec2, release: bool) {
     }
 }
 
+/// Asserts typed and scrubbed spacing changes take effect with exactly one undo step.
 #[test]
 fn spacing_fields_type_scrub_and_keep_one_undo_step() {
     let (mut u, ids) = scene(true);
-    let field = Id::new(("selection_spacing", "horizontal"));
+    let field = Id::unique(("selection_spacing", "horizontal"));
     let p = u.ctx.read_response(field.with("field")).unwrap().rect.center();
     let history = u.app.session.undo_depth().0;
     u.button(p, true);
@@ -88,12 +89,14 @@ fn canvas_gap_drag_keeps_selection_and_undo_redo_for_both_grid_axes() {
     }
 }
 
+/// Asserts Escape rolls a spacing drag back, and releasing outside the window commits once
+/// while keeping the selection.
 #[test]
 fn escape_rolls_back_and_an_outside_release_finishes_the_gesture() {
     let (mut u, ids) = scene(false);
     let before = u.app.session.undo_depth().0;
     // A canvas handle takes the keyboard from a previously focused panel field.
-    let field = u.ctx.read_response(Id::new(("selection_spacing", "horizontal")).with("field")).unwrap().rect.center();
+    let field = u.ctx.read_response(Id::unique(("selection_spacing", "horizontal")).with("field")).unwrap().rect.center();
     u.button(field, true);
     u.button(field, false);
     u.frame(vec![]);

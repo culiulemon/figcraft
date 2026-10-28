@@ -13,7 +13,7 @@ use crate::layers_drag_tests::Ui;
 
 /// A plugin whose first call shows a panel with every kind of control and whose later calls (the
 /// panel's events) make a rectangle.
-fn panel_module() -> Vec<u8> {
+pub(crate) fn panel_module() -> Vec<u8> {
     let spec = json!({"title": "Test panel", "controls": [
         {"type": "note", "label": "Hello from the plugin"},
         {"type": "number", "name": "size", "label": "Size", "value": 10},
@@ -89,14 +89,18 @@ fn an_open_plugin_panel_draws_no_frames_while_idle() {
     Harness::new(session()).assert_idle("a plugin panel");
 }
 
+/// Asserts a plugin colour field's swatch opens the picker on that field, a picked colour
+/// reaches the plugin, and a second plugin's panel opens while the first remains (two panels
+/// present).
 #[test]
 fn a_colour_field_opens_the_colour_picker_and_two_panels_show_side_by_side() {
     let mut u = Ui::new(session());
     u.ctx.enable_accesskit();
     u.frame(vec![]);
     let nodes = |u: &mut Ui| u.frame_output(vec![]).platform_output.accesskit_update.unwrap().nodes;
-    // The swatch beside a colour field opens the colour picker on it.
-    let swatch = nodes(&mut u).iter().map(|(_, n)| n).find(|n| n.label() == Some("Color")).and_then(|n| n.bounds()).unwrap();
+    // The swatch beside the accent field (named for that field, not just "Color") opens the
+    // colour picker on the plugin field, not on another colour control in the window.
+    let swatch = nodes(&mut u).iter().map(|(_, n)| n).find(|n| n.label() == Some("Accent Color")).and_then(|n| n.bounds()).unwrap();
     let at = Pos2::new(((swatch.x0 + swatch.x1) / 2.0) as f32, ((swatch.y0 + swatch.y1) / 2.0) as f32);
     u.button(at, true);
     u.button(at, false);

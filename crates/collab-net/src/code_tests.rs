@@ -87,7 +87,10 @@ fn a_local_share_is_joined_by_its_code_and_edits_sync() {
     let mut late = session("Cy");
     late.execute("collab.join", &json!({"code": shown})).unwrap();
     pump(&mut [&mut late], "the refusal", |s| matches!(s[0].live().status, Status::Failed { .. }));
-    assert!(late.live().status.label().contains("Couldn't join"), "{:?}", late.live().status);
+    // The port is free again: another program's host may have taken it, and that host refuses
+    // the code's secret.
+    let label = late.live().status.label();
+    assert!(label.contains("Couldn't join") || label.contains("The host refused"), "{label}");
 }
 
 #[test]
@@ -103,7 +106,10 @@ fn a_local_code_with_the_wrong_secret_or_a_typo_doesnt_join() {
     assert!(host.live().peers.is_empty());
     // A typing mistake is caught before anything connects.
     let mut typo: Vec<char> = local.code().chars().collect();
-    typo[7] = if typo[7] == 'A' { 'B' } else { 'A' };
+    // The last symbol contains only checksum bits. Changing payload bits can collide with
+    // the eight-bit checksum, so it does not guarantee a malformed code.
+    let last = typo.last_mut().unwrap();
+    *last = if *last == 'A' { 'B' } else { 'A' };
     let e = guest.execute("collab.join", &json!({"code": typo.iter().collect::<String>()})).unwrap_err().to_string();
     assert!(e.contains("typing mistake"), "{e}");
     // A view-only code doesn't exist here, and says where it does.
@@ -141,7 +147,9 @@ fn old_server() -> (Endpoint, std::thread::JoinHandle<()>) {
     let t = std::thread::spawn(move || {
         for stream in listener.incoming().take(2).flatten() {
             let Ok(mut ws) = tungstenite::accept(stream) else { continue };
-            let _ = ws.read();
+            // read() returns Result<Message>, not a lock guard; this test server deliberately
+            // ignores whatever the client sent first.
+            let _ = ws.read(); // NOSONAR
             let refused = ServerMsg::Refused { reason: "that message couldn't be read".into() };
             let _ = ws.send(Message::Binary(Bytes::from(message::encode(&refused).unwrap())));
             let _ = ws.close(None);

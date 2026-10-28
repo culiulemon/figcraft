@@ -1,6 +1,6 @@
-//! `#join=` in the page's URL.
+//! `#join=` and `?control` in the page's URL.
 
-use crate::query::join_link;
+use crate::query::{control, join_link};
 
 #[test]
 fn join_takes_the_rest_of_the_fragment() {
@@ -26,4 +26,15 @@ fn an_overlong_link_is_ignored() {
     let long = format!("#join=figcraft://join?host=h&file=f&token={}", "a".repeat(7000));
     assert_eq!(join_link(&long), None);
     assert_eq!(join_link(&format!("#join={}", "é".repeat(4000))), None, "length counts bytes");
+}
+
+#[test]
+fn control_is_opt_in() {
+    assert!(control("?control"));
+    assert!(control("?webgl&control=1"), "after other entries, with a value");
+    assert!(control("control"), "no leading ?");
+    assert!(!control(""));
+    assert!(!control("?"));
+    assert!(!control("?webgl"));
+    assert!(!control("?nocontrol&controls"), "only the whole entry name");
 }

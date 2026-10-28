@@ -48,9 +48,11 @@ fn an_image_within_the_limits_decodes() {
 }
 
 #[test]
-fn an_image_wider_or_taller_than_the_limit_is_refused() {
-    assert!(images::decode_within(&png(30, 20), ColorProfile::Srgb, 29, u64::MAX).is_none());
-    assert!(images::decode_within(&png(20, 30), ColorProfile::Srgb, 29, u64::MAX).is_none());
+fn an_image_wider_or_taller_than_the_limit_is_scaled_down_to_fit() {
+    let (p, _) = images::decode_within(&png(30, 20), ColorProfile::Srgb, 15, u64::MAX).unwrap();
+    assert_eq!((p.width(), p.height()), (15, 10));
+    let (p, _) = images::decode_within(&png(20, 30), ColorProfile::Srgb, 15, u64::MAX).unwrap();
+    assert_eq!((p.width(), p.height()), (10, 15));
 }
 
 #[test]
@@ -63,8 +65,20 @@ fn a_huge_image_is_refused_from_its_header_alone() {
     // 16 000 × 16 000 is within the side limit; its pixels (1 GB) aren't within a 1 MB budget, and
     // the file has none to decode: only the header is read.
     assert!(images::decode_within(&png_header_only(16_000, 16_000), ColorProfile::Srgb, 16_384, 1 << 20).is_none());
-    // Past the side limit, the shipped decode refuses it the same way.
+    // Past the side limit, the shipped decode reads its header and finds no pixels to scale down.
     assert!(images::decode(&png_header_only(20_000, 10)).is_none());
+}
+
+#[test]
+fn an_image_past_the_side_limit_is_drawn_downscaled() {
+    // #1336: one side over 16 384 px drew nothing.
+    let p = images::decode(&png(16_385, 4)).unwrap();
+    assert_eq!(p.width(), 16_384);
+    assert!(p.height() >= 1 && p.height() <= 4);
+    assert!(p.pixels().iter().all(|c| c.alpha() == 255));
+    let p = images::decode(&png(4, 18_078)).unwrap();
+    assert_eq!(p.height(), 16_384);
+    assert!(p.width() >= 1 && p.width() <= 4);
 }
 
 fn key(name: &str) -> images::Key {

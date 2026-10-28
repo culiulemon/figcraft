@@ -41,11 +41,17 @@ still answers every method that acts on the app's state (`engine.execute`, `docu
 `node.get`, `ui.inspect`, `ui.pointer`, `ui.key`, `ui.type`, `ui.set`, `ui.render`, `window.list`,
 …), in the file that window shows, so an attached agent can edit, inspect and save while the app is
 out of sight. The app is not drawn meanwhile and only wakes for requests, at most ten times a
-second while minimised, so a request there takes up to about 0.1 s. What only a drawn frame can
-answer (`ui.screenshot`, `ui.input`, `window.new`) is an error at once (`window 0 is minimised or
-hidden: …`) instead of waiting for the window to show; `ui.render` draws the document without it.
-Under Wayland the app can't tell that its window is minimised: where the compositor then stops
-drawing it, a request waits for the window and gets the 60 s timeout error.
+second while minimised, so a request there takes up to about 0.1 s. A request that needs a drawn
+frame (`ui.screenshot`, `ui.input`) is kept queued while the window is hidden and asks it to paint
+(`RequestPaintWhileHidden`; native eframe honours that). A screenshot whose window reports no
+visibility at all is parked the same way with its deadline, so it cannot wait forever in the
+queue. A screenshot settles on three completed, presented UI frames (a discarded sizing pass does
+not count), then is issued, and expires once at its 60 s deadline if no paint arrives. `window.new`
+remains an error at once (`window 0 is minimised or hidden: …`) instead of waiting for the window
+to show; `ui.render` draws the document without it. Under Wayland the app can't tell that its
+window is minimised: where the compositor then stops drawing it, a request waits for the window
+and gets the 60 s timeout error. The browser's shared eframe runner does not implement
+`RequestPaintWhileHidden` yet, so hidden-tab screenshots and injected input are unqualified there.
 
 Coordinates are page units, y down. `x`/`y` in `node.set`/`node.create` are relative to the parent
 frame (groups have no coordinate space of their own).
@@ -100,13 +106,17 @@ JSON or the gradient shorthand `{"type":"linearGradient","stops":["#hex","#hex"]
 {"id":3,"method":"engine.execute","params":{"command":"command.batch","params":{"label":"Tidy","commands":[{"command":"align.left","params":{"ids":[2,3]}},{"command":"distribute.vertical","params":{"ids":[2,3]}}]}}}
 ```
 
-Inside `command.batch`, `{"$step": n}` in a step's params stands for the `id` in step `n`'s result
-(zero-based; `{"$step": n, "field": "…"}` for another field; any object with a `$step` key is read
-as one, and a nested `command.batch` step keeps its own references to its own steps), so one batch
-can create a frame and fill it:
+Inside `command.batch`, a step can name itself with `"as"` and later steps use its result:
+`{"$ref": "name"}` in a step's params stands for the `id` in that step's result, and `{"$step": n}`
+for the `id` in step `n`'s result (zero-based). Either takes `"field"` for another key or a slash
+path into the result, such as `ids/0` for the first copy `edit.duplicate` returned. Any object with a
+`$ref` or `$step` key is read as a reference, names are unique within a batch, and a nested
+`command.batch` step keeps its own references to its own steps (see [MCP: Step
+references](mcp.md#step-references) for the rules and errors). So one batch can create a frame, fill
+it and duplicate it:
 
 ```json
-{"id":4,"method":"engine.execute","params":{"command":"command.batch","params":{"commands":[{"command":"node.create","params":{"type":"frame","width":200,"height":100}},{"command":"node.create","params":{"type":"rectangle","parent":{"$step":0},"width":20,"height":20}}]}}}
+{"id":4,"method":"engine.execute","params":{"command":"command.batch","params":{"commands":[{"command":"node.create","as":"card","params":{"type":"frame","width":200,"height":100}},{"command":"node.create","params":{"type":"rectangle","parent":{"$ref":"card"},"width":20,"height":20}},{"command":"edit.duplicate","as":"copy","params":{"ids":[{"$ref":"card"}]}},{"command":"node.set","params":{"ids":[{"$ref":"copy","field":"ids/0"}],"props":{"name":"Card copy"}}}]}}}
 ```
 
 ### `engine.commands {}`
@@ -131,7 +141,8 @@ component/instance links, overrides, `slot` (a slot layer's property name), boun
 `devStatus` (handoff status), `devChanged` (changed since it was marked ready for dev),
 `annotations` (Dev Mode notes: `[{label, properties, category?}]`), `codeLinks` (a component's
 links to code: `[{language, importPath, name, template}]`), `devResources` (links for developers,
-its own and inherited: `[{name, url, index?, from?}]`), `pluginData` (layer data written with
+its own and inherited: `[{name, url, index?, from?}]`), `measurements` (Dev Mode measurements
+starting from the layer: `[{to} | {side}]`), `pluginData` (layer data written with
 `node.set {props: {pluginData: {key: value}}}`, pages included: `{key: value}`, values as strings;
 only when there is some). The auto layout props
 that `node.set` accepts are listed in [mcp.md](mcp.md#conventions-agents-must-know).
@@ -169,7 +180,8 @@ far the view is panned (`pan`, `panRange`), whether a scroll is still coasting (
 active screen's `hotspots` (`[{id, rect: [x0, y0, x1, y1]}]` in window points, bottom-most first),
 whether a click where nothing reacts flashes them (`hotspotHints`) and they are flashing now
 (`hotspotFlash`), and whether the Inspect panel shows (`inspect`) with the layer it shows
-(`inspected`) (`null` when nothing plays). `presentOptions` holds the options the next presentation
+(`inspected`), and the link an Open link notice waits to open (`linkNotice`, else `null`) (`null`
+when nothing plays). `presentOptions` holds the options the next presentation
 starts with (`scale`, `deviceFrame`, `comments`, `hotspotHints`, `inspect`).
 `textPreview` is true while a live preview shows on the canvas (a hovered text style, named
 instance or blend mode, a dragged axis slider; see `text.preview` in [mcp.md](mcp.md)).
@@ -259,7 +271,7 @@ separate calls. Returns `{queued}`.
 
 Invoke a menu item exactly like clicking it (this may open a dialog). Returns `{ok, lastError}`.
 
-### `ui.set {rightTab?, leftTab?, theme?, home?, homeSection?, homeSearch?, homeRecentsView?, homeRecentsSort?, homeRecentsOrder?, palette?, mainMenu?, focusRegion?, colorPicker?, variables?, layerFilter?, collapseLayers?, exportPreview?, preview?, presentScroll?, colorProfileDialog?, stylePicker?, stylePickerEdit?, stylePickerView?, iconGallery?, protoEditor?, contextMenu?, contextSelectLayer?, commentOpen?, commentDraft?, commentFilter?, commentSort?, commentSearch?, commentReply?, commentEdit?, presentComments?, devCompare?, devCompareMode?, devCompareSplit?, annotationFilter?, resetFrameStats?, pluginsWindow?, pluginsTab?, pluginConfirm?, pluginForm?}`
+### `ui.set {rightTab?, leftTab?, theme?, home?, homeSection?, homeSearch?, homeRecentsView?, homeRecentsSort?, homeRecentsOrder?, palette?, mainMenu?, focusRegion?, colorPicker?, variables?, layerFilter?, collapseLayers?, exportPreview?, preview?, presentScroll?, colorProfileDialog?, stylePicker?, stylePickerEdit?, stylePickerView?, iconGallery?, protoEditor?, contextMenu?, contextSelectLayer?, commentOpen?, commentDraft?, commentFilter?, commentSort?, commentSearch?, commentReply?, commentEdit?, presentComments?, devCompare?, devCompareMode?, devCompareSplit?, annotationFilter?, resetFrameStats?, pluginsWindow?, pluginsTab?, pluginConfirm?, pluginForm?, devCompareVersion?}`
 
 Switch panels and modes: `rightTab` `design|prototype|inspect`, `leftTab` `file|assets`, `theme`,
 `home` (bool), `homeSection` (`recents`, `online` or `templates`: which section the home screen shows, as `ui.inspect` reports it; opening
@@ -296,21 +308,31 @@ closes it), `commentDraft` (`{x, y}`: start a new comment there), `commentFilter
 text, focused with the cursor at its end: an `@` there shows the mention picker), `commentEdit` (a
 message index of the open thread to edit, 0 for the first; `null` stops), `presentComments` (bool:
 the presenter shows the presented frame's comments, also Shift+C there). Dev Mode: `devCompare` (a
-ready-for-dev frame or section id opens the Compare changes view, like `dev.compare {id, show:
-true}`; `null` closes it) with `devCompareMode` (`sideBySide|overlay`) and `devCompareSplit` (the
+frame or section id opens the Compare changes view, like `dev.compare {id, show:
+true}`; `null` closes it) with `devCompareVersion` (a version id to compare with; `null`: when it
+was marked ready for dev), `devCompareMode` (`sideBySide|overlay`) and `devCompareSplit` (the
 overlay slider, 0–1), `annotationFilter` (`all`, `none` for uncategorised, or a category id or name:
 the annotations the canvas shows). `resetFrameStats` (true: start `framesDrawn` and
 `repaintCauses` over). Returns `ui.inspect` (which reports `stylePicker`,
 `stylePickerView`, `comments`: `open`, `draft`, `filter`, `sort`, `search`, `editing` and the
-`mentions` the picker offers, `devCompare` (`{id, mode, split}` or `null`), `devFocus` (the frame the
+`mentions` the picker offers, `devCompare` (`{id, mode, split, version}` or `null`), `devFocus` (the frame the
 focus view shows, or `null`) and `annotationFilter`).
 
 ### `ui.screenshot {path?}`
 
-PNG of the whole window (`window` picks one), UI included (needs a visible window; an idle one draws the frame to
-capture). Returns `{path, width, height}`, without `path` `{format: "png", width, height, data}`
-(base64); an error at once when the window is minimised or hidden, or after 60 s when the window
-doesn't deliver.
+PNG of the whole window (`window` picks one), UI included (an idle one draws the frame to capture;
+a hidden one, or one whose platform visibility is not reported, is asked to paint and the request
+is parked with its deadline until it does). Returns
+`{path, width, height}`, without `path` `{format: "png", width, height, data}` (base64). Requests
+are bounded to four pending, 128 MiB of pixels per image and 256 MiB in flight or
+completed-but-undrained. The reservation is the larger of the encoder phase (readback +
+straight-RGBA copy + PNG) and the reply phase (readback + PNG + base64); the encoder copy is
+dropped before base64 is built, and an oversized encoded reply is refused before base64 is
+allocated. The reply carries the request's own id, and the capture belongs to the document and
+window it was admitted for; cancellation, a tab switch, a resize/DPI/zoom between issuance and
+arrival (retried twice, then an error), an unrepresentable current surface (fail closed), and the
+60 s deadline never write late files. A hidden window whose pixels arrived is asked to paint the
+pass that drains them, so a completed readback is not left to time out.
 
 ### `ui.render {path?, scale?, ids?}`
 
@@ -358,3 +380,24 @@ read -r reply <&3; echo "$reply"
 
 For agents, prefer the MCP server (`figcraft-cli mcp --attach 7979`, see `docs/mcp.md`): it wraps
 these methods in documented tools and returns images inline.
+
+## In the browser: `window.figcraft`
+
+The web build has no TCP server (a page can't listen on a socket), so it offers the same methods to the
+page itself, as promises on `window.figcraft` (`apps/figcraft-web/src/api.rs`). An agent driving FigCraft in a
+browser tab, or a host app showing it in an `<iframe>`, uses the commands it would send to the desktop
+app. It is opt-in: the page installs `window.figcraft` only when its URL has a `control` query entry
+(`index.html?control`, which can be combined with other flags: `?webgl&control`).
+
+| Call | |
+|---|---|
+| `figcraft.request(method, params)` | any control method of this document → its `result` |
+| `figcraft.execute(command, params)` | `engine.execute` |
+| `figcraft.commands()` / `figcraft.inspect()` | `engine.commands` / the inspect method |
+| `figcraft.screenshot(params)` | `ui.screenshot` (no `path`: the PNG comes back inline) |
+| `figcraft.openFile(name, bytes)` | runs `file.open` with the bytes as `data` and resolves with its result |
+| `figcraft.captureDownloads(on)` | while on, a save or export is kept in the page instead of downloaded |
+| `figcraft.files()` / `figcraft.readFile(name)` | the kept files (`{path, size}`) / one of them as a `Uint8Array` |
+
+Errors reject with an `Error` carrying the method's message. Requests run on the UI's next frame, so a
+hidden tab (whose frames the browser pauses) answers when it is shown again.

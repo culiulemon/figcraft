@@ -11,6 +11,16 @@ use crate::message::{
 use crate::sim::Rng;
 use crate::{Error, Replica, diff};
 
+#[test]
+fn encoding_into_a_prefix_keeps_the_wire_body() {
+    let msg = moved_layer();
+    let prefix = b"container header".to_vec();
+    let bytes = crate::message::encode_into(&msg, prefix.clone()).unwrap();
+    assert_eq!(&bytes[..prefix.len()], prefix);
+    assert_eq!(&bytes[prefix.len()..], encode(&msg).unwrap());
+    assert_eq!(decode::<ClientMsg>(&bytes[prefix.len()..], bytes.len()).unwrap(), msg);
+}
+
 /// A typical edit: one layer dragged (its transform).
 fn moved_layer() -> ClientMsg {
     let mut doc = Document::new("f");
@@ -38,7 +48,7 @@ fn samples() -> (Vec<ClientMsg>, Vec<ServerMsg>) {
             name: "Ada".into(),
             color: "#FF8800".into(),
             client_version: "0.2.0".into(),
-            resume: Some(Resume { session: 77, client_id: 4, seq: 10 }),
+            resume: Some(Resume { session: 77, client_id: 4, seq: 10, secret: 0x5EC2E7 }),
         }),
         moved_layer(),
         cursor(),
@@ -102,6 +112,7 @@ fn samples() -> (Vec<ClientMsg>, Vec<ServerMsg>) {
             processed: Processed::default(),
             peers: vec![peer.clone()],
             access: Access::Edit,
+            secret: 0x5EC2E7,
         },
         ServerMsg::Welcome {
             session: 77,
@@ -111,6 +122,7 @@ fn samples() -> (Vec<ClientMsg>, Vec<ServerMsg>) {
             processed: Processed { last_batch: 7, refused: vec![3, 6] },
             peers: vec![],
             access: Access::View,
+            secret: 1,
         },
         ServerMsg::Changes(Accepted { seq: 11, author: 4, batch_id: 2, changes: vec![set.clone(), Change::Delete { id: NodeId(5) }] }),
         ServerMsg::Reject { batch_id: 3, reason: "no".into(), fixes: vec![set] },

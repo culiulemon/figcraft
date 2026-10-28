@@ -132,18 +132,15 @@ impl<T: Keyed> List<T> {
         let keys: Vec<T::Key> = value.read("order")?;
         let list = (self.get_mut)(doc);
         let mut slots: Vec<Option<T>> = std::mem::take(list).into_iter().map(Some).collect();
-        let mut at: BTreeMap<T::Key, Vec<usize>> = BTreeMap::new();
+        let mut at: BTreeMap<T::Key, std::collections::VecDeque<usize>> = BTreeMap::new();
         for (i, e) in slots.iter().enumerate() {
             if let Some(e) = e {
-                at.entry(e.key()).or_default().push(i);
+                at.entry(e.key()).or_default().push_back(i);
             }
         }
         for k in keys {
             let Some(idx) = at.get_mut(&k) else { continue };
-            if idx.is_empty() {
-                continue;
-            }
-            let i = idx.remove(0);
+            let Some(i) = idx.pop_front() else { continue };
             if let Some(e) = slots.get_mut(i).and_then(Option::take) {
                 list.push(e);
             }
@@ -213,6 +210,9 @@ doc_scalars! {
     ImagePresets => image_presets,
     AnnotationCategories => annotation_categories,
     Libraries => libraries,
+    Kind => kind,
+    Timer => timer,
+    Vote => vote,
 }
 
 /// Keyed maps (no order): changed and added entries are put, missing ones removed.
@@ -252,7 +252,8 @@ pub(crate) fn diff(a: &Document, b: &Document, out: &mut Vec<Change>) -> Result<
         |k| Entry::Image(k.clone()),
         image_json,
         out,
-    )
+    )?;
+    diff_map(&a.votes, &b.votes, |x, y| x == y, |k| Entry::Ballot(k.clone()), Json::of, out)
 }
 
 /// Apply a document-level change. Returns whether it can change which pages are listed (the
@@ -288,6 +289,9 @@ pub(crate) fn apply(doc: &mut Document, change: &Change) -> Result<bool, Error> 
                 let img = image_of(value)?;
                 doc.images.insert(k.clone(), img);
             }
+            Entry::Ballot(k) => {
+                doc.votes.insert(k.clone(), value.read("ballot")?);
+            }
         },
         Change::Remove { entry } => match entry {
             Entry::Style(k) => STYLES.remove(doc, k),
@@ -299,6 +303,9 @@ pub(crate) fn apply(doc: &mut Document, change: &Change) -> Result<bool, Error> 
             }
             Entry::Image(k) => {
                 doc.images.remove(k);
+            }
+            Entry::Ballot(k) => {
+                doc.votes.remove(k);
             }
         },
         _ => return Err(Error::Invalid("not a document-level change".into())),
@@ -336,6 +343,7 @@ pub(crate) fn entry_value(doc: &Document, entry: &Entry) -> Result<Option<Json>,
         Entry::Variable(k) => doc.variables.variables.iter().find(|v| v.id == *k).map(Json::of),
         Entry::DevSnapshot(k) => doc.dev_snapshots.get(k).map(|s| Json::of(s.as_ref())),
         Entry::Image(k) => doc.images.get(k).map(image_json),
+        Entry::Ballot(k) => doc.votes.get(k).map(Json::of),
     };
     value.transpose()
 }
@@ -349,6 +357,7 @@ pub(crate) fn has(doc: &Document, entry: &Entry) -> bool {
         Entry::Variable(k) => doc.variables.variables.iter().any(|v| v.id == *k),
         Entry::DevSnapshot(k) => doc.dev_snapshots.contains_key(k),
         Entry::Image(k) => doc.images.contains_key(k),
+        Entry::Ballot(k) => doc.votes.contains_key(k),
     }
 }
 

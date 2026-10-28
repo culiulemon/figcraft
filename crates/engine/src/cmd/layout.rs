@@ -19,6 +19,9 @@ pub fn specs() -> Vec<CommandSpec> {
     )]
 }
 
+/// Same cap the layout pass applies to grid track counts.
+const MAX_TRACKS: usize = 1000;
+
 fn set_track(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "layout.setTrack";
     let ids = req_targets(CMD, s, p)?;
@@ -38,7 +41,7 @@ fn set_track(s: &mut Session, p: &Value) -> Result<Value> {
         let Some(l) = n.layout.as_mut().filter(|l| l.mode == LayoutMode::Grid) else {
             return Err(bad(CMD, format!("node {id} is not a grid auto layout frame")));
         };
-        let count = tracks_now.len().max(if columns { l.grid_columns } else { l.grid_rows } as usize);
+        let count = tracks_now.len().max(if columns { l.grid_columns } else { l.grid_rows } as usize).min(MAX_TRACKS);
         if !(0.0..count as f64).contains(&index) {
             return Err(bad(CMD, format!("`index` must be 0..{count}")));
         }
@@ -247,6 +250,17 @@ mod tests {
         }
         assert!(s.execute("node.set", &json!({"id": f, "props": {"columnTracks": ["1fr", "wide"]}})).is_err());
         assert!(s.execute("node.set", &json!({"id": f, "props": {"rowTracks": 5}})).is_err());
+    }
+
+    #[test]
+    fn set_track_clamps_hostile_grid_counts() {
+        let mut s = Session::new();
+        let f = id(&ex(&mut s, "frame.create", json!({"x": 0, "y": 0, "width": 320, "height": 200, "props": {"layout": "grid"}})));
+        // A crafted file can carry a count node.set would have clamped.
+        s.doc_mut().unwrap().get_mut(f).unwrap().layout.as_mut().unwrap().grid_columns = 5_000_000;
+        let p = json!({"ids": [f], "axis": "columns", "index": 4_999_999, "sizing": "hug"});
+        assert!(s.execute("layout.setTrack", &p).is_err());
+        assert!(node(&s, f).layout.unwrap().column_tracks.len() <= 1000);
     }
 
     #[test]

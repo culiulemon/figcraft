@@ -69,10 +69,13 @@ fn paragraph(s: &Value, td: &mut TextData) {
         // Missing means a fixed box.
         _ => TextAutoResize::None,
     };
-    if text(s, "textTruncation") == Some("ENDING") {
+    // A line limit applies only while truncation is on; a leftover `maxLines` is ignored.
+    let ending = text(s, "textTruncation") == Some("ENDING");
+    td.max_lines = num(s, "maxLines").filter(|n| ending && *n >= 1.0).map_or(0, |n| n.min(10_000.0) as u32);
+    // Auto height with a line limit keeps hugging its lines up to the limit.
+    if ending && !td.truncates() {
         td.auto_resize = TextAutoResize::Truncate;
     }
-    td.max_lines = num(s, "maxLines").filter(|n| *n >= 1.0).map_or(0, |n| n.min(10_000.0) as u32);
     td.paragraph_spacing = len(s, "paragraphSpacing").unwrap_or(0.0);
     td.paragraph_indent = len(s, "paragraphIndent").unwrap_or(0.0);
     td.list_spacing = len(s, "listSpacing").unwrap_or(0.0).min(10_000.0);
@@ -101,6 +104,15 @@ fn type_style(cx: &mut Ctx, s: &Value, base: &TextStyle) -> TextStyle {
     } else if s.get("fontWeight").is_some() || s.get("italic").is_some() {
         let weight = num(s, "fontWeight").map_or_else(|| t.weight(), |w| w.clamp(1.0, 1000.0) as u16);
         t.font_style = style_name(weight, flag(s, "italic").unwrap_or_else(|| t.italic()));
+    }
+    // Variable font axes, `{tag: value}` (FigCraft's own key; the Sketch importer writes it).
+    if let Some(axes) = s.get("fontVariations").and_then(Value::as_object) {
+        t.variations = axes
+            .iter()
+            .take(64)
+            .filter(|(k, _)| k.len() == 4 && k.is_ascii())
+            .filter_map(|(k, v)| Some((k.clone(), v.as_f64().filter(|x| x.is_finite())?.clamp(-1e5, 1e5))))
+            .collect();
     }
     if let Some(size) = num(s, "fontSize").filter(|x| *x > 0.0) {
         t.font_size = size.clamp(0.5, 10_000.0);

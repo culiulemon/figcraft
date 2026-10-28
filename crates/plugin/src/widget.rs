@@ -1,5 +1,5 @@
-//! Widgets (ABI v3): a plugin draws a layer on the canvas by describing it, and FigCraft builds the
-//! layers. The description comes from the plugin, so it is untrusted: [`WidgetRender::parse`]
+//! Widgets (ABI v3; editable text fields and a property menu since v4): a plugin draws a layer on
+//! the canvas by describing it, and FigCraft builds the layers. The description comes from the plugin, so it is untrusted: [`WidgetRender::parse`]
 //! checks its size, node count, depth, numbers, strings, colours and image sizes before the engine
 //! sees it. The engine decides where the layers go (only inside the widget's own layer).
 
@@ -24,6 +24,12 @@ const MAX_SIZE: f64 = 4000.0;
 /// Largest image (decoded bytes), and all images of one widget together.
 pub const MAX_IMAGE_BYTES: usize = 1024 * 1024;
 const MAX_IMAGES_BYTES: usize = 2 * 1024 * 1024;
+/// Longest value of an editable text field (the same as any text layer's).
+pub const MAX_FIELD_CHARS: usize = MAX_TEXT;
+/// Most items in a widget's property menu, most colours in one colour item, longest item label.
+const MAX_MENU: usize = 8;
+const MAX_SWATCHES: usize = 8;
+const MAX_MENU_LABEL: usize = 32;
 
 /// What a widget is made of: FigCraft's own layer kinds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +71,10 @@ pub struct WidgetNode {
     /// Clicking this layer calls the plugin back with this name (empty: not clickable).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub target: String,
+    /// API 4, text layers: the text is an editable field with this name; an edit calls the plugin
+    /// back with the field and its new value, which is also kept in the state under this name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub field: String,
     /// Position in the parent frame (ignored inside auto layout and for the widget itself).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub x: Option<f64>,
@@ -119,6 +129,38 @@ pub struct WidgetRender {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<Map<String, Value>>,
     pub root: WidgetNode,
+    /// API 4: the widget's property menu, shown while it's selected (empty: none).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub menu: Vec<MenuItem>,
+}
+
+/// What a property menu item is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MenuKind {
+    /// A button.
+    #[default]
+    Action,
+    /// On or off (`checked`).
+    Toggle,
+    /// One of a few colours (`options`; `value` is the current one).
+    Color,
+}
+
+/// One item of a widget's property menu; choosing it calls the plugin back with `item`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MenuItem {
+    pub item: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    #[serde(rename = "type", default)]
+    pub kind: MenuKind,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checked: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
 }
 
 /// What one description may still use while it's checked.
@@ -141,8 +183,74 @@ impl WidgetRender {
             return Err("widget: the root must be a frame".into());
         }
         w.root.check(0, &mut Budget { nodes: 0, image_bytes: 0 }).map_err(|e| format!("widget: {e}"))?;
+        check_menu(&mut w.menu).map_err(|e| format!("widget: {e}"))?;
         Ok(w)
     }
+
+    /// Whether it uses what plugin API 4 added (fields or a menu).
+    pub fn uses_api_4(&self) -> bool {
+        fn field(n: &WidgetNode) -> bool {
+            !n.field.is_empty() || n.children.iter().any(field)
+        }
+        !self.menu.is_empty() || field(&self.root)
+    }
+}
+
+/// Check and normalise a property menu: at most [`MAX_MENU`] items with distinct names and short
+/// labels (an item's name when it has none); a colour item has 1–[`MAX_SWATCHES`] colours, its
+/// value one of them.
+pub fn check_menu(menu: &mut [MenuItem]) -> Result<(), String> {
+    if menu.len() > MAX_MENU {
+        return Err(format!("a menu has more than {MAX_MENU} items"));
+    }
+    for i in 0..menu.len() {
+        let Some(m) = menu.get_mut(i) else { continue };
+        check_id("menu item", &m.item, MAX_NAME)?;
+        m.label = clean("a menu label", &m.label, MAX_MENU_LABEL)?;
+        if m.label.is_empty() {
+            m.label.clone_from(&m.item);
+        }
+        let colours = m.kind == MenuKind::Color;
+        if m.checked && m.kind != MenuKind::Toggle {
+            return Err("`checked` is for toggles".into());
+        }
+        if colours == m.options.is_empty() || m.options.len() > MAX_SWATCHES {
+            return Err(format!("a colour item needs 1–{MAX_SWATCHES} `options` (and only it has them)"));
+        }
+        for o in &mut m.options {
+            let mut c = Some(std::mem::take(o));
+            colour("options", &mut c)?;
+            *o = c.unwrap_or_default();
+        }
+        colour("value", &mut m.value)?;
+        if m.value.as_ref().is_some_and(|v| !m.options.contains(v)) {
+            return Err("a colour item's `value` must be one of its `options`".into());
+        }
+        let item = m.item.clone();
+        if menu.get(..i).is_some_and(|before| before.iter().any(|b| b.item == item)) {
+            return Err(format!("two menu items are called `{item}`"));
+        }
+    }
+    Ok(())
+}
+
+/// An editable field's new value, cleaned: line endings become `\n`, tabs spaces, and other control
+/// characters are dropped; at most [`MAX_FIELD_CHARS`].
+pub fn clean_field(value: &str) -> Result<String, String> {
+    let v: String = value
+        .replace("\r\n", "\n")
+        .chars()
+        .filter_map(|c| match c {
+            '\r' | '\n' => Some('\n'),
+            '\t' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect();
+    if v.chars().count() > MAX_FIELD_CHARS {
+        return Err(format!("a field's value is longer than {MAX_FIELD_CHARS} characters"));
+    }
+    Ok(v)
 }
 
 /// A widget's state: a JSON object of at most [`MAX_STATE_BYTES`] with short keys.
@@ -186,6 +294,9 @@ impl WidgetNode {
         if !self.target.is_empty() {
             check_id("target", &self.target, MAX_NAME)?;
         }
+        if !self.field.is_empty() {
+            check_id("field", &self.field, MAX_NAME)?;
+        }
         for (what, v) in [("x", self.x), ("y", self.y)] {
             within(what, v, -MAX_SIZE, MAX_SIZE)?;
         }
@@ -210,6 +321,7 @@ impl WidgetNode {
         )?;
         only("text", !self.text.is_empty() || self.size.is_some() || self.color.is_some() || self.bold, kind == WidgetKind::Text)?;
         only("data", !self.data.is_empty(), kind == WidgetKind::Image)?;
+        only("field", !self.field.is_empty(), kind == WidgetKind::Text)?;
         if self.text.chars().count() > MAX_TEXT {
             return Err(format!("a text is longer than {MAX_TEXT} characters"));
         }

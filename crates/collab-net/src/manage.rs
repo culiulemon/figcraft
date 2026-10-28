@@ -196,19 +196,27 @@ pub fn plugins(server: &Endpoint, key: &str, req: PluginReq, limits: &NetLimits,
     Ok(r)
 }
 
-/// A WebSocket to `server` that waits for answers up to the idle timeout (a large upload takes the
-/// server a while to keep).
+/// A WebSocket to `server` that waits for answers up to the request-reply timeout (a large upload
+/// takes the server a while to keep).
 fn connect(server: &Endpoint, limits: &NetLimits, timeout: Duration) -> Result<Ws, String> {
     let (stream, _, _) = open(server, timeout, limits)?;
     let (ws, _) = tungstenite::client::client_with_config(server.url(), stream, Some(config(limits.max_server_message)))
         .map_err(|e| format!("{} doesn't answer as a FigCraft server: {e}", server.display()))?;
-    ws.get_ref().set_read_timeout(Some(limits.idle_timeout)).map_err(|e| e.to_string())?;
+    // A publish uploads a whole file; a large project on a slow link can take several minutes to
+    // receive and answer. The wait uses `request_reply_timeout`, not the session `idle_timeout`.
+    ws.get_ref().set_read_timeout(Some(limits.request_reply_timeout)).map_err(|e| e.to_string())?;
     Ok(ws)
 }
 
-/// Close politely: read until the server's close arrives (or the socket ends), so it isn't lost.
+/// How long `close` waits for the server's close.
+const CLOSE_DRAIN: Duration = Duration::from_secs(2);
+
+/// Close politely: read until the server's close arrives (or the socket ends), so it isn't lost,
+/// but no longer than [`CLOSE_DRAIN`] (a server that keeps pinging, or goes quiet, would pin the
+/// loop).
 fn close(mut ws: Ws) {
     let _ = ws.close(None);
+    ws.get_mut().read_until(Some(std::time::Instant::now() + CLOSE_DRAIN));
     while ws.read().is_ok() {}
 }
 
@@ -238,5 +246,53 @@ fn reply<T>(ws: &mut Ws, limits: &NetLimits, pick: impl Fn(ServerMsg) -> Option<
             Ok(_) => continue,
             Err(e) => Err(format!("no answer from the server ({e})")),
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Whether `close` returns within 3 s against a server that never answers the close and does
+    /// `serve` instead, with reads waiting up to `idle`.
+    fn closes_in_time(idle: Duration, serve: impl FnOnce(WebSocket<std::net::TcpStream>) + Send + 'static) -> bool {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            if let Ok(ws) = tungstenite::accept(s) {
+                serve(ws);
+            }
+        });
+        let limits = NetLimits { idle_timeout: idle, ..NetLimits::default() };
+        let server = Endpoint { host: addr.to_string(), path: "/".into(), secure: false };
+        let ws = connect(&server, &limits, Duration::from_secs(2)).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            close(ws);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(3)).is_ok()
+    }
+
+    /// A server that keeps pinging and never answers the close must not pin `close` forever.
+    #[test]
+    fn close_returns_against_a_server_that_keeps_pinging() {
+        let pinging = closes_in_time(Duration::from_millis(300), |mut ws| {
+            while ws.send(Message::Ping(Bytes::new())).is_ok() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        assert!(pinging, "close() kept draining a pinging server");
+    }
+
+    /// Nor one that goes quiet, however long the idle timeout.
+    #[test]
+    fn close_returns_against_a_silent_server() {
+        let silent = closes_in_time(Duration::from_secs(10), |ws| {
+            std::thread::sleep(Duration::from_secs(5));
+            drop(ws);
+        });
+        assert!(silent, "close() waited out the idle timeout");
     }
 }

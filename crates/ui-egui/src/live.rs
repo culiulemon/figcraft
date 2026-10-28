@@ -98,6 +98,11 @@ pub struct LiveUi {
     pub advanced: bool,
     pub this_computer: bool,
     pub port: String,
+    /// The server key for online sharing, and the server address it was entered for (a server
+    /// that needs one; `None`: none). Passed to `collab.share` so a keyed server can be used
+    /// from the Share popover without the Publish dialog. The key goes out only to the server it
+    /// belongs to: switching the server in Preferences must not leak the old one to it.
+    pub share_key: Option<(String, String)>,
     /// What is typed in the join field of the Share popover and the home screen.
     pub code: String,
     /// The join started from the home screen: what it is doing shows under the field, and its
@@ -354,7 +359,7 @@ pub fn chat_box(app: &mut FigApp, ctx: &egui::Context) {
             let _ = app.session.live_chat("");
             return;
         }
-        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("live_chat")));
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("live_chat")));
         chat_bubble(&painter, tip, None, &chat.text, fill, alpha);
         app.ui.live.chat = Some(chat);
         return;
@@ -366,7 +371,7 @@ pub fn chat_box(app: &mut FigApp, ctx: &egui::Context) {
     }
     ctx.request_repaint_after(std::time::Duration::from_secs_f64(CHAT_HOLD + CHAT_FADE - idle));
     let fg = text_on(fill);
-    let resp = egui::Area::new(egui::Id::new("live_chat_box"))
+    let resp = egui::Area::new(egui::Id::unique("live_chat_box"))
         .order(egui::Order::Foreground)
         .fixed_pos(tip + vec2(12.0, 16.0))
         .show(ctx, |ui| {
@@ -378,7 +383,7 @@ pub fn chat_box(app: &mut FigApp, ctx: &egui::Context) {
                     let w = ui.painter().layout_no_wrap(chat.text.clone(), regular(12.0), fg).size().x + 8.0;
                     ui.add(
                         egui::TextEdit::singleline(&mut chat.text)
-                            .id(egui::Id::new("live_chat_text"))
+                            .id(egui::Id::unique("live_chat_text"))
                             .frame(egui::Frame::NONE)
                             .font(regular(12.0))
                             .text_color(fg)
@@ -425,7 +430,7 @@ pub fn spotlight_banner(app: &mut FigApp, ctx: &egui::Context, canvas: Rect) {
         return;
     };
     let t = Tokens::get(ctx);
-    let clicked = widgets::canvas_banner(ctx, egui::Id::new("live_spotlight"), canvas, |ui| {
+    let clicked = widgets::canvas_banner(ctx, egui::Id::unique("live_spotlight"), canvas, |ui| {
         ui.label(egui::RichText::new(text).font(regular(11.0)).color(t.text));
         widgets::button(ui, button, true, true).clicked()
     });
@@ -473,7 +478,7 @@ pub fn people_bar(app: &mut FigApp, ui: &mut Ui, area: Rect) {
     let mut spotlight = false;
     if in_session {
         let c = pos2(x, cy);
-        let resp = ui.interact(Rect::from_center_size(c, vec2(2.0 * R, 2.0 * R)), ui.id().with("live_me"), Sense::click());
+        let resp = ui.interact(Rect::from_center_size(c, vec2(2.0 * R, 2.0 * R)), ui.scope_id().with("live_me"), Sense::click());
         a11y::menu_button(&resp, tr("You"), a11y::menu_open(&resp));
         if spotlighting || resp.hovered() {
             ui.painter().circle_stroke(c, R + 2.5, Stroke::new(2.0, me_fill));
@@ -491,7 +496,7 @@ pub fn people_bar(app: &mut FigApp, ui: &mut Ui, area: Rect) {
         let c = pos2(x, cy);
         let following = follow == Some(*id);
         let tip = if following { trf("Stop following {name}", &[("name", name)]) } else { trf("Follow {name}", &[("name", name)]) };
-        let resp = ui.interact(Rect::from_center_size(c, vec2(2.0 * R, 2.0 * R)), ui.id().with(("live_avatar", id)), Sense::click()).tip(tip);
+        let resp = ui.interact(Rect::from_center_size(c, vec2(2.0 * R, 2.0 * R)), ui.scope_id().with(("live_avatar", id)), Sense::click()).tip(tip);
         ring(ui, c);
         avatar(ui.painter(), c, R, name, *fill);
         if following || resp.hovered() {
@@ -517,7 +522,7 @@ pub fn people_bar(app: &mut FigApp, ui: &mut Ui, area: Rect) {
         ui.painter().text(c, Align2::CENTER_CENTER, format!("+{more}"), semibold(10.0), t.text);
     }
     let chev = Rect::from_center_size(pos2(x + R + 10.0, cy), vec2(16.0, 24.0));
-    let cresp = ui.interact(chev, ui.id().with("live_people"), Sense::click());
+    let cresp = ui.interact(chev, ui.scope_id().with("live_people"), Sense::click());
     a11y::menu_button(&cresp, tr("People in this file"), a11y::menu_open(&cresp));
     if cresp.hovered() {
         ui.painter().rect_filled(chev, CornerRadius::same(4), t.hover);
@@ -665,7 +670,7 @@ fn online_note(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
 /// home screen is closed. The session of the join that started, if one did.
 pub fn join_row(app: &mut FigApp, ui: &mut Ui, width: f32) -> Option<SessionId> {
     let mut typed = std::mem::take(&mut app.ui.live.code);
-    let joined = ui.horizontal(|ui| join_field(app, ui, &mut typed, egui::Id::new("live_join_code"), width, false)).inner;
+    let joined = ui.horizontal(|ui| join_field(app, ui, &mut typed, egui::Id::unique("live_join_code"), width, false)).inner;
     app.ui.live.code = typed;
     joined
 }
@@ -714,7 +719,7 @@ fn start_ui(app: &mut FigApp, ui: &mut Ui, t: &Tokens) {
     ui.horizontal(|ui| {
         widgets::label(ui, tr("Your name"), t.text);
         let name = app.session.prefs.user_name.clone();
-        if let Some(n) = widgets::text_field(ui, egui::Id::new("live_name"), &name, 160.0, tr("Your name")) {
+        if let Some(n) = widgets::text_field(ui, egui::Id::unique("live_name"), &name, 160.0, tr("Your name")) {
             app.run("pref.userName", json!({"name": n}));
         }
     });
@@ -746,6 +751,15 @@ fn start_ui(app: &mut FigApp, ui: &mut Ui, t: &Tokens) {
         if let (true, Ok(port)) = (local, app.ui.live.port.trim().parse::<u16>()) {
             params["port"] = json!(port);
         }
+        // The key goes out only to the server it belongs to (the server in Preferences): changing
+        // the server must not send the old server's key to a new one.
+        if !local
+            && let Some((at, key)) = app.ui.live.share_key.as_ref()
+            && *at == server
+            && !key.is_empty()
+        {
+            params["key"] = json!(key);
+        }
         app.run("collab.share", params);
     }
     join_and_advanced(app, ui, t, |app, ui, t| {
@@ -755,13 +769,23 @@ fn start_ui(app: &mut FigApp, ui: &mut Ui, t: &Tokens) {
             }
             ui.horizontal(|ui| {
                 widgets::label(ui, tr("Port"), t.text);
-                if let Some(port) = widgets::text_field_named(ui, egui::Id::new("live_port"), &app.ui.live.port, 70.0, tr("Port")) {
+                if let Some(port) = widgets::text_field_named(ui, egui::Id::unique("live_port"), &app.ui.live.port, 70.0, tr("Port")) {
                     // Digits only; empty: the usual port, or any free one.
                     app.ui.live.port = port.trim().parse::<u16>().map(|p| p.to_string()).unwrap_or_default();
                 }
             });
         } else {
             widgets::label(ui, tr("Another server, or one that needs its key. The usual server is set in Preferences."), t.text_secondary);
+            // The server key (a server that needs one; the address in Preferences is without it).
+            // It is remembered for the server it was typed for, so it never leaks to another one.
+            ui.horizontal(|ui| {
+                widgets::label(ui, tr("Server key"), t.text);
+                let shown = app.ui.live.share_key.as_ref().and_then(|(at, key)| (*at == server).then_some(key.as_str())).unwrap_or_default();
+                if let Some(key) = widgets::secret_field_named(ui, egui::Id::unique("live_share_key"), shown, 200.0, tr("Server key")) {
+                    let key: String = key.trim().chars().filter(|c| !c.is_whitespace() && !c.is_control()).take(128).collect();
+                    app.ui.live.share_key = if key.is_empty() { None } else { Some((server.trim().to_string(), key)) };
+                }
+            });
             if widgets::button(ui, tr("Publish to another server…"), false, true).clicked() {
                 open_publish(app);
                 ui.close();
@@ -885,11 +909,11 @@ fn share_ui(app: &mut FigApp, ui: &mut Ui, t: &Tokens, share: &Share) {
             });
             ui.horizontal(|ui| {
                 if widgets::button(ui, tr("Copy code"), true, true).clicked() {
-                    app.services.clipboard_set_text(&code);
+                    app.clipboard_set_text(&code);
                     app.toast(tr("Join code copied"));
                 }
                 if widgets::button(ui, tr("Copy link"), false, true).on_hover_text(tr("An invite link that opens FigCraft and joins")).clicked() {
-                    app.services.clipboard_set_text(&link);
+                    app.clipboard_set_text(&link);
                     app.toast(tr("Invite link copied"));
                 }
             });
@@ -1007,7 +1031,7 @@ fn report_ui(app: &mut FigApp, ui: &mut Ui, t: &Tokens) {
             .hint_text(tr("Spam, stolen work, abuse…"))
             .char_limit(figcraft_engine::live::MAX_REPORT)
             .desired_width(ui.available_width())
-            .id(egui::Id::new("live_report_reason")),
+            .id(egui::Id::unique("live_report_reason")),
     );
     a11y::text(&resp, tr("Report"), &reason);
     crate::widgets::select_all_on_focus(ui, &resp, &reason);
@@ -1042,7 +1066,7 @@ fn link_rows(app: &mut FigApp, ui: &mut Ui, rows: &[(&str, &String, &str)]) {
                 ui.label(egui::RichText::new(widgets::elide(ui, value, w)).font(regular(10.5)).monospace());
             });
             if widgets::button(ui, tr("Copy"), false, true).on_hover_text(trf("Copy the {label}", &[("label", &label.to_lowercase())])).clicked() {
-                app.services.clipboard_set_text(value);
+                app.clipboard_set_text(value);
                 app.toast(*what);
             }
         });
@@ -1085,11 +1109,11 @@ pub fn join_dialog(app: &mut FigApp, ctx: &egui::Context) {
     let mut cancel = false;
     let mut go = false;
     let focus = std::mem::take(&mut app.ui.live.focus_join);
-    crate::dialogs::window(tr("Join live session"), ctx).id(egui::Id::new("Join live session")).open(&mut open).show(ctx, |ui| {
+    crate::dialogs::window(tr("Join live session"), ctx).id(egui::Id::unique("Join live session")).open(&mut open).show(ctx, |ui| {
         ui.set_width(380.0);
         widgets::label(ui, tr("Type the join code you were given, or paste an invite link."), t.text);
         ui.horizontal(|ui| {
-            go = join_field(app, ui, &mut link, egui::Id::new("live_join_link"), 300.0, focus).is_some();
+            go = join_field(app, ui, &mut link, egui::Id::unique("live_join_link"), 300.0, focus).is_some();
             cancel = widgets::button(ui, tr("Cancel"), false, true).clicked();
         });
         widgets::label(ui, tr("You'll get the shared file as a new tab and edit it together."), t.text_secondary);
@@ -1158,7 +1182,7 @@ pub fn publish_dialog(app: &mut FigApp, ctx: &egui::Context) {
     let open_server = info.as_ref().is_some_and(|v| v["open"] == true);
     // A first look at an address already filled in.
     ask |= focus && !address.is_empty() && !keyed && info.is_none();
-    crate::dialogs::window(tr("Publish to server"), ctx).id(egui::Id::new("Publish to server")).open(&mut open).show(ctx, |ui| {
+    crate::dialogs::window(tr("Publish to server"), ctx).id(egui::Id::unique("Publish to server")).open(&mut open).show(ctx, |ui| {
         ui.set_width(380.0);
         widgets::label(
             ui,
@@ -1170,7 +1194,7 @@ pub fn publish_dialog(app: &mut FigApp, ctx: &egui::Context) {
             egui::TextEdit::singleline(&mut form.server)
                 .hint_text("wss://server/ or ws://server:47900/?key=…")
                 .desired_width(380.0)
-                .id(egui::Id::new("live_publish_server")),
+                .id(egui::Id::unique("live_publish_server")),
         );
         // The address may carry the server key: it isn't read out.
         a11y::text(&resp, tr("Server address"), "");
@@ -1202,7 +1226,7 @@ pub fn publish_dialog(app: &mut FigApp, ctx: &egui::Context) {
             ),
         }
         widgets::label(ui, tr("File name"), t.text_secondary);
-        let nresp = ui.add(egui::TextEdit::singleline(&mut form.name).desired_width(380.0).id(egui::Id::new("live_publish_name")));
+        let nresp = ui.add(egui::TextEdit::singleline(&mut form.name).desired_width(380.0).id(egui::Id::unique("live_publish_name")));
         a11y::text(&nresp, tr("File name"), &form.name);
         crate::widgets::select_all_on_focus(ui, &nresp, &form.name);
         go |= nresp.lost_focus() && enter(ui) && (keyed || open_server);
@@ -1249,7 +1273,7 @@ fn published_dialog(app: &mut FigApp, ctx: &egui::Context) {
     let t = Tokens::get(ctx);
     let mut open = true;
     let mut done = false;
-    crate::dialogs::window(tr("File published"), ctx).id(egui::Id::new("File published")).open(&mut open).show(ctx, |ui| {
+    crate::dialogs::window(tr("File published"), ctx).id(egui::Id::unique("File published")).open(&mut open).show(ctx, |ui| {
         ui.set_width(400.0);
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
         widgets::label(ui, &trf("{name} is on the server.", &[("name", &p.name)]), t.text);

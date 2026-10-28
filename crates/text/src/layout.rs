@@ -100,7 +100,7 @@ pub struct Decoration {
 }
 
 /// Most dots or wave samples drawn for one decoration.
-const MAX_DECO_STEPS: usize = 20_000;
+const MAX_DECO_STEPS: usize = 2_500;
 
 impl Decoration {
     /// The line's outline: a bar, a row of dots or a wave, `thickness` thick.
@@ -256,6 +256,11 @@ struct Item {
 impl Item {
     fn is_space(&self) -> bool {
         crate::breaks::is_space(self.ch)
+    }
+    /// A space justified text widens: not U+200B, which only marks where a line may break (between
+    /// the words of Thai, Lao, Khmer or Burmese text, written without spaces).
+    fn stretches(&self) -> bool {
+        self.is_space() && self.ch != '\u{200B}'
     }
 }
 
@@ -527,7 +532,7 @@ pub fn layout(text: &TextData, box_width: Option<f64>, box_height: Option<f64>) 
     let mut out = TextLayout { styles: styles.clone(), ..Default::default() };
     let mut y = 0.0;
     let mut para_start_line = true;
-    let max_lines = if text.max_lines > 0 && matches!(text.auto_resize, TextAutoResize::Truncate) { text.max_lines as usize } else { usize::MAX };
+    let max_lines = if text.max_lines > 0 && text.truncates() { text.max_lines as usize } else { usize::MAX };
     // A style's vertical metrics (ascent, descent, line height, cap height) come from its own
     // font, never a fallback face, so lines mixing scripts keep the spacing of lines that don't.
     let metrics = |st_idx: usize| -> [f64; 4] {
@@ -540,6 +545,25 @@ pub fn layout(text: &TextData, box_width: Option<f64>, box_height: Option<f64>) 
             }
             None => [size * 0.8, size * 0.2, whole_px(st.line_height.resolve(size, 1.2)), size * 0.7],
         }
+    };
+    // An item's glyph with its pen position at `pen` on the line at `baseline` (none for a space
+    // the font has no glyph for).
+    let glyph_at = |it: &Item, pen: f64, baseline: f64| {
+        let size = styles.get(it.style).map(|st| sanitize_size(st.font_size)).unwrap_or(12.0) * it.scale;
+        (it.gid != 0 || !it.is_space()).then(|| Glyph {
+            face: it.face.clone(),
+            coords: it.coords.clone(),
+            gid: it.gid,
+            x: pen + it.dx,
+            y: baseline - it.dy,
+            size,
+            advance: it.adv,
+            char_start: it.char_start,
+            char_end: it.char_end,
+            style: it.style,
+            rtl: it.level % 2 == 1,
+            warp: Affine::IDENTITY,
+        })
     };
     let mut first_cap = 0.0;
     for (li, (s, e, para_end, para)) in lines.iter().enumerate() {
@@ -587,7 +611,7 @@ pub fn layout(text: &TextData, box_width: Option<f64>, box_height: Option<f64>) 
             items.get(vis_end.wrapping_sub(1)).filter(|it| hang_end && !rtl_line && vis_end > *s + 1 && closes(it.ch)).map_or(0.0, |it| it.adv);
         let gstart = out.glyphs.len();
         // Justify: extra space per gap.
-        let gaps = items.get(*s..vis_end).unwrap_or(&[]).iter().filter(|it| it.is_space()).count();
+        let gaps = items.get(*s..vis_end).unwrap_or(&[]).iter().filter(|it| it.stretches()).count();
         let justify_extra = match (text.align_h, wrap) {
             (TextAlignH::Justified, Some(maxw)) if !para_end && !break_after(*e) && gaps > 0 => {
                 ((maxw - line_indent + hang_l + hang_r - width) / gaps as f64).max(0.0)
@@ -603,7 +627,7 @@ pub fn layout(text: &TextData, box_width: Option<f64>, box_height: Option<f64>) 
             .unwrap_or(&[])
             .iter()
             .filter(|it| !is_line_break(it.ch))
-            .map(|it| it.adv + if it.is_space() { justify_extra } else { 0.0 })
+            .map(|it| it.adv + if it.stretches() { justify_extra } else { 0.0 })
             .sum();
         let mut pen = if rtl_line { -trailing } else { line_indent - hang_l };
         // List marker (before the line's text; zero-length char range so carets skip it).
@@ -680,25 +704,9 @@ pub fn layout(text: &TextData, box_width: Option<f64>, box_height: Option<f64>) 
             if is_line_break(it.ch) {
                 continue;
             }
-            let size = styles.get(it.style).map(|st| sanitize_size(st.font_size)).unwrap_or(12.0) * it.scale;
-            if it.gid != 0 || !it.is_space() {
-                out.glyphs.push(Glyph {
-                    face: it.face.clone(),
-                    coords: it.coords.clone(),
-                    gid: it.gid,
-                    x: pen + it.dx,
-                    y: baseline - it.dy,
-                    size,
-                    advance: it.adv,
-                    char_start: it.char_start,
-                    char_end: it.char_end,
-                    style: it.style,
-                    rtl: it.level % 2 == 1,
-                    warp: Affine::IDENTITY,
-                });
-            }
+            out.glyphs.extend(glyph_at(it, pen, baseline));
             pen += it.adv;
-            if it.is_space() {
+            if it.stretches() {
                 pen += justify_extra;
             }
         }
@@ -752,7 +760,40 @@ pub fn layout(text: &TextData, box_width: Option<f64>, box_height: Option<f64>) 
         }
     }
     if out.truncated {
+        // The last line shown runs on into the line cut after it, so the ellipsis fills the line
+        // ("Lorem consec…") instead of following the last whole word ("Lorem…").
+        let last = out.lines.len().checked_sub(1);
+        let wrapped_on = last.and_then(|li| Some((out.lines.get(li)?, lines.get(li)?, lines.get(li + 1)?)));
+        if let (Some(maxw), Some((line, &(_, e, para_end, _), &(ns, ne, _, _)))) = (wrap, wrapped_on)
+            && !para_end
+            && !break_after(e)
+            && !line.rtl
+        {
+            let baseline = line.baseline;
+            let mut pen = out.glyphs.get(line.glyph_start..line.glyph_end).and_then(<[Glyph]>::last).map_or(line.width, |g| g.x + g.advance);
+            for it in items.get(ns..ne).unwrap_or(&[]) {
+                if pen > maxw {
+                    break;
+                }
+                if !is_line_break(it.ch) {
+                    out.glyphs.extend(glyph_at(it, pen, baseline));
+                    pen += it.adv;
+                }
+            }
+            let gend = out.glyphs.len();
+            if let Some(l) = out.lines.last_mut() {
+                l.glyph_end = gend;
+            }
+        }
         add_ellipsis(&mut out, wrap);
+        // Carets and selections reach every char the line shows, borrowed ones included.
+        if let Some(l) = out.lines.last() {
+            let shown =
+                out.glyphs.get(l.glyph_start..l.glyph_end).unwrap_or(&[]).iter().filter(|g| g.char_end > g.char_start).map(|g| g.char_end).max();
+            if let (Some(shown), Some(l)) = (shown, out.lines.last_mut()) {
+                l.char_end = l.char_end.max(shown);
+            }
+        }
     }
 
     // Horizontal alignment within the box.
@@ -1035,6 +1076,18 @@ fn is_emoji(c: char) -> bool {
     matches!(c, '\u{1F1E6}'..='\u{1F1FF}' | '\u{1F300}'..='\u{1FAFF}')
 }
 
+/// The lower case of the capital sigma at `i`: the final form ς or σ, chosen from the letters
+/// around it in the whole text (as lower-casing the whole string would), not from the lone char.
+fn lower_sigma(chars: &[char], i: usize) -> char {
+    // Enough context to step over any realistic run of combining marks next to the sigma.
+    const CONTEXT: usize = 32;
+    let before: String = chars.get(i.saturating_sub(CONTEXT)..i).unwrap_or(&[]).iter().collect();
+    let after: String = chars.iter().skip(i + 1).take(CONTEXT).collect();
+    let lower = format!("{before}\u{3A3}{after}").to_lowercase();
+    // Only the sigma's lower case depends on context, so the text before it keeps its length.
+    lower.get(before.to_lowercase().len()..).and_then(|s| s.chars().next()).unwrap_or('σ')
+}
+
 /// One run of chars shaped with a single face and style.
 struct Segment<'a> {
     start: usize,
@@ -1059,18 +1112,22 @@ fn shape_segment(chars: &[char], seg: &Segment, face: &Arc<Face>, features: &[Fe
     // a word split across styled runs is capitalised once) and remember synthesised small caps.
     let mut mapped: Vec<(char, usize, bool)> = Vec::with_capacity(end.saturating_sub(start));
     let mut prev = start.checked_sub(1).and_then(|i| chars.get(i)).copied();
+    let mut before = start.checked_sub(2).and_then(|i| chars.get(i)).copied();
     for (i, c) in chars.get(start..end).unwrap_or(&[]).iter().enumerate() {
         let src = start + i;
         if small_caps && !native_smcp && c.is_lowercase() {
             for u in c.to_uppercase() {
                 mapped.push((u, src, true));
             }
+        } else if style.case == TextCase::Lower && *c == 'Σ' {
+            mapped.push((lower_sigma(chars, src), src, false));
         } else {
             let mut buf = [0u8; 4];
-            for u in style.case.apply_after(c.encode_utf8(&mut buf), prev).chars() {
+            for u in style.case.apply_between(c.encode_utf8(&mut buf), before, prev).chars() {
                 mapped.push((u, src, false));
             }
         }
+        before = prev;
         prev = Some(*c);
     }
     let mut small = vec![false; end.saturating_sub(start)];

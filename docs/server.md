@@ -336,8 +336,8 @@ the address it came from and when it was last opened (for expiry).
   beside it, flushed, then renamed over the old one. The log is only ever appended to, and synced
   before the server tells anyone about the change.
 - **Compaction** writes the file's state as the next snapshot and starts an empty log, after
-  `compact_after` entries or `compact_mb` of log, when the last person leaves, and when the server
-  stops. A log left over from a compaction cut short is replayed over the snapshot, which already
+  `compact_after` entries or `compact_mb` of log, when the last person leaves a file that was
+  edited (the ids of people who only joined stay in the log), and when the server stops. A log left over from a compaction cut short is replayed over the snapshot, which already
   holds it all, so nothing changes. If a damaged generation field made a current log look like such
   a leftover, its edits the snapshot lacks are recovered the same way and the damage is reported.
 - **Damage is skipped and reported, never deleted.** At startup a folder whose description, links

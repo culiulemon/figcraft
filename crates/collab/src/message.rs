@@ -94,6 +94,10 @@ pub struct Resume {
     pub client_id: u32,
     /// The last sequence number it applied.
     pub seq: u64,
+    /// The secret the server gave with this client id ([`ServerMsg::Welcome`]'s `secret`): only
+    /// the client the id was given to can resume it (0: none).
+    #[serde(default)]
+    pub secret: u64,
 }
 
 /// Someone in the session.
@@ -635,7 +639,8 @@ pub enum ServerMsg {
     /// Joined: the session's identity (a server that restarted without its saved state is a new
     /// session), this connection's client id, the current sequence number, the document (or the
     /// batches missed since a reconnecting client's last sequence number), what the server did
-    /// with this client's batches so far, who else is here and what this client may do.
+    /// with this client's batches so far, who else is here, what this client may do and the
+    /// secret it resumes its id with ([`Resume::secret`]; only this client is told).
     Welcome {
         session: u64,
         client_id: u32,
@@ -644,6 +649,8 @@ pub enum ServerMsg {
         processed: Processed,
         peers: Vec<Peer>,
         access: Access,
+        #[serde(default)]
+        secret: u64,
     },
     /// Accepted changes, in order, to everyone (the author's own come back as confirmation).
     Changes(Accepted),
@@ -732,11 +739,13 @@ pub fn utc_date(secs: u64) -> String {
 
 /// The binary form of `msg`: [`WIRE_VERSION`], then postcard.
 pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>, Error> {
-    let body = postcard::to_allocvec(msg).map_err(|e| Error::Encode(e.to_string()))?;
-    let mut out = Vec::with_capacity(body.len() + 1);
-    out.push(WIRE_VERSION);
-    out.extend(body);
-    Ok(out)
+    encode_into(msg, Vec::new())
+}
+
+/// Append the binary form of `msg` to an owned prefix, without a second payload-sized buffer.
+pub fn encode_into<T: Serialize>(msg: &T, mut prefix: Vec<u8>) -> Result<Vec<u8>, Error> {
+    prefix.push(WIRE_VERSION);
+    postcard::to_extend(msg, prefix).map_err(|e| Error::Encode(e.to_string()))
 }
 
 /// Read a binary message of at most `max_bytes` (untrusted input: never panics, allocates at most

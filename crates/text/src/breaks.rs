@@ -19,14 +19,17 @@ enum Class {
     Hyphen,
     /// Everything else (letters, digits, other symbols): no break inside a run of them.
     Other,
+    /// The figure space: glues what's on either side, ideographs included.
+    Glue,
 }
 
-/// Opening brackets and quotes (line-end prohibited).
-const OPEN: &str = "([{‘“〈《「『【〔〖〘〚〝（［｛｢";
-/// Closing brackets, quotes and punctuation, iteration marks, small kana and the prolonged sound
-/// mark (line-start prohibited; the small katakana extensions U+31F0..U+31FF are a range below).
-const CLOSE: &str =
-    ")]},.:;!?’”‥…‼⁇⁈⁉、。々〉》」』】〕〗〙〛〜〞〟〻ぁぃぅぇぉっゃゅょゎゕゖゝゞ゠ァィゥェォッャュョヮヵヶ・ーヽヾ！），．：；？］｝｡｣､･ｰ";
+/// Opening brackets and quotes (line-end prohibited, JIS X 4051's 行末禁則).
+const OPEN: &str = "([{‘“〈《「『【〔〖〘〚〝（［｛｢｟";
+/// Closing brackets, quotes and punctuation, iteration marks, small kana, the prolonged sound mark
+/// and the (semi-)voiced sound marks (line-start prohibited, JIS X 4051's 行頭禁則). Two blocks
+/// are ranges in [`class`] instead: the small katakana extensions U+31F0..U+31FF and the halfwidth
+/// small kana U+FF67..U+FF6F plus the halfwidth voicing marks U+FF9E/U+FF9F.
+const CLOSE: &str = ")]},.:;!?’”‥…‼⁇⁈⁉、。々〉》」』】〕〗〙〛〜〞〟〻ぁぃぅぇぉっゃゅょゎゕゖゝゞ゠ァィゥェォッャュョヮヵヶ・ーヽヾ！），．：；？］｝｡｣､･ｰ｠゛゜〱〲〳〴〵";
 
 fn class(c: char) -> Class {
     if c.is_ascii_alphanumeric() {
@@ -35,11 +38,12 @@ fn class(c: char) -> Class {
     if OPEN.contains(c) {
         return Class::Open;
     }
-    if CLOSE.contains(c) || ('\u{31F0}'..='\u{31FF}').contains(&c) {
+    if CLOSE.contains(c) || ('\u{31F0}'..='\u{31FF}').contains(&c) || ('\u{FF67}'..='\u{FF6F}').contains(&c) || matches!(c, '\u{FF9E}' | '\u{FF9F}') {
         return Class::Close;
     }
     match c {
-        ' ' | '\t' | '\u{3000}' | '\u{2002}'..='\u{200B}' => Class::Space,
+        ' ' | '\t' | '\u{3000}' | '\u{2002}'..='\u{2006}' | '\u{2008}'..='\u{200B}' => Class::Space,
+        '\u{2007}' => Class::Glue,
         '-' | '/' | '\u{2010}' | '\u{2013}' | '\u{2014}' => Class::Hyphen,
         '\u{2E80}'..='\u{2FFF}'
         | '\u{3003}'..='\u{33FF}'
@@ -60,8 +64,8 @@ pub(crate) fn break_between(a: char, b: char) -> bool {
     use Class::*;
     match (class(a), class(b)) {
         // Spaces hang at the end of the line before them; kinsoku: no closing mark starts a line,
-        // no opening mark ends one.
-        (_, Space | Close) | (Open, _) => false,
+        // no opening mark ends one; glue holds on both sides.
+        (_, Space | Close | Glue) | (Open | Glue, _) => false,
         (Space | Hyphen | Ideo, _) | (_, Ideo) => true,
         _ => false,
     }
@@ -86,7 +90,7 @@ pub(crate) fn grapheme_starts(text: &str) -> Vec<bool> {
 }
 
 /// The char index of the grapheme cluster boundary after (`forward`) or before char `index` in
-/// `text`: where an arrow key, Delete or Backspace moves the caret to.
+/// `text`: where an arrow key or Delete moves the caret to.
 pub fn grapheme_step(text: &str, index: usize, forward: bool) -> usize {
     let mut at = 0;
     for g in text.graphemes(true) {
@@ -97,4 +101,40 @@ pub fn grapheme_step(text: &str, index: usize, forward: bool) -> usize {
         at = next;
     }
     at.min(index)
+}
+
+/// The start of the text deleted by Backspace at char `index`.
+///
+/// A letter's trailing mark (Grapheme_Cluster_Break Extend or SpacingMark, such as Thai MAI THO or
+/// SARA AM) is deleted on its own; other grapheme clusters remain atomic, so emoji sequences, flags,
+/// keycaps and Hangul syllables written as conjoining jamo stay intact.
+pub fn backspace_step(text: &str, index: usize) -> usize {
+    let end = text.chars().count().min(index);
+    let start = grapheme_step(text, end, false);
+    if start == end {
+        return end;
+    }
+
+    let cluster = text.chars().skip(start).take(end - start).collect::<Vec<_>>();
+    let letter_cluster = cluster.len() > 1 && cluster.first().is_some_and(|c| c.is_alphabetic());
+    if letter_cluster && cluster.last().is_some_and(|&c| is_trailing_mark(c)) { end - 1 } else { start }
+}
+
+/// Whether `c` is Extend or SpacingMark: it joins a plain letter's cluster. ZWJ also joins one but
+/// is a joiner, not a mark.
+fn is_trailing_mark(c: char) -> bool {
+    c != '\u{200D}' && format!("a{c}").graphemes(true).count() == 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn figure_space_is_non_breaking() {
+        assert!(!break_between('\u{2007}', '0'));
+        assert!(!break_between('1', '\u{2007}'));
+        assert!(!break_between('日', '\u{2007}') && !break_between('\u{2007}', '日'), "nor beside ideographs");
+        assert!(!is_space('\u{2007}'));
+    }
 }

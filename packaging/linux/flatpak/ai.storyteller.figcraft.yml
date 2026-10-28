@@ -53,6 +53,7 @@ modules:
     build-commands:
       - cargo --offline build --release --locked -p figcraft
       - install -Dm755 target/release/figcraft /app/bin/figcraft
+      - install -Dm644 NOTICE /app/share/doc/figcraft/NOTICE
       - install -Dm644 packaging/linux/ai.storyteller.figcraft.desktop /app/share/applications/ai.storyteller.figcraft.desktop
       - install -Dm644 packaging/linux/ai.storyteller.figcraft.mime.xml /app/share/mime/packages/ai.storyteller.figcraft.xml
       - mkdir -p /app/share/icons && cp -R assets/app-icon/hicolor /app/share/icons/

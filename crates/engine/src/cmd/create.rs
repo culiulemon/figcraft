@@ -83,7 +83,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "image.place",
             "Place image",
-            "{data (base64) | path, x?, y?, width?, height?, parent?, mode? (fill|fit|crop|tile)} → {id, image, width, height, imageProfile (its embedded colour profile; null: taken as sRGB)}",
+            "{data (base64) | path, x?, y?, width?, height?, parent?, target? (an existing layer: the image is added on top of its fills instead of making a layer), mode? (fill|fit|crop|tile)} → {id, image, width, height, imageProfile (its embedded colour profile; null: taken as sRGB)}",
             true,
             place_image
         ),
@@ -111,7 +111,8 @@ pub fn frame_at(doc: &Document, page: NodeId, pt: Point, exclude: &[NodeId]) -> 
             return None;
         }
         let n = doc.node(id)?;
-        if !n.visible || n.locked {
+        // Board objects (stickies, shapes with text) never take layers in.
+        if !n.visible || n.locked || n.is_board_atom() {
             return None;
         }
         let is_container = n.kind.is_frame_like() || matches!(n.kind, NodeKind::Section { .. });
@@ -164,6 +165,42 @@ fn create_kind(s: &mut Session, p: &Value, t: &str) -> Result<Value> {
 /// Parse SVG path data (`M L H V C S Q T A Z`, absolute and relative) into a bezier path.
 pub fn parse_path_data(d: &str) -> Option<figcraft_geom::BezPath> {
     figcraft_geom::BezPath::from_svg(d).ok()
+}
+
+/// A vector's geometry made from SVG path data (see [`path_network`]).
+pub(crate) struct PathShape {
+    /// The network, with the path's own box moved to the origin and scaled to the size asked for.
+    pub network: VectorNetwork,
+    pub width: f64,
+    pub height: f64,
+    /// Where the path's own box starts in its coordinates (unscaled).
+    pub offset: (f64, f64),
+}
+
+/// The network SVG path data `d` draws, for `node.create` and `node.set`: the path's own box moves
+/// to the origin, and `width`/`height` scale it as [`vector_scale`] says. Data that doesn't parse
+/// or draws nothing is refused.
+pub(crate) fn path_network(cmd: &str, d: &str, width: Option<f64>, height: Option<f64>) -> Result<PathShape> {
+    use figcraft_geom::Shape;
+    let empty = || bad(cmd, "`path` draws nothing: a vector needs a visible line or area");
+    let mut path = parse_path_data(d).ok_or_else(|| bad(cmd, "`path` is not valid SVG path data"))?;
+    let bb = path.bounding_box();
+    if !(bb.x0.is_finite() && bb.y0.is_finite() && bb.width().is_finite() && bb.height().is_finite()) {
+        return Err(bad(cmd, "`path` has coordinates too large to draw"));
+    }
+    if bb.width() <= 1e-9 && bb.height() <= 1e-9 {
+        return Err(empty());
+    }
+    path.apply_affine(figcraft_geom::Affine::translate((-bb.x0, -bb.y0)));
+    let (sx, sy) = vector_scale(width, height, bb.width(), bb.height(), "a path").map_err(|e| bad(cmd, e))?;
+    if sx != 1.0 || sy != 1.0 {
+        path.apply_affine(figcraft_geom::Affine::scale_non_uniform(sx, sy));
+    }
+    let network = VectorNetwork::from_path(&path);
+    if network.segments.is_empty() {
+        return Err(empty());
+    }
+    Ok(PathShape { network, width: bb.width() * sx, height: bb.height() * sy, offset: (bb.x0, bb.y0) })
 }
 
 /// How much a vector's path is scaled to take the size asked for: with both sides, each scales
@@ -228,27 +265,12 @@ pub fn create(s: &mut Session, p: &Value) -> Result<Value> {
     let asked = (num(p, "width"), num(p, "height"));
     if let NodeKind::Vector { network } = &mut kind {
         if let Some(d) = string(p, "path") {
-            let mut path = parse_path_data(&d).ok_or_else(|| bad(cmd, "`path` is not valid SVG path data"))?;
-            use figcraft_geom::Shape;
-            let bb = path.bounding_box();
-            if bb.width() <= 1e-9 && bb.height() <= 1e-9 {
-                return Err(bad(cmd, "`path` draws nothing: a vector needs a visible line or area"));
-            }
-            path.apply_affine(figcraft_geom::Affine::translate((-bb.x0, -bb.y0)));
-            let (sx, sy) = vector_scale(asked.0, asked.1, bb.width(), bb.height(), "a path").map_err(|e| bad(cmd, e))?;
-            if sx != 1.0 || sy != 1.0 {
-                path.apply_affine(figcraft_geom::Affine::scale_non_uniform(sx, sy));
-            }
-            *network = VectorNetwork::from_path(&path);
-            if network.segments.is_empty() {
-                return Err(bad(cmd, "`path` draws nothing: a vector needs a visible line or area"));
-            }
+            let shape = path_network(cmd, &d, asked.0, asked.1)?;
+            *network = shape.network;
             if boolean(p, "closed") == Some(false) {
                 network.regions.clear();
             }
-            w = bb.width() * sx;
-            h = bb.height() * sy;
-            offset = (bb.x0, bb.y0);
+            (w, h, offset) = (shape.width, shape.height, shape.offset);
         } else if let Some(Value::Array(pts)) = get(p, "points") {
             let pts: Vec<Point> = pts.iter().filter_map(|v| Some(Point::new(f64_of(v.get(0)?)?, f64_of(v.get(1)?)?))).collect();
             if pts.len() < 2 {
@@ -372,9 +394,28 @@ fn read_path(path: &str) -> Result<Vec<u8>> {
     Err(crate::EngineError::Other(format!("{path}: files can't be read in the browser")))
 }
 
+/// Layers that can show an image inside their own outline.
+pub fn accepts_image_fill(kind: &NodeKind) -> bool {
+    kind.is_shape() || kind.is_frame_like() || matches!(kind, NodeKind::Text(_) | NodeKind::BooleanOp { .. })
+}
+
+/// Add an image fill on top of the layer's fills: the others keep their place and variable
+/// bindings; a linked fill style no longer describes the list, so the link goes.
+fn add_image_fill(node: &mut Node, image: String, mode: ImageScaleMode) {
+    node.fills.push(Paint::image(image, mode));
+    node.styles.fill = None;
+}
+
 /// Place an image as a rectangle with an image fill (Figma's image layer).
 pub fn place_image(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "image.place";
+    let target = opt_id(cmd, p, "target")?;
+    if let Some(id) = target {
+        let node = s.doc()?.node(id).ok_or(crate::EngineError::NoNode(id))?;
+        if !accepts_image_fill(&node.kind) {
+            return Err(bad(cmd, "`target` must be a layer that can have a fill"));
+        }
+    }
     let bytes = if let Some(b64) = string(p, "data") {
         use base64::Engine as _;
         let b64 = b64.split_once(',').map(|(_, d)| d.to_string()).unwrap_or(b64);
@@ -390,6 +431,14 @@ pub fn place_image(s: &mut Session, p: &Value) -> Result<Value> {
         "tile" => ImageScaleMode::Tile,
         _ => ImageScaleMode::Fill,
     };
+    if let Some(id) = target {
+        let doc = s.doc_mut()?;
+        let (hash, _, _) = figcraft_format::add_image(doc, bytes).map_err(|e| bad(cmd, e.to_string()))?;
+        let profile = figcraft_render::images::profile_name(&hash, doc.images.get(&hash));
+        let node = doc.get_mut(id)?;
+        add_image_fill(node, hash.clone(), mode);
+        return Ok(json!({"id": id, "image": hash, "width": node.width, "height": node.height, "imageProfile": profile}));
+    }
     let page = s.page()?;
     let parent = crate::params::opt_id(cmd, p, "parent")?.unwrap_or(page);
     let ds = s.ds_mut()?;

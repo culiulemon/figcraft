@@ -340,6 +340,13 @@ fn rem_conversion_leaves_names_alone() {
     let f = crate::codegen::px_to_rem;
     // Lengths convert, names ending in "px" don't.
     assert_eq!(f("width: 32px; --gap-8px: 1; margin: -8px 0px;", 16.0), "width: 2rem; --gap-8px: 1; margin: -0.5rem 0rem;");
-    assert_eq!(f("épx 1px px", 16.0), "épx 0.06rem px");
+    assert_eq!(f("épx 1px px", 16.0), "épx 0.0625rem px");
     assert_eq!(f("", 16.0), "");
+}
+
+#[test]
+fn rem_conversion_keeps_the_original_pixels() {
+    let f = crate::codegen::px_to_rem;
+    assert_eq!(f("padding: 3px;", 16.0), "padding: 0.1875rem;");
+    assert_eq!(f("gap: 0.5px;", 16.0), "gap: 0.03125rem;");
 }

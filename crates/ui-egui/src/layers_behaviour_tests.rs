@@ -312,6 +312,7 @@ fn pages_down_to(u: &mut Ui, to: f32) -> Vec<NodeId> {
     opened
 }
 
+/// Asserts a 60-page list scrolls with the wheel to its last page, past its first pages.
 #[test]
 fn a_long_pages_list_scrolls_and_leaves_room_for_the_layers() {
     let mut s = Session::new();
@@ -330,6 +331,7 @@ fn a_long_pages_list_scrolls_and_leaves_room_for_the_layers() {
     // The wheel over the pages list scrolls it to its last page.
     let wheel = Event::MouseWheel {
         unit: egui::MouseWheelUnit::Point,
+        source: egui::MouseWheelSource::Unknown,
         delta: egui::vec2(0.0, -400.0),
         phase: egui::TouchPhase::Move,
         modifiers: Default::default(),
@@ -382,6 +384,8 @@ fn double_click_checking_focus(u: &mut Ui, p: Pos2) {
     }
 }
 
+/// Asserts double-clicking a page selects and renames it, with the keyboard in its name
+/// field for the screen-reader tree.
 #[test]
 fn double_clicking_a_page_renames_it_with_the_focus_in_the_screen_reader_tree() {
     let mut s = Session::new();
@@ -394,10 +398,10 @@ fn double_clicking_a_page_renames_it_with_the_focus_in_the_screen_reader_tree() 
     double_click_checking_focus(&mut u, r2);
     assert_eq!(u.app.session.page().unwrap(), p2);
     assert_eq!(u.app.ui.rename_page.as_ref().map(|r| r.0), Some(p2), "a double click renames the page");
-    assert!(u.ctx.memory(|m| m.has_focus(Id::new(("pagename", p2)).with("te"))), "with the keyboard in its name");
+    assert!(u.ctx.memory(|m| m.has_focus(Id::unique(("pagename", p2)).with("te"))), "with the keyboard in its name");
     // The page that's open.
     u.app.ui.rename_page = None;
-    u.ctx.memory_mut(|m| m.surrender_focus(Id::new(("pagename", p2)).with("te")));
+    u.ctx.memory_mut(|m| m.surrender_focus(Id::unique(("pagename", p2)).with("te")));
     u.app.session.execute("page.select", &json!({"id": p1})).unwrap();
     for _ in 0..30 {
         u.frame(vec![]);

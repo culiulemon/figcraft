@@ -17,8 +17,8 @@ pub const USAGE: &str = "figcraft-cli — FigCraft without a window
 
 USAGE:
   figcraft-cli info <file> [--json]
-  figcraft-cli export <file> -o <out> [--format png|jpg|svg|webp|pdf|fig] [--scale N] [--page NAME] [--node ID|NAME]
-                      [--bleed LENGTH] [--crop-marks] [--bleed-marks] [--cmyk]
+  figcraft-cli export <file> -o <out> [--format png|jpg|svg|webp|pdf|xml|fig] [--scale N] [--page NAME] [--node ID|NAME]
+                      [--bleed LENGTH] [--crop-marks] [--bleed-marks] [--cmyk] [--vd-compat bestEffort|exact|ignore]
   figcraft-cli convert <in> <out>
   figcraft-cli render <file> -o <out.png> [--scale N] [--page NAME]
   figcraft-cli run <script.json|script.jsonl> [--in <file>] [--out <file>]
@@ -27,16 +27,16 @@ USAGE:
   figcraft-cli mcp [--attach PORT] [--automation-read-root DIR]... [--automation-write-root DIR]...
   figcraft-cli plugin publish <folder> --server ws://host:port/[?key=KEY]
   figcraft-cli perf [--layers N[,N...]] [--instances N[,N...]]
-  figcraft-cli help | --help | --version
+  figcraft-cli help | --help | --version   (a subcommand followed by --help or -h prints this too)
 
 Every subcommand takes --no-system-fonts (or set FIGCRAFT_NO_SYSTEM_FONTS=1): text uses only the
 fonts built into FigCraft, for renders that match on every machine. Otherwise installed fonts are
 indexed the first time text is laid out, as in the app.
 
 Files: .figcraft (native), .json (FigCraft or REST API file JSON), .fig (best effort; `info` lists what
-wasn't imported), .svg, .png/.jpg/.webp/.gif/.bmp (open as an image layer). `export` writes one file
-per top-level frame into the <out> directory, or one file when <out> has an image extension or --node
-is given (`fig`, or an <out> ending in .fig: the whole file as .fig, experimental; other apps may
+wasn't imported), .sketch (Sketch 48 or newer, best effort), .svg, .png/.jpg/.webp/.gif/.bmp (open as an
+image layer). `export` writes one file per top-level frame into the <out> directory, or one file when
+<out> has an image extension or --node is given (`fig`, or an <out> ending in .fig: the whole file as .fig, experimental; other apps may
 not open every file); PDFs take print options (a bleed like 3mm or 0.125in,
 crop and bleed marks, CMYK colour). `run` executes a JSON array (or JSON lines) of
 {\"command\": id, \"params\": {...}} in a headless session and prints one JSON result line per step.
@@ -46,10 +46,11 @@ the FIGCRAFT_SERVER_KEY environment variable (which keeps it out of the shell hi
 `--automation-read-root DIR` / `--automation-write-root DIR` (each may be repeated; the folders
 must exist) confine the files a subcommand touches: reads only inside a read or write root, writes
 only inside a write root, everything else refused -- so giving no write root denies writing
-altogether. They are taken by `mcp`, to confine the agent's commands, and by `info`, `export`,
-`convert`, `render` and `run`, to confine that one run; without them a subcommand reads and writes
-as the user who started it, as before. A running app confines itself: start it with
-`figcraft --control PORT` and the same flags (`--attach` refuses them).
+altogether. They reach the headless side only: `mcp` takes them to confine the agent's commands,
+and `info`, `export`, `convert`, `render` and `run` to confine that one run; without them a
+subcommand reads and writes as the user who started it, as before. A `mcp --attach` server is
+confined by the app it attaches to, not by flags passed to the CLI: start that app with
+`figcraft --control PORT` and the same roots (`--attach` refuses them).
 See docs/cli.md and docs/mcp.md.";
 
 /// The automation roots a file subcommand was given, if any. Omitting both leaves the run
@@ -74,6 +75,10 @@ fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match run(&argv) {
         Ok(code) => code,
+        Err(CliError::Help) => {
+            println!("{USAGE}");
+            ExitCode::SUCCESS
+        }
         Err(CliError::Usage(msg)) => {
             eprintln!("error: {msg}\n\n{USAGE}");
             ExitCode::from(2)
@@ -87,6 +92,8 @@ fn main() -> ExitCode {
 
 #[derive(Debug)]
 pub enum CliError {
+    /// `--help` or `-h` after a subcommand: usage on stdout, exit code 0.
+    Help,
     /// Bad arguments: usage is printed, exit code 2.
     Usage(String),
     /// The operation failed: exit code 1.
@@ -101,15 +108,27 @@ impl From<String> for CliError {
 
 pub type CliResult<T> = Result<T, CliError>;
 
-fn run(argv: &[String]) -> CliResult<ExitCode> {
-    let system_fonts = !argv.iter().any(|a| a == "--no-system-fonts");
-    let argv: Vec<String> = argv.iter().filter(|a| *a != "--no-system-fonts").cloned().collect();
-    if system_fonts {
+fn parse_args(argv: &[String], valued: &[&str], flags: &[&str]) -> CliResult<Args> {
+    let flags = [flags, &["no-system-fonts"]].concat();
+    let args = Args::parse(argv, valued, &flags)?;
+    if !args.flag("no-system-fonts") {
         // Text lays out with the installed fonts, like the desktop app, so headless renders and
         // auto layout sizes match what users see.
         figcraft_text::scan_system_fonts_on_demand();
+    } else {
+        // Nothing scans them then, not even a `.sketch` import matching its fonts.
+        figcraft_text::opt_out_of_system_fonts();
     }
-    let Some((cmd, rest)) = argv.split_first() else { return Err(CliError::Usage("missing subcommand".into())) };
+    Ok(args)
+}
+
+fn run(argv: &[String]) -> CliResult<ExitCode> {
+    let Some(command_index) = argv.iter().position(|a| a != "--no-system-fonts") else {
+        return Err(CliError::Usage("missing subcommand".into()));
+    };
+    let cmd = argv.get(command_index).ok_or_else(|| CliError::Usage("missing subcommand".into()))?;
+    // Keep leading global flags with the subcommand's options, where values and `--` are parsed.
+    let rest: Vec<String> = argv.iter().enumerate().filter(|(i, _)| *i != command_index).map(|(_, a)| a.clone()).collect();
     match cmd.as_str() {
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
@@ -120,21 +139,27 @@ fn run(argv: &[String]) -> CliResult<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         "info" => {
-            let a = Args::parse(rest, &ROOT_FLAGS, &["json"])?;
+            let a = parse_args(&rest, &ROOT_FLAGS, &["json"])?;
             let file = a.one_positional("info <file>")?;
             confined(&a, || files::info(&file, a.flag("json")))
         }
         "export" => {
-            let valued = [&["format", "scale", "page", "node", "o", "out", "bleed"][..], &ROOT_FLAGS[..]].concat();
-            let a = Args::parse(rest, &valued, &["crop-marks", "bleed-marks", "cmyk"])?;
+            let valued = [&["format", "scale", "page", "node", "o", "out", "bleed", "vd-compat"][..], &ROOT_FLAGS[..]].concat();
+            let a = parse_args(&rest, &valued, &["crop-marks", "bleed-marks", "cmyk"])?;
             let file = a.one_positional("export <file> -o <out>")?;
             let out = a.value("o").or_else(|| a.value("out")).ok_or_else(|| CliError::Usage("export needs -o <out>".into()))?;
-            let target =
-                files::Target { format: a.value("format"), scale: a.scale()?, page: a.value("page"), node: a.value("node"), print: a.print()? };
+            let target = files::Target {
+                format: a.value("format"),
+                scale: a.scale()?,
+                page: a.value("page"),
+                node: a.value("node"),
+                print: a.print()?,
+                vd_compat: a.vd_compat()?,
+            };
             confined(&a, || files::export(&file, &out, &target))
         }
         "convert" => {
-            let a = Args::parse(rest, &ROOT_FLAGS, &[])?;
+            let a = parse_args(&rest, &ROOT_FLAGS, &[])?;
             match a.positional.as_slice() {
                 [i, o] => confined(&a, || files::convert(i, o)),
                 _ => Err(CliError::Usage("convert <in> <out>".into())),
@@ -142,19 +167,19 @@ fn run(argv: &[String]) -> CliResult<ExitCode> {
         }
         "render" => {
             let valued = [&["o", "out", "scale", "page"][..], &ROOT_FLAGS[..]].concat();
-            let a = Args::parse(rest, &valued, &[])?;
+            let a = parse_args(&rest, &valued, &[])?;
             let file = a.one_positional("render <file> -o <out.png>")?;
             let out = a.value("o").or_else(|| a.value("out")).ok_or_else(|| CliError::Usage("render needs -o <out.png>".into()))?;
             confined(&a, || files::render(&file, &out, a.scale()?, a.value("page").as_deref()))
         }
         "run" => {
             let valued = [&["in", "out"][..], &ROOT_FLAGS[..]].concat();
-            let a = Args::parse(rest, &valued, &[])?;
+            let a = parse_args(&rest, &valued, &[])?;
             let script = a.one_positional("run <script.json|.jsonl>")?;
             confined(&a, || files::run_script(&script, a.value("in").as_deref(), a.value("out").as_deref()))
         }
         "commands" => {
-            let a = Args::parse(rest, &["filter"], &["json"])?;
+            let a = parse_args(&rest, &["filter"], &["json"])?;
             if !a.positional.is_empty() {
                 return Err(CliError::Usage("commands takes no positional arguments".into()));
             }
@@ -163,7 +188,7 @@ fn run(argv: &[String]) -> CliResult<ExitCode> {
         }
         "mcp" => {
             let valued = [&["attach"][..], &ROOT_FLAGS[..]].concat();
-            let a = Args::parse(rest, &valued, &[])?;
+            let a = parse_args(&rest, &valued, &[])?;
             if !a.positional.is_empty() {
                 return Err(CliError::Usage("mcp takes no positional arguments".into()));
             }
@@ -178,7 +203,7 @@ fn run(argv: &[String]) -> CliResult<ExitCode> {
             mcp(attach.as_deref(), roots_of(&a)?)
         }
         "plugin" => {
-            let a = Args::parse(rest, &["server"], &[])?;
+            let a = parse_args(&rest, &["server"], &[])?;
             match a.positional.as_slice() {
                 [verb, folder] if verb == "publish" => {
                     let server = a.value("server").ok_or_else(|| CliError::Usage("plugin publish needs --server ws://host:port/".into()))?;
@@ -188,10 +213,10 @@ fn run(argv: &[String]) -> CliResult<ExitCode> {
             }
         }
         "perf" => {
-            let a = Args::parse(rest, &["layers", "instances"], &[])?;
+            let a = parse_args(&rest, &["layers", "instances"], &[])?;
             let sizes: Vec<usize> = a.usizes("layers", &[1000, 10_000])?.into_iter().map(|n| n.clamp(10, 2_000_000)).collect();
             let instances: Vec<usize> = a.usizes("instances", &[2000])?.into_iter().filter(|n| *n > 0).map(|n| n.min(100_000)).collect();
-            perf::run(&sizes, &instances, system_fonts)
+            perf::run(&sizes, &instances, !a.flag("no-system-fonts"))
         }
         other => Err(CliError::Usage(format!("unknown subcommand `{other}`"))),
     }

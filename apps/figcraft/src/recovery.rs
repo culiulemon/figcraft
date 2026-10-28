@@ -206,10 +206,12 @@ impl Recovery {
             let doc = d.doc.clone();
             let (versions, branches) = (d.versions.clone(), figcraft_engine::branches::current(s, d.uid));
             // Which online file it is and what of the server's this very copy has (a line each:
-            // the server, the file's id, then the session, client id and last change), while it
+            // the server, the file's id, then the session, client id, last change and the secret the
+            // client id resumes with), while it
             // is one. Written after the copy, never before: a note must not promise more of the
             // server's changes than its copy holds.
-            let online = s.online_of(d.uid).map(|(server, file, at)| format!("{server}\n{file}\n{} {} {}", at.session, at.client_id, at.seq));
+            let online =
+                s.online_of(d.uid).map(|(server, file, at)| format!("{server}\n{file}\n{} {} {} {}", at.session, at.client_id, at.seq, at.secret));
             let job = move || {
                 if !write_atomic(&path, &doc, &versions, &branches) {
                     return false;
@@ -312,7 +314,10 @@ fn rejoin_online(file: &Path, s: &mut Session) -> Option<u64> {
     let (server, id, at) = (lines.next()?, lines.next()?, lines.next()?);
     let mut at = at.split(' ').map(|n| n.parse::<u64>().ok());
     let (session, client, seq) = (at.next()??, at.next()??, at.next()??);
-    let params = json!({"path": file.to_string_lossy(), "server": server, "file": id, "session": session, "client": client, "seq": seq});
+    // Absent in notes written before ids had secrets.
+    let secret = at.next().flatten().unwrap_or(0);
+    let params =
+        json!({"path": file.to_string_lossy(), "server": server, "file": id, "session": session, "client": client, "seq": seq, "secret": secret});
     s.execute("collab.recoverFile", &params).ok()?.get("session")?.as_u64()
 }
 
@@ -338,7 +343,24 @@ fn stamp(s: &Session, d: &DocState) -> Vec<u64> {
 fn write_atomic(path: &Path, doc: &figcraft_engine::doc::Document, versions: &[Version], branches: &[Branch]) -> bool {
     let Ok(bytes) = figcraft_format::save_bytes_with_history(doc, None, versions, branches) else { return false };
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, path).is_ok()
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true).mode(0o600);
+        let Ok(mut f) = opts.open(&tmp) else { return false };
+        if std::io::Write::write_all(&mut f, &bytes).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return false;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if std::fs::write(&tmp, bytes).is_err() {
+            return false;
+        }
+    }
+    std::fs::rename(&tmp, path).is_ok()
 }
 
 /// [`recover_all`], for a start that keeps nothing waiting: how many documents came back as

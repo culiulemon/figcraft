@@ -359,6 +359,10 @@ impl<'s> Decoder<'s, '_> {
     fn field(&mut self, f: &Field, depth: usize) -> Result<Kv<'s>, KiwiError> {
         let ty = f.ty.ok_or_else(|| KiwiError("message: untyped field".into()))?;
         if !f.array {
+            // A nested definition spends its own value in `def`.
+            if !matches!(ty, Type::Def(_)) {
+                self.spend(1)?;
+            }
             return self.value(ty, depth);
         }
         let n = self.r.var_uint()? as usize;
@@ -559,7 +563,11 @@ pub mod encode {
             Type::Byte => w.byte(ranged(0, 255)? as u8),
             Type::Int => w.var_int(ranged(i32::MIN.into(), i32::MAX.into())? as i32),
             Type::Uint => w.var_uint(ranged(0, u32::MAX.into())? as u32),
-            Type::Float => w.var_float(v.f64().map(|x| x as f32).filter(|x| x.is_finite()).ok_or_else(bad)?),
+            // Infinity is a value of its own (an axis with no maximum size); NaN is not.
+            Type::Float => w.var_float(match v {
+                Kv::Float(f) if f.is_infinite() => *f,
+                _ => v.f64().map(|x| x as f32).filter(|x| x.is_finite()).ok_or_else(bad)?,
+            }),
             Type::Str => w.string(v.str().ok_or_else(bad)?),
             Type::Int64 => w.var_int64(ranged(i64::MIN.into(), i64::MAX.into())? as i64),
             Type::Uint64 => w.var_uint64(ranged(0, u64::MAX.into())? as u64),

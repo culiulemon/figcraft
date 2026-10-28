@@ -233,6 +233,20 @@ fn not_sharing_the_popover_offers_one_way_to_start_and_one_to_join() {
 }
 
 #[test]
+fn the_server_key_shows_as_dots_while_shown_and_typed() {
+    let (mut h, _) = harness();
+    let shapes = open(&mut h);
+    click(&mut h, &shapes, "Advanced");
+    h.app.ui.live.share_key = Some(("wss://share.example/".to_string(), "s3cret-key".to_string()));
+    let shapes = h.frames(2);
+    let dots = "•".repeat(10);
+    assert!(has_text(&shapes, &dots) && !has_text(&shapes, "s3cret-key"));
+    // Editing it keeps it hidden.
+    let shapes = click(&mut h, &shapes, &dots);
+    assert!(!has_text(&shapes, "s3cret-key"));
+}
+
+#[test]
 fn sharing_online_shows_the_code_copies_it_and_stops() {
     let (mut h, script) = harness();
     let shapes = open(&mut h);
@@ -385,13 +399,16 @@ fn without_a_code_the_link_is_shared_instead() {
     assert_eq!(script.lock().unwrap().copied.last().map(String::as_str), Some(PLAIN));
 }
 
+/// Asserts the join field accepts a typed code or invite link, joins on Enter, clears after
+/// joining, shows failure/retry, rejects an invalid code with an error, and accepts local
+/// codes and links.
 #[test]
 fn the_join_field_takes_a_code_or_a_link_and_enter_joins() {
     let (mut h, script) = harness();
     let shapes = open(&mut h);
     // Click into the field (its hint), type a code the way people type it, press Enter.
     click(&mut h, &shapes, "Code or invite link");
-    assert!(h.ctx.memory(|m| m.has_focus(egui::Id::new("live_join_code"))));
+    assert!(h.ctx.memory(|m| m.has_focus(egui::Id::unique("live_join_code"))));
     type_text(&mut h, " k7m 2qx-9td ");
     assert_eq!(crate::live::inspect(&h.app)["joinField"], " k7m 2qx-9td ");
     key(&mut h, Key::Enter);
@@ -450,13 +467,15 @@ fn the_home_screen_joins_with_a_code_and_opens_the_file() {
     assert_eq!(h.app.session.docs.len(), 2);
 }
 
+/// Asserts the join dialog uses the same shared join field, focuses it, and closes once the
+/// join starts.
 #[test]
 fn the_join_dialog_is_the_same_field() {
     let (mut h, script) = harness();
     crate::menus::invoke(&mut h.app, "collab.join");
     let shapes = h.frames(2);
     assert!(has_text(&shapes, "Type the join code you were given, or paste an invite link.") && has_text(&shapes, "Code or invite link"));
-    assert!(h.ctx.memory(|m| m.has_focus(egui::Id::new("live_join_link"))), "the field has the keyboard");
+    assert!(h.ctx.memory(|m| m.has_focus(egui::Id::unique("live_join_link"))), "the field has the keyboard");
     type_text(&mut h, "4fh j8r 2wn");
     key(&mut h, Key::Enter);
     h.frames(1);
@@ -484,6 +503,22 @@ fn the_server_preference_resets_and_turns_online_sharing_off() {
     click(&mut h, &shapes, "Start sharing");
     let s = script.lock().unwrap();
     assert!(s.published.is_empty() && s.hosted.len() == 1, "shared on the local network");
+}
+
+#[test]
+fn a_key_typed_for_one_server_is_not_sent_to_another() {
+    // The Server key field remembers the server it was typed for: it goes out only to that
+    // server. Changing the server in Preferences must not send the old server's key to the new
+    // one. (The key is set as the field editor would, bound to the server it was typed for.)
+    let (mut h, script) = harness();
+    h.app.ui.live.share_key = Some(("wss://share.example/".to_string(), "KeyKeyKeyKeyKeyKeyKey0".to_string()));
+    h.frames(2);
+    // Change the server in Preferences to another one, then share: the old key must not go to it.
+    h.app.session.execute("pref.publishServer", &json!({"url": "wss://other.example/"})).unwrap();
+    h.frames(2);
+    let shapes = open(&mut h);
+    click(&mut h, &shapes, "Start sharing");
+    assert_eq!(script.lock().unwrap().published.last().unwrap().key, None, "the old server's key is not sent to the new server");
 }
 
 #[test]

@@ -99,16 +99,18 @@ fn scene(s: &mut Session) -> Scene {
 
 #[test]
 fn dragging_in_the_layers_panel_reorders_by_the_documented_rules() {
-    // The panel drops layers with `node.reparent {ids, parent, index}`: `index` counts the
-    // parent's children bottom first, as they are before the move.
+    // The panel drops layers with `node.reparent {ids, parent, index}`: `index` is where the first
+    // moved layer ends up among the parent's children, bottom first, counted after the move.
     // (moved, index in F, F's children after (bottom first), derivation)
-    let rows: [(&[&str], usize, [&str; 4], &str); 6] = [
-        (&["a"], 4, ["b", "c", "d", "a"], "a layer dragged to the top of its parent's list comes to the front"),
+    let rows: [(&[&str], usize, [&str; 4], &str); 8] = [
+        (&["a"], 3, ["b", "c", "d", "a"], "a layer dragged to the top of its parent's list comes to the front"),
+        (&["a"], 9, ["b", "c", "d", "a"], "an index past the end is the front"),
         (&["d"], 0, ["d", "a", "b", "c"], "a layer dragged to the bottom of the list goes to the back"),
-        (&["a"], 2, ["b", "a", "c", "d"], "a layer dropped between two layers lands between them"),
-        (&["a", "b"], 4, ["c", "d", "a", "b"], "several selected layers move together, keeping their order"),
-        (&["a", "d"], 2, ["b", "a", "d", "c"], "several layers from apart land together where they are dropped"),
-        (&["b", "c"], 1, ["a", "b", "c", "d"], "silent: dropping a block of layers onto itself changes nothing (pinned)"),
+        (&["a"], 1, ["b", "a", "c", "d"], "a layer moved up one place goes up one place (#992)"),
+        (&["a"], 0, ["a", "b", "c", "d"], "silent: a layer asked to stay where it is stays (pinned)"),
+        (&["a", "b"], 2, ["c", "d", "a", "b"], "several selected layers move together, keeping their order"),
+        (&["a", "d"], 1, ["b", "a", "d", "c"], "several layers from apart land together where they are asked to"),
+        (&["b", "c"], 1, ["a", "b", "c", "d"], "silent: moving a block of layers to where it is changes nothing (pinned)"),
     ];
     for (moved, index, after, why) in rows {
         let mut s = Session::new();
@@ -170,6 +172,32 @@ fn dragging_into_frames_groups_and_auto_layout() {
         [k.b, k.d],
         "silent: hidden layers move and locked frames take drops (pinned)"
     );
+}
+
+#[test]
+fn reparent_index_is_the_final_position_in_auto_layout_and_across_parents() {
+    // #992: `index` is the layer's place among the parent's children after the move.
+    let mut s = Session::new();
+    let row = id(&ex(&mut s, "node.create", json!({"type": "frame", "name": "Row", "props": {"layout": "horizontal"}})));
+    let text = |s: &mut Session, t: &str, parent: NodeId| id(&ex(s, "node.create", json!({"type": "text", "name": t, "text": t, "parent": parent})));
+    let (first, second, third) = (text(&mut s, "first", row), text(&mut s, "second", row), text(&mut s, "third", row));
+    let names = |s: &Session, p: NodeId| kids(s, p).iter().map(|i| name(s, *i)).collect::<Vec<_>>();
+    ex(&mut s, "node.reparent", json!({"ids": [first], "parent": row, "index": 1}));
+    assert_eq!(names(&s, row), ["second", "first", "third"], "moved down one place");
+    ex(&mut s, "node.reparent", json!({"ids": [first], "parent": row, "index": 2}));
+    assert_eq!(names(&s, row), ["second", "third", "first"], "moved to the end");
+    ex(&mut s, "node.reparent", json!({"ids": [first], "parent": row, "index": 0}));
+    assert_eq!(names(&s, row), ["first", "second", "third"], "moved to the start");
+    let x = |s: &Session, i: NodeId| s.doc().unwrap().node(i).unwrap().transform.as_coeffs()[4];
+    assert!(x(&s, first) < x(&s, second) && x(&s, second) < x(&s, third), "the flow follows the new order");
+    // Into another parent, `index` means the same thing.
+    let other = id(&ex(&mut s, "node.create", json!({"type": "frame", "name": "Other", "props": {"layout": "horizontal"}})));
+    let (p, q) = (text(&mut s, "p", other), text(&mut s, "q", other));
+    ex(&mut s, "node.reparent", json!({"ids": [second], "parent": other, "index": 1}));
+    assert_eq!(kids(&s, other), [p, second, q], "lands at index 1 of the new parent");
+    ex(&mut s, "node.reparent", json!({"ids": [first, third], "parent": other, "index": 3}));
+    assert_eq!(kids(&s, other), [p, second, q, first, third], "several layers start at index 3, keeping their order");
+    assert!(kids(&s, row).is_empty());
 }
 
 #[test]

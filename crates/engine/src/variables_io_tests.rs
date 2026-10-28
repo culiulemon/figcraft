@@ -1,5 +1,5 @@
 //! Extended variable collections (overrides, library updates, reset), variables import and
-//! export (JSON round trip, merging by name, CSS, junk), gradient stops bound to variables and
+//! export (JSON round trip, merging by name, CSS, Dart, junk), gradient stops bound to variables and
 //! variant properties driven by string variables.
 
 use figcraft_color::{Color, ColorStop, Gradient, GradientKind, Paint, PaintKind};
@@ -214,9 +214,9 @@ fn variables_export_and_import_round_trip() {
     let css = ex(&mut s, "variable.export", json!({"format": "css", "collections": ["Theme"]}))["text"].as_str().unwrap().to_string();
     for want in [
         ":root {\n",
-        "  --radius: 4;\n",
+        "  --radius: 4px;\n",
         "[data-theme=\"Dark\"] {\n",
-        "  --radius: 6.5;\n",
+        "  --radius: 6.5px;\n",
         "  --accent: var(--color-primary);\n",
         "  --label: \"Say  hi \";\n",
     ] {
@@ -373,6 +373,86 @@ fn variant_properties_follow_string_variables() {
 }
 
 #[test]
+fn variables_export_as_dart_constants_for_flutter() {
+    let mut s = Session::new();
+    theme(&mut s);
+    let dart = ex(&mut s, "variable.export", json!({"format": "dart"}))["text"].as_str().unwrap().to_string();
+    for want in [
+        "import 'dart:ui';\n",
+        "/// Theme · Light\nabstract final class Theme {\n",
+        "  static const Color colorPrimary = Color(0x800000FF);\n",
+        "  static const double radius = 4;\n",
+        "  static const String label = 'Say \"hi\"';\n",
+        "  static const bool on = false;\n",
+        "  static const Color accent = Color(0xFF000000);\n",
+        "/// Theme · Dark\nabstract final class ThemeDark {\n",
+        "  static const double radius = 6.5;\n",
+        // An alias is its target's value in that mode.
+        "  static const Color accent = Color(0xFFFFFFFF);\n",
+    ] {
+        assert!(dart.contains(want), "{want:?} in\n{dart}");
+    }
+    // Every class lists every variable once.
+    assert_eq!(dart.matches("static const").count(), 10, "{dart}");
+}
+
+#[test]
+fn dart_export_names_are_valid_dart() {
+    let mut s = Session::new();
+    ex(&mut s, "variable.createCollection", json!({"name": "2 brand-tokens", "modes": ["Default", "high contrast"]}));
+    ex(&mut s, "variable.createCollection", json!({"name": "Brand tokens"}));
+    for name in ["space/2xl", "class", "a b", "a-b", "\u{65e5}\u{672c}", "it's $5\\"] {
+        ex(&mut s, "variable.create", json!({"collection": "2 brand-tokens", "name": name, "type": "string", "value": name}));
+    }
+    let dart = ex(&mut s, "variable.export", json!({"format": "dart"}))["text"].as_str().unwrap().to_string();
+    for want in [
+        "abstract final class V2BrandTokens {",
+        "abstract final class V2BrandTokensHighContrast {",
+        "abstract final class BrandTokens {",
+        "static const String space2xl = 'space/2xl';",
+        "static const String class_ = 'class';",
+        // Two names that read the same in Dart stay apart.
+        "static const String aB = 'a b';",
+        "static const String aB2 = 'a-b';",
+        // Nothing usable in a name: still a name.
+        "static const String v = '\u{65e5}\u{672c}';",
+        "static const String itS5 = 'it\\'s \\$5\\\\';",
+    ] {
+        assert!(dart.contains(want), "{want:?} in\n{dart}");
+    }
+}
+
+#[test]
+fn dart_export_names_never_shadow_dart_types() {
+    let mut s = Session::new();
+    ex(&mut s, "variable.createCollection", json!({"name": "Color"}));
+    ex(&mut s, "variable.createCollection", json!({"name": "String"}));
+    for name in ["double", "int", "bool", "num"] {
+        ex(&mut s, "variable.create", json!({"collection": "Color", "name": name, "type": "number", "value": 1}));
+    }
+    ex(&mut s, "variable.create", json!({"collection": "Color", "name": "ratio", "type": "number", "value": 0.125}));
+    ex(&mut s, "variable.create", json!({"collection": "Color", "name": "third", "type": "number", "value": 1.0 / 3.0}));
+    ex(&mut s, "variable.create", json!({"collection": "Color", "name": "huge", "type": "number", "value": 1.5e21}));
+    let dart = ex(&mut s, "variable.export", json!({"format": "dart"}))["text"].as_str().unwrap().to_string();
+    // A class `Color` would hide dart:ui's `Color`, a constant `double` the type of those after it.
+    for want in [
+        "abstract final class Color_ {",
+        "abstract final class String_ {",
+        "static const double double_ = 1;",
+        "static const double int_ = 1;",
+        "static const double bool_ = 1;",
+        "static const double num_ = 1;",
+        // Numbers keep their full precision.
+        "static const double ratio = 0.125;",
+        "static const double third = 0.3333333333333333;",
+        // Too big for an exact integer literal: an exponent, still a double.
+        "static const double huge = 1.5e21;",
+    ] {
+        assert!(dart.contains(want), "{want:?} in\n{dart}");
+    }
+}
+
+#[test]
 fn paints_replaced_through_node_set_keep_unchanged_stop_bindings() {
     let mut s = Session::new();
     let r = gradient_rect(&mut s);
@@ -396,4 +476,40 @@ fn paints_replaced_through_node_set_keep_unchanged_stop_bindings() {
     ex(&mut s, "variable.set", json!({"variable": "brand", "value": "#0000ff"}));
     assert_eq!(stops(&s, r), ["FFFFFF", "0000FF"]);
     healthy(&s);
+}
+
+#[test]
+fn css_export_gives_lengths_a_unit_and_keeps_opacity_bare() {
+    let mut s = Session::new();
+    ex(&mut s, "variable.createCollection", json!({"name": "Brand"}));
+    ex(&mut s, "variable.create", json!({"collection": "Brand", "name": "card", "type": "number", "value": 12}));
+    ex(&mut s, "variable.create", json!({"collection": "Brand", "name": "fade", "type": "number", "value": 0.5}));
+    ex(&mut s, "variable.create", json!({"collection": "Brand", "name": "half", "type": "number", "value": 0.5}));
+    ex(&mut s, "variable.create", json!({"collection": "Brand", "name": "dim", "type": "number", "value": 1}));
+    ex(&mut s, "variable.set", json!({"variable": "dim", "value": {"alias": "half"}}));
+    let f = idv(&ex(&mut s, "frame.create", json!({"x": 0, "y": 0, "width": 100, "height": 100})));
+    let g = idv(&ex(&mut s, "frame.create", json!({"x": 200, "y": 0, "width": 100, "height": 100})));
+    ex(&mut s, "node.set", json!({"id": f, "props": {"cornerRadius": 12, "opacity": 0.5}}));
+    ex(&mut s, "variable.bind", json!({"ids": [f], "field": "cornerRadius", "variable": "card"}));
+    ex(&mut s, "variable.bind", json!({"ids": [f], "field": "opacity", "variable": "fade"}));
+    ex(&mut s, "variable.bind", json!({"ids": [g], "field": "opacity", "variable": "dim"}));
+    let css = ex(&mut s, "variable.export", json!({"format": "css"}))["text"].as_str().unwrap_or_default().to_string();
+    // A radius is a length; opacity stays a number, also through an alias it reads.
+    assert!(css.contains("--card: 12px;") && css.contains("--fade: 0.5;") && css.contains("--half: 0.5;"), "{css}");
+}
+
+#[test]
+fn review_a_long_alias_chain_keeps_its_role_to_the_end() {
+    let mut s = Session::new();
+    ex(&mut s, "variable.createCollection", json!({"name": "Brand"}));
+    ex(&mut s, "variable.create", json!({"collection": "Brand", "name": "o0", "type": "number", "value": 0.5}));
+    // o12 -> o11 -> … -> o0: longer than any fixed number of rounds would reach.
+    for i in 1..=12 {
+        ex(&mut s, "variable.create", json!({"collection": "Brand", "name": format!("o{i}"), "type": "number", "value": 1}));
+        ex(&mut s, "variable.set", json!({"variable": format!("o{i}"), "value": {"alias": format!("o{}", i - 1)}}));
+    }
+    let f = idv(&ex(&mut s, "frame.create", json!({"x": 0, "y": 0, "width": 100, "height": 100})));
+    ex(&mut s, "variable.bind", json!({"ids": [f], "field": "opacity", "variable": "o12"}));
+    let css = ex(&mut s, "variable.export", json!({"format": "css"}))["text"].as_str().unwrap_or_default().to_string();
+    assert!(css.contains("--o0: 0.5;"), "{css}");
 }

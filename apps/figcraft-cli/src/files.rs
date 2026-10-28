@@ -1,10 +1,11 @@
 //! The file subcommands: info, export, convert, render and run.
 
+use std::ffi::OsStr;
 use std::path::Path;
 use std::process::ExitCode;
 
-use figcraft_doc::{Document, ExportFormat, ExportSetting, NodeId, NodeKind, PrintSettings};
-use figcraft_engine::Session;
+use figcraft_doc::{Document, ExportFormat, ExportSetting, NodeId, NodeKind, PrintSettings, VdCompat};
+use figcraft_engine::{BatchScope, BatchStep, Session};
 use serde_json::{Value, json};
 
 use crate::{CliError, CliResult};
@@ -19,12 +20,12 @@ fn load_noted(path: &str) -> CliResult<(Document, Vec<String>)> {
 }
 
 fn ext(path: &str) -> String {
-    Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase()
+    Path::new(path).extension().and_then(OsStr::to_str).unwrap_or("").to_ascii_lowercase()
 }
 
 fn image_format(e: &str) -> Option<ExportFormat> {
     match e {
-        "png" | "jpg" | "jpeg" | "svg" | "webp" | "pdf" => ExportFormat::from_ext(e),
+        "png" | "jpg" | "jpeg" | "svg" | "webp" | "pdf" | "xml" => ExportFormat::from_ext(e),
         _ => None,
     }
 }
@@ -207,10 +208,13 @@ pub fn info(path: &str, as_json: bool) -> CliResult<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The file name a layer exports to: the app's rule ([`figcraft_engine::cmd::file::safe_file_name`],
+/// so `/` becomes `_` too), without leading or trailing spaces and dots, at most 100 characters
+/// and 200 bytes (file systems allow 255, and a number and the extension still fit).
 fn sanitize(name: &str) -> String {
-    let s: String = name.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | ' ' | '.') { c } else { '_' }).collect();
-    let s = s.trim().trim_matches('.').to_string();
-    if s.is_empty() { "layer".into() } else { s.chars().take(100).collect() }
+    let s = figcraft_engine::cmd::file::safe_file_name(name);
+    let s = s.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    if s.is_empty() { "layer".into() } else { s.char_indices().take(100).take_while(|(i, c)| i + c.len_utf8() <= 200).map(|(_, c)| c).collect() }
 }
 
 /// What `export` exports and how.
@@ -221,6 +225,8 @@ pub struct Target {
     pub node: Option<String>,
     /// PDF only.
     pub print: PrintSettings,
+    /// Android Vector Drawable (XML) only.
+    pub vd_compat: VdCompat,
 }
 
 pub fn export(file: &str, out: &str, t: &Target) -> CliResult<ExitCode> {
@@ -235,15 +241,20 @@ pub fn export(file: &str, out: &str, t: &Target) -> CliResult<ExitCode> {
     let (scale, node, print) = (t.scale, t.node.as_deref(), &t.print);
     let fmt = match t.format.as_deref() {
         Some(f) => {
-            image_format(&f.to_ascii_lowercase()).ok_or_else(|| CliError::Usage(format!("unknown --format `{f}` (png|jpg|svg|webp|pdf|fig)")))?
+            image_format(&f.to_ascii_lowercase()).ok_or_else(|| CliError::Usage(format!("unknown --format `{f}` (png|jpg|svg|webp|pdf|xml|fig)")))?
         }
         None => image_format(&ext(out)).unwrap_or(ExportFormat::Png),
     };
     let target = node.map(|q| find_node(&doc, page, q)).transpose()?;
     let single = image_format(&ext(out)).is_some();
     let bytes_of = |ids: &[NodeId]| {
-        let setting = ExportSetting { format: fmt, print: *print, ..Default::default() };
-        figcraft_engine::cmd::file::export_bytes_with(&doc, ids, &setting, scale).map_err(|e| CliError::Failed(e.to_string()))
+        let setting = ExportSetting { format: fmt, print: *print, vd_compat: t.vd_compat, ..Default::default() };
+        let (bytes, warnings) = figcraft_engine::cmd::file::export_file(&doc, ids, &setting, scale).map_err(|e| CliError::Failed(e.to_string()))?;
+        // What an Android Vector Drawable changed or left out, like the .fig notes.
+        for w in warnings {
+            eprintln!("note: {w}");
+        }
+        Ok::<_, CliError>(bytes)
     };
     if single {
         let bytes = match target {
@@ -268,14 +279,19 @@ pub fn export(file: &str, out: &str, t: &Target) -> CliResult<ExitCode> {
         return Err(CliError::Failed("the page is empty: nothing to export".into()));
     }
     let mut used = std::collections::BTreeSet::new();
+    let mut next_suffix: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for id in ids {
         let base = sanitize(doc.node(id).map(|n| n.name.as_str()).unwrap_or("layer"));
-        let mut name = base.clone();
-        let mut k = 2;
-        while !used.insert(name.to_lowercase()) {
-            name = format!("{base} {k}");
-            k += 1;
-        }
+        let base_lower = base.to_lowercase();
+        let next = next_suffix.entry(base_lower).or_insert(1);
+        let name = loop {
+            let k = *next;
+            *next += 1;
+            let candidate = if k == 1 { base.clone() } else { format!("{base} {k}") };
+            if used.insert(candidate.to_lowercase()) {
+                break candidate;
+            }
+        };
         let path = Path::new(out).join(format!("{name}.{}", fmt.ext())).to_string_lossy().into_owned();
         write(&path, &bytes_of(&[id])?)?;
         println!("{path}");
@@ -283,8 +299,29 @@ pub fn export(file: &str, out: &str, t: &Target) -> CliResult<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn refuse_dropping_images(input: &str, out: &str, images_left_out: usize) -> CliResult<()> {
+    if images_left_out > 0 && figcraft_engine::file_access::same_file(input, out) {
+        return Err(CliError::Failed(format!(
+            "{out} wasn't written: {images_left_out} of its images weren't loaded (together they pass what FigCraft reads from one file), and writing over it would delete them. Write to another path; {input} keeps them."
+        )));
+    }
+    Ok(())
+}
+
+fn refuse_dropping_images_from_script(input: Option<(&str, usize)>, active: &figcraft_engine::DocState, out: &str) -> CliResult<()> {
+    if let Some((input, images_left_out)) = input {
+        refuse_dropping_images(input, out, images_left_out)?;
+    }
+    if let Some(images_left_out) = active.images_lost_saving_to(out) {
+        refuse_dropping_images(out, out, images_left_out)?;
+    }
+    Ok(())
+}
+
 pub fn convert(input: &str, out: &str) -> CliResult<ExitCode> {
-    let doc = load(input)?;
+    let (loaded, _) = figcraft_engine::cmd::file::load_path(input, None).map_err(|e| CliError::Failed(format!("can't open {input}: {e}")))?;
+    refuse_dropping_images(input, out, loaded.images_past_budget)?;
+    let doc = loaded.doc;
     let page = doc
         .current_page
         .filter(|p| doc.pages.contains(p))
@@ -309,7 +346,7 @@ pub fn render(file: &str, out: &str, scale: f64, page: Option<&str>) -> CliResul
 }
 
 /// Parse a script: a JSON array of steps, `{"commands": [...]}`, or JSON lines.
-pub fn parse_script(text: &str) -> Result<Vec<(String, Value)>, String> {
+pub fn parse_script(text: &str) -> Result<Vec<BatchStep>, String> {
     let steps: Vec<Value> = match serde_json::from_str::<Value>(text) {
         Ok(Value::Array(a)) => a,
         Ok(Value::Object(o)) if o.contains_key("commands") => {
@@ -334,7 +371,8 @@ pub fn parse_script(text: &str) -> Result<Vec<(String, Value)>, String> {
                 Some(p @ Value::Object(_)) => p.clone(),
                 Some(_) => return Err(format!("step {i} ({cmd}): `params` must be an object")),
             };
-            Ok((cmd.to_string(), params))
+            let name = figcraft_engine::batch::step_name(i, &s).map_err(|e| e.to_string())?;
+            Ok(BatchStep { name, ..BatchStep::new(cmd, params) })
         })
         .collect()
 }
@@ -343,43 +381,44 @@ pub fn run_script(script: &str, input: Option<&str>, out: Option<&str>) -> CliRe
     let bytes = figcraft_engine::file_access::read(script).map_err(|e| CliError::Failed(e.to_string()))?;
     let text = String::from_utf8(bytes).map_err(|_| CliError::Failed(format!("{script}: not UTF-8")))?;
     let steps = parse_script(&text).map_err(|e| CliError::Failed(format!("{script}: {e}")))?;
-    let mut s = match input {
+    let (mut s, input_images_left_out) = match input {
         Some(path) => {
             let mut s = Session::empty();
             s.execute("file.open", &json!({"path": path})).map_err(|e| CliError::Failed(format!("can't open {path}: {e}")))?;
-            s
+            let left_out = s.ds().map_err(|e| CliError::Failed(e.to_string()))?.images_lost_saving_to(path).unwrap_or(0);
+            (s, left_out)
         }
-        None => Session::new(),
+        None => (Session::new(), 0),
     };
     // One undo step and all-or-nothing, the way the same commands behave through `command.batch`
-    // (MCP, the control channel, plugins): `{"$step": n}` resolves against the steps before it, and
-    // a step that fails takes the whole script back instead of leaving the earlier steps applied.
-    // The result lines are held back until the script is through, so none of them reports work that
-    // was rolled back.
-    let mut results: Vec<Value> = Vec::with_capacity(steps.len());
+    // (MCP, the control channel, plugins): `{"$step": n}` and `{"$ref": "name"}` resolve against the
+    // steps before it, and a step that fails takes the whole script back instead of leaving the
+    // earlier steps applied. The result lines are held back until the script is through, so none of
+    // them reports work that was rolled back.
+    let mut scope = BatchScope::new(&steps).map_err(|e| CliError::Failed(format!("{script}: {e}")))?;
     let mut failed_at = 0;
     let outcome = s.grouped(&format!("run {script}"), |s| {
-        for (i, (cmd, params)) in steps.iter().enumerate() {
+        for (i, step) in steps.iter().enumerate() {
             failed_at = i;
-            let v = s.batch_step(&results, i, cmd, params)?;
+            s.batch_step(&mut scope, &step.command, &step.params)?;
             s.ui_requests.clear();
-            results.push(v);
         }
         Ok(())
     });
     if let Err(e) = outcome {
-        let cmd = steps.get(failed_at).map_or("", |(cmd, _)| cmd.as_str());
+        let cmd = steps.get(failed_at).map_or("", |step| step.command.as_str());
         let i = failed_at;
         println!("{}", json!({"step": i, "command": cmd, "ok": false, "error": e.to_string(), "rolledBack": true}));
         eprintln!("error: step {i} ({cmd}) failed: {e}");
         eprintln!("the script's document changes were rolled back");
         return Ok(ExitCode::from(1));
     }
-    for (i, ((cmd, _), v)) in steps.iter().zip(&results).enumerate() {
-        println!("{}", json!({"step": i, "command": cmd, "ok": true, "result": v}));
+    for (i, (step, v)) in steps.iter().zip(scope.results()).enumerate() {
+        println!("{}", json!({"step": i, "command": step.command, "ok": true, "result": v}));
     }
     if let Some(out) = out {
         let ds = s.ds().map_err(|e| CliError::Failed(e.to_string()))?;
+        refuse_dropping_images_from_script(input.map(|input| (input, input_images_left_out)), ds, out)?;
         if ext(out) == "figcraft" {
             // Through the engine, so the version history is kept.
             write(out, &figcraft_engine::cmd::file::file_bytes(ds).map_err(|e| CliError::Failed(e.to_string()))?)?;
@@ -411,6 +450,14 @@ mod tests {
         assert_eq!(sanitize("Home / Hero"), "Home _ Hero");
         assert_eq!(sanitize("../.."), "_");
         assert_eq!(sanitize(""), "layer");
+        // The same characters the app's export keeps (#1154): only what file systems refuse goes.
+        assert_eq!(sanitize("Homepage - desktop (live + verbeteringen)"), "Homepage - desktop (live + verbeteringen)");
+        assert_eq!(sanitize("Q&A, 50% #1 [v2] {x} ~é"), "Q&A, 50% #1 [v2] {x} ~é");
+        assert_eq!(sanitize("a\\b:c*d?e\"f<g>h|i\tj"), "a_b_c_d_e_f_g_h_i_j");
+        assert_eq!(sanitize(" .hidden. "), "hidden");
+        assert_eq!(sanitize(" . .name. . "), "name", "spaces and dots at the edges, mixed");
+        assert_eq!(sanitize(&"x".repeat(300)).chars().count(), 100);
+        assert_eq!(sanitize(&"\u{1F600}".repeat(100)), "\u{1F600}".repeat(50), "at most 200 bytes, whole characters");
     }
 
     #[test]
@@ -494,6 +541,43 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A script names its steps with `as` and reads paths into their results, like `command.batch`.
+    #[test]
+    fn a_script_refers_to_named_steps_and_paths() {
+        let dir = temp_dir("run-ref");
+        let script = dir.join("script.json");
+        std::fs::write(
+            &script,
+            r#"[
+                {"command": "node.create", "as": "card", "params": {"type": "frame", "name": "Card", "x": 0, "y": 0, "width": 200, "height": 100}},
+                {"command": "edit.duplicate", "as": "copy", "params": {"ids": [{"$ref": "card"}]}},
+                {"command": "node.set", "params": {"ids": [{"$ref": "copy", "field": "ids/0"}], "props": {"name": "Copy"}}}
+            ]"#,
+        )
+        .unwrap();
+        let out = dir.join("out.figcraft");
+        run_script(script.to_str().unwrap(), None, Some(out.to_str().unwrap())).unwrap();
+
+        let mut s = Session::empty();
+        s.execute("file.open", &json!({"path": out.to_str().unwrap()})).unwrap();
+        let doc = s.doc().unwrap();
+        let top = doc.node(s.page().unwrap()).unwrap().children.clone();
+        let names: Vec<_> = top.iter().map(|id| doc.node(*id).unwrap().name.clone()).collect();
+        assert_eq!(names, ["Card", "Copy"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Two steps with one name fail before anything runs.
+    #[test]
+    fn a_script_with_a_name_twice_runs_nothing() {
+        let dir = temp_dir("run-dup-name");
+        let script = dir.join("script.json");
+        std::fs::write(&script, r#"[{"command": "select.none", "as": "a"}, {"command": "select.none", "as": "a"}]"#).unwrap();
+        let Err(CliError::Failed(e)) = run_script(script.to_str().unwrap(), None, None) else { panic!("a name twice must fail") };
+        assert!(e.contains("step 1: `as` \"a\" is already step 0's name"), "{e}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A step that fails takes the whole script back: nothing is written, and the failure says so.
     #[test]
     fn a_failed_step_leaves_no_output() {
@@ -511,6 +595,26 @@ mod tests {
         // The failure is the script's, not the call's: the CLI reports it and exits non-zero.
         run_script(script.to_str().unwrap(), None, Some(out.to_str().unwrap())).unwrap();
         assert!(!out.exists(), "a script that failed writes nothing");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_script_output_over_its_input_is_refused_whichever_tab_the_script_left_active() {
+        let dir = temp_dir("script-images-left-out");
+        let input = dir.join("big.figcraft");
+        std::fs::write(&input, b"kept").unwrap();
+        let link = dir.join("link.figcraft");
+        std::fs::hard_link(&input, &link).unwrap();
+        let (input, link, other) = (input.to_str().unwrap(), link.to_str().unwrap(), dir.join("other.figcraft"));
+        let duplicate = Session::new();
+        let active = duplicate.ds().unwrap();
+
+        for out in [input, link] {
+            let refused = refuse_dropping_images_from_script(Some((input, 3)), active, out);
+            assert!(matches!(&refused, Err(CliError::Failed(m)) if m.contains("3 of its images")), "{out}");
+        }
+        assert!(refuse_dropping_images_from_script(Some((input, 3)), active, other.to_str().unwrap()).is_ok());
+        assert!(refuse_dropping_images_from_script(Some((input, 0)), active, input).is_ok());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -79,7 +79,7 @@ fn redlines_measure_on_hover_without_alt() {
         s.tool.overlay.guides.len()
     };
     assert_eq!(hover(&mut s), 0, "plain hover doesn't measure");
-    s.tool.redlines = true;
+    s.tool.dev_mode = true;
     assert!(hover(&mut s) > 0, "Inspect measures on hover");
 }
 

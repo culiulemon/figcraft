@@ -163,6 +163,7 @@ fn exports_never_use_lod() {
         outlined: &[],
         skip: &[],
         lod: true,
+        magnified_image_pixels: false,
         under: None,
         time: 0.0,
         bounds: &bounds,

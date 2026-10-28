@@ -15,7 +15,7 @@ use tiny_skia::Pixmap;
 
 pub(crate) type Key = (String, [i32; 7], ColorProfile);
 
-/// The largest image side decoded.
+/// The largest side of a decoded image: larger images are scaled down to fit.
 const MAX_SIDE: u32 = 16_384;
 /// The most bytes one image's decoding may allocate: the image crate's own default limit (a
 /// larger image is refused from its header).
@@ -83,26 +83,25 @@ fn fkey(f: &ImageFilters) -> [i32; 7] {
     [q(f.exposure), q(f.contrast), q(f.saturation), q(f.temperature), q(f.tint), q(f.highlights), q(f.shadows)]
 }
 
-/// Decode encoded image bytes into a premultiplied sRGB pixmap (max 16k per side).
+/// Decode encoded image bytes into a premultiplied sRGB pixmap (scaled down to 16k per side).
 pub fn decode(bytes: &[u8]) -> Option<Pixmap> {
     decode_in(bytes, ColorProfile::Srgb).map(|(p, _)| p)
 }
 
-/// Decode encoded image bytes into a premultiplied pixmap (max 16k per side): converted from the
+/// Decode encoded image bytes into a premultiplied pixmap (scaled down to 16k per side): converted from the
 /// image's own profile into `target` (`false`), or as sRGB when it has none (`true`: the sRGB →
 /// `target` conversion is still to do).
 fn decode_in(bytes: &[u8], target: ColorProfile) -> Option<(Pixmap, bool)> {
     decode_within(bytes, target, MAX_SIDE, MAX_DECODED_BYTES)
 }
 
-/// [`decode_in`] for images at most `max_side` wide and tall whose decoded pixels take at most
-/// `max_bytes`; larger ones are refused from their header, before any pixels are decoded.
+/// [`decode_in`] for images whose decoded pixels take at most `max_bytes` (larger ones are refused
+/// from their header, before any pixels are decoded), scaled down to at most `max_side` wide and
+/// tall.
 pub(crate) fn decode_within(bytes: &[u8], target: ColorProfile, max_side: u32, max_bytes: u64) -> Option<(Pixmap, bool)> {
     use image::ImageDecoder;
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(max_side);
-    limits.max_image_height = Some(max_side);
     limits.max_alloc = Some(max_bytes);
     reader.limits(limits);
     let mut dec = reader.into_decoder().ok()?;
@@ -110,7 +109,11 @@ pub(crate) fn decode_within(bytes: &[u8], target: ColorProfile, max_side: u32, m
         return None;
     }
     let source = crate::image_profile::Source::read(bytes, &mut dec);
-    let img = image::DynamicImage::from_decoder(dec).ok()?;
+    let mut img = image::DynamicImage::from_decoder(dec).ok()?;
+    if img.width() > max_side || img.height() > max_side {
+        // `thumbnail` keeps the aspect ratio and works in integers (no float copy of the pixels).
+        img = img.thumbnail(max_side, max_side);
+    }
     match source.convert(&img, target) {
         Some(rgba) => Some((premultiplied(&rgba)?, false)),
         None => Some((premultiplied(&img.to_rgba8())?, true)),

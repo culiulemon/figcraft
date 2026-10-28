@@ -162,6 +162,7 @@ fn paints_gradients_and_image_placeholders() {
     let s = &named(&doc, "Solid").fills[0];
     assert!(matches!(s.kind, PaintKind::Solid { color } if color.r == 1.0 && color.a == 1.0));
     assert!(close(f64::from(s.opacity), 0.25), "paint opacity × colour alpha");
+    assert!(close(f64::from(s.color_alpha), 0.5), "the colour's part, which a bound variable replaces");
     assert!(!s.visible && s.blend == BlendMode::Screen);
     let PaintKind::Gradient(g) = &named(&doc, "Linear").fills[0].kind else { panic!() };
     assert_eq!((g.kind, g.from, g.to, g.width), (GradientKind::Linear, (0.0, 0.5), (1.0, 0.5), (0.0, 1.0)));
@@ -362,6 +363,17 @@ fn text_styles_and_runs() {
     assert_eq!((body.runs[0].style.case, body.runs[0].style.decoration), (TextCase::SmallCaps, TextDecoration::Strikethrough));
     assert_eq!(body.runs[0].style.font_style, "Semi Bold Italic", "overrides inherit the base");
     assert!(!named(&doc, "NoFills").fills.is_empty(), "text keeps its default fill");
+}
+
+#[test]
+fn max_lines_apply_only_while_truncating() {
+    let (doc, _) = one(json!([
+        {"id": "1", "name": "Auto", "type": "TEXT", "relativeTransform": at(0.0, 0.0), "size": {"x": 100, "y": 20}, "characters": "a",
+         "style": {"textAutoResize": "HEIGHT", "textTruncation": "DISABLED", "maxLines": 2}}
+    ]));
+    let NodeKind::Text(td) = &named(&doc, "Auto").kind else { panic!() };
+    assert_eq!((td.auto_resize, td.max_lines), (TextAutoResize::Height, 0));
+    assert!(!td.truncates());
 }
 
 #[test]

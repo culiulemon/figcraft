@@ -39,7 +39,7 @@ pub fn is_valid_library_id(id: &str) -> bool {
 }
 
 /// Image hashes become archive member names: only plain hex-like names are looked up.
-fn is_valid_hash(h: &str) -> bool {
+pub(crate) fn is_valid_hash(h: &str) -> bool {
     (1..=128).contains(&h.len()) && h.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 

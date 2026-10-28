@@ -253,3 +253,22 @@ fn random_drops_and_reconnects_converge() {
     }
     assert!(snapshots > 0, "no reconnect needed a snapshot");
 }
+
+#[test]
+fn resume_needs_the_issued_secret() {
+    let mut s = Server::new(base(), "tok", Limits { max_peers: 2, ..Limits::default() });
+    let mut host = join(&mut s);
+    let guest = join(&mut s);
+    // A participant who knows the (public) session and the host's id can't take that id over,
+    // whether the session is full or not, and with view-only access or not.
+    let forged = message::Resume { client_id: host.id(), ..guest.resume() };
+    assert_eq!(forged.session, host.resume().session);
+    let refused = s.join_as(Hello { resume: Some(forged), ..hello() }, message::Access::View);
+    assert!(matches!(refused, Err(ServerMsg::Refused { .. })), "a forged resume of a live id is refused: {refused:?}");
+    s.leave(guest.id());
+    let (id, _) = s.join_as(Hello { resume: Some(forged), ..hello() }, message::Access::View).unwrap();
+    assert_ne!(id, host.id(), "a forged resume joins as new");
+    // The real client still comes back as itself.
+    let resend = come_back(&mut s, &mut host);
+    assert!(resend.is_empty());
+}

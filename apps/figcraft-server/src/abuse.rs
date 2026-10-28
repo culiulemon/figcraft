@@ -120,15 +120,15 @@ impl Abuse {
         open
     }
 
-    /// `ip` tried a join code that was right (`ok`) or wrong: a right one forgives the wrong ones
-    /// before it; enough wrong ones in a row lock the address out.
+    /// `ip` tried a join code that was right (`ok`) or wrong: a right one doesn't forgive the wrong
+    /// ones before it (they only decay with time); enough wrong ones lock the address out.
     pub fn code_tried(&mut self, ip: IpAddr, ok: bool, now: Instant) {
         if !ok {
             self.wrong_codes.take(now);
         }
         for (k, times) in ip_blocks(ip) {
             let a = self.address(k, f64::from(times), now);
-            if ok || now.saturating_duration_since(a.wrong_at) > CODE_LOCKOUT {
+            if now.saturating_duration_since(a.wrong_at) > CODE_LOCKOUT {
                 a.wrong = 0;
             }
             if !ok {

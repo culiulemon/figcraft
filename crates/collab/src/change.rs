@@ -181,6 +181,8 @@ node_props! {
     Annotations => annotations,
     CodeLinks => code_links,
     DevResources => dev_resources,
+    Measurements => measurements,
+    Board => board,
 }
 
 /// A document-level property. Lists of entries with ids (styles, comments, variable collections,
@@ -219,6 +221,12 @@ pub enum DocProp {
     Variables,
     /// Variable ids in order.
     VariableOrder,
+    /// A design file or a board.
+    Kind,
+    /// A board's countdown (`null`: none).
+    Timer,
+    /// A board's vote (`null`: none); the ballots are [`Entry::Ballot`]s.
+    Vote,
 }
 
 /// A document-level entry, by id.
@@ -238,6 +246,8 @@ pub enum Entry {
     DevSnapshot(NodeId),
     /// An image by content hash (value: `{width, height, bytes}` with the encoded bytes in base64).
     Image(String),
+    /// A voter's ballot in a board's vote (value: the layer ids voted on).
+    Ballot(String),
 }
 
 /// One synced value a change writes: a node property, a document-level property or a
@@ -311,7 +321,7 @@ impl Entry {
             Entry::Variable(id) => Some(id_space(id, VARIABLE_ID_PREFIX)),
             Entry::Collection(id) => Some(id_space(id, COLLECTION_ID_PREFIX)),
             Entry::Comment(id) => Some(space_of(*id)),
-            Entry::DevSnapshot(_) | Entry::Image(_) => None,
+            Entry::DevSnapshot(_) | Entry::Image(_) | Entry::Ballot(_) => None,
         }
     }
 
@@ -324,6 +334,7 @@ impl Entry {
             Entry::Variable(id) => format!("variable {id}"),
             Entry::DevSnapshot(id) => format!("ready-for-dev snapshot of {id}"),
             Entry::Image(hash) => format!("image {hash}"),
+            Entry::Ballot(voter) => format!("ballot of {voter}"),
         }
     }
 
@@ -334,7 +345,7 @@ impl Entry {
             Entry::Comment(_) => Some(Family::Comments),
             Entry::Collection(_) => Some(Family::Collections),
             Entry::Variable(_) => Some(Family::Variables),
-            Entry::DevSnapshot(_) | Entry::Image(_) => None,
+            Entry::DevSnapshot(_) | Entry::Image(_) | Entry::Ballot(_) => None,
         }
     }
 }

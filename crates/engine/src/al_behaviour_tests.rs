@@ -221,3 +221,15 @@ fn canvas_stacking_paints_and_exports_the_first_child_on_top() {
     s.undo().unwrap();
     assert_eq!(pixel(&s, f, 40, 10), [0, 0, 255, 255]);
 }
+
+#[test]
+fn a_size_given_with_a_new_path_fixes_that_axis() {
+    let mut s = Session::new();
+    let f = al_frame(&mut s, json!({}));
+    let v = id(s.execute("node.create", &json!({"type": "vector", "path": "M0 0 L10 10", "closed": false, "parent": f})).unwrap());
+    set(&mut s, v, json!({"sizingH": "fill"}));
+    assert_eq!(sizing(&s, v).0, Sizing::Fill);
+    set(&mut s, v, json!({"path": "M0 0 L20 5", "width": 30}));
+    assert_eq!(sizing(&s, v).0, Sizing::Fixed);
+    assert!((size(&s, v).0 - 30.0).abs() < 1e-6, "{:?}", size(&s, v));
+}
