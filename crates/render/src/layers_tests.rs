@@ -194,6 +194,31 @@ fn a_layer_with_a_pattern_fill_is_not_kept() {
     assert_eq!(super::layers::kept_bytes(), 0, "a patterned layer is drawn every frame");
 }
 
+/// A text run painted with a pattern keeps its layer from being kept too: the run's fills come
+/// from the layout's styles, not the node's own `fills`, which the cache check also reads.
+#[test]
+fn a_text_run_with_a_pattern_fill_is_not_kept() {
+    let _turn = turn();
+    let mut d = Document::new("patterned text");
+    let p = d.first_page().unwrap();
+    let source = d.create(p, NodeKind::Rectangle, "Source", 0.0, 0.0, 20.0, 20.0).unwrap();
+    d.get_mut(source).unwrap().fills = vec![Paint::solid(Color::from_hex("20C060").unwrap())];
+    let mut td = figcraft_doc::TextData::new("patterned");
+    td.style.font_size = 20.0;
+    td.runs = vec![figcraft_doc::StyleRun {
+        start: 0,
+        end: 9,
+        style: figcraft_doc::TextStyle { fills: Some(vec![Paint::pattern(source.0)]), ..td.style.clone() },
+    }];
+    let text = d.create(p, NodeKind::Text(td), "Text", 40.0, 40.0, 120.0, 40.0).unwrap();
+    d.get_mut(text).unwrap().opacity = 0.5;
+    let doc = Arc::new(d);
+    for _ in 0..2 {
+        let _ = drawn(&doc, p, &view(), 55);
+    }
+    assert_eq!(super::layers::kept_bytes(), 0, "a text layer with a patterned run is drawn every frame");
+}
+
 /// An edited layer's older version is dropped with the entry it was kept in: its key never hits
 /// again, and the node it holds is memory the pixel budget doesn't count.
 #[test]

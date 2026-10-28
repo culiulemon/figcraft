@@ -13,7 +13,7 @@ use std::collections::hash_map::{DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use figcraft_doc::{Document, Node, NodeId};
+use figcraft_doc::{Document, Node, NodeId, NodeKind};
 use figcraft_geom::Affine;
 use tiny_skia::Pixmap;
 
@@ -102,6 +102,11 @@ fn whole(v: f64) -> bool {
     (v - v.round()).abs() < 1e-6
 }
 
+/// Whether any of `paints` draws a pattern, whose pixels belong to a node outside the layer.
+fn paints_a_pattern(paints: &[figcraft_color::Paint]) -> bool {
+    paints.iter().any(|p| matches!(p.kind, figcraft_color::PaintKind::Pattern(_)))
+}
+
 fn cacheable_subtree(ctx: &Ctx, n: &Node, depth: usize) -> bool {
     if depth > 64 {
         return false;
@@ -111,7 +116,14 @@ fn cacheable_subtree(ctx: &Ctx, n: &Node, depth: usize) -> bool {
     }
     // A pattern fill's pixels are its source node's, which is outside this subtree: an edit there
     // changes nothing this layer's key hashes.
-    if n.fills.iter().chain(&n.strokes).any(|p| matches!(p.kind, figcraft_color::PaintKind::Pattern(_))) {
+    if paints_a_pattern(&n.fills) || paints_a_pattern(&n.strokes) {
+        return false;
+    }
+    // A text run with its own fills draws with those (the layout's styles), not the node's: they
+    // can name a pattern source outside the subtree just as a node-level fill can.
+    if let NodeKind::Text(t) = &n.kind
+        && t.spans().iter().any(|(_, _, s)| s.fills.as_deref().is_some_and(paints_a_pattern))
+    {
         return false;
     }
     n.children.iter().all(|c| ctx.doc.node(*c).is_none_or(|cn| cacheable_subtree(ctx, cn, depth + 1)))
