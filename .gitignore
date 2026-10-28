@@ -8,3 +8,5 @@ plans/
 /log/
 .DS_Store
 *.profraw
+.cache/
+.vscode/
