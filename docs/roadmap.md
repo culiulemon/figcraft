@@ -1,4 +1,4 @@
-# FigCraft roadmap: milestones and what's next
+﻿# FigCraft roadmap: milestones and what's next
 
 > **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-26 · **Change:** minor (Android Vector Drawable export; a selected unfilled shape drags over a filled layer below it (#1370); text truncation fills the last line, survives resizing, and auto height takes Max lines (#1375, #1376, #1377); M11 widget fields and property menus; M12 Boards: timer and voting; Installed weights of an embedded font family (#1246); `.sketch` import, best effort; Adobe Fonts found on macOS (#298); M12 Boards; community fixes in #507, #510, #529 and #530: auto-save, a text box by dragging, batch step references, removing someone from a live session, Russian and Turkish catalogs reviewed, Czech and Indonesian drafts, the Japanese draft completed, zoom previews, the web clipboard, Alt-drag snapping and Cmd+D repeat, recovery copies, crash and rollback fixes, colour emoji, `.fig` import fixes; earlier changes are in the revision history below) · **Target:** Figma Design (desktop app 126.10.7)
 
@@ -67,7 +67,8 @@ blockers.
 
 - Team libraries for a whole team (lists, accounts and permissions) and deeper library analytics (4–8 h, after
   accounts), branching (8–15 h).
-- GPU canvas held to the CPU renderer (30–60 h).
+- GPU canvas: damage-tracked assembly for pages with backdrop effects (4–6 h; everything they draw
+  is on the GPU already, parity-tested and kept between frames).
 - Figma Draw multi-edit and pen pressure on macOS/Linux tablets (2–5 h).
 - Mobile viewer and prototype mirror (20–40 h).
 
@@ -75,6 +76,7 @@ blockers.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-25 | minor | GPU canvas (gap 7, P5–P11): images, patterns, per-paint blends, any-outline and inner shadows, every effect list, styled text, masks and nested backdrop effects draw on the GPU, and cross-frame retention keeps each page step's pixels and each page node's encoded scene, so a drag encodes only the layers it moved (a single-layer drag on the corpus pages is 0.9–10.9 ms). What is left is damage-tracked assembly for pages with backdrop effects (4–6 h), which re-assemble whole each frame today. Numbers in [`gpu-rasterizer.md`](gpu-rasterizer.md) |
 | 2026-10-26 | minor | Dragging a selected unfilled shape (M1, #1370): a press inside a selected stroke-only shape over a filled layer stacked below it moved that layer; the drag-from-inside fallback of #910 now treats any layer painted below the selection like the frame or canvas behind it, so the selection drags, while a layer painted above it still takes the press. Regression test in the selection behaviour suite. Numbers unchanged |
 | 2026-10-26 | minor | Text truncation (M4, #1375, #1376, #1377): the last line shown takes as much of the next word as fits before the ellipsis ("Lorem consec…", not "Lorem…"); an explicit height, `transform.resize`, a resize handle or fixed sizing on a truncated text keeps it truncating instead of turning it fixed size; Max lines on auto-height text hugs up to that many lines and ends in an ellipsis (`text.maxLines`, `node.set {maxLines}`, Type settings, `.fig` export and import), and `node.get` / `get_node` report `maxLines`. Regression tests in the text and engine behaviour suites. Numbers unchanged |
 | 2026-10-24 | minor | Installed weights of an embedded font family (M7, #1246): release builds embed some families with only a few styles (Poppins Regular, Italic and Bold), and the first font scan dropped every installed face of such a family, so an installed Poppins SemiBold or Medium was never offered (a rescan did offer them). The first scan now keeps the embedded faces, which still win for the styles they cover, and offers the installed styles they lack beside them. Regression test in the font database tests. Numbers unchanged |
