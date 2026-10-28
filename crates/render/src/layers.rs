@@ -149,6 +149,19 @@ pub(crate) fn settled(key: Key) -> bool {
     false
 }
 
+/// Drop the entry kept at `key`, from both indexes, and give its bytes back.
+fn drop_entry(state: &mut State, key: Key) {
+    let Some(entry) = state.map.remove(&key) else { return };
+    state.bytes = state.bytes.saturating_sub(entry.bytes);
+    let Some(keys) = state.by_node.get_mut(&entry.root.id) else { return };
+    if let Some(i) = keys.iter().position(|k| *k == key) {
+        keys.swap_remove(i);
+    }
+    if keys.is_empty() {
+        state.by_node.remove(&entry.root.id);
+    }
+}
+
 /// Keep `layer`, `n`'s pixels drawn through `page_xf` with its top-left at `anchor`.
 pub(crate) fn put(key: Key, root: Arc<Node>, layer: Arc<Layer>) {
     let bytes = layer.pix.data().len() + layer.shadows.iter().map(|s| s.pix.data().len()).sum::<usize>();
@@ -158,9 +171,7 @@ pub(crate) fn put(key: Key, root: Arc<Node>, layer: Arc<Layer>) {
     let mut state = state().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     state.tick += 1;
     let tick = state.tick;
-    if let Some(old) = state.map.remove(&key) {
-        state.bytes = state.bytes.saturating_sub(old.bytes);
-    }
+    drop_entry(&mut state, key);
     // A node edited since an entry was made is a new `Arc`: entries keyed on the old one never hit
     // again, and the nodes they hold (text, paths, children) take memory the pixel budget doesn't
     // count. Drop them; the same node drawn at another transform keeps its entry.
@@ -169,16 +180,14 @@ pub(crate) fn put(key: Key, root: Arc<Node>, layer: Arc<Layer>) {
     for k in state.by_node.remove(&id).unwrap_or_default() {
         if state.map.get(&k).is_some_and(|e| Arc::ptr_eq(&e.root, &root)) {
             kept_keys.push(k);
-        } else if let Some(old) = state.map.remove(&k) {
-            state.bytes = state.bytes.saturating_sub(old.bytes);
+        } else {
+            drop_entry(&mut state, k);
         }
     }
     state.by_node.insert(id, kept_keys);
     while state.bytes + bytes > BUDGET {
         let Some(oldest) = state.map.iter().min_by_key(|(_, e)| e.used).map(|(k, _)| *k) else { break };
-        if let Some(old) = state.map.remove(&oldest) {
-            state.bytes = state.bytes.saturating_sub(old.bytes);
-        }
+        drop_entry(&mut state, oldest);
     }
     state.bytes += bytes;
     state.map.insert(key, Entry { root, layer, bytes, used: tick });
