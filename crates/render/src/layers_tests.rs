@@ -173,3 +173,47 @@ fn a_layer_with_an_outlined_descendant_is_not_kept() {
     assert_eq!(twice(vec![inner]), 0, "an outlined descendant keeps the layer from being kept");
     assert!(twice(Vec::new()) > 0, "the same layer is kept without it");
 }
+
+/// A layer with a pattern fill is not kept: its pixels are another node's, outside the subtree the
+/// layer's key hashes.
+#[test]
+fn a_layer_with_a_pattern_fill_is_not_kept() {
+    let _turn = turn();
+    let mut d = Document::new("pattern");
+    let p = d.first_page().unwrap();
+    let source = d.create(p, NodeKind::Rectangle, "Source", 0.0, 0.0, 20.0, 20.0).unwrap();
+    d.get_mut(source).unwrap().fills = vec![Paint::solid(Color::from_hex("20C060").unwrap())];
+    let group = d.create(p, NodeKind::Group, "Group", 40.0, 40.0, 120.0, 120.0).unwrap();
+    let filled = d.create(group, NodeKind::Rectangle, "Filled", 0.0, 0.0, 100.0, 100.0).unwrap();
+    d.get_mut(filled).unwrap().fills = vec![Paint::pattern(source.0)];
+    d.get_mut(group).unwrap().opacity = 0.5;
+    let doc = Arc::new(d);
+    for _ in 0..2 {
+        let _ = drawn(&doc, p, &view(), 53);
+    }
+    assert_eq!(super::layers::kept_bytes(), 0, "a patterned layer is drawn every frame");
+}
+
+/// An edited layer's older version is dropped with the entry it was kept in: its key never hits
+/// again, and the node it holds is memory the pixel budget doesn't count.
+#[test]
+fn a_kept_layer_drops_the_nodes_older_versions() {
+    let _turn = turn();
+    let mut d = Document::new("edited");
+    let p = d.first_page().unwrap();
+    let card = d.create(p, NodeKind::Rectangle, "Card", 20.0, 20.0, 120.0, 80.0).unwrap();
+    let n = d.get_mut(card).unwrap();
+    n.fills = vec![Paint::solid(Color::from_hex("E03030").unwrap())];
+    n.effects = vec![Effect::layer_blur()];
+    let doc = Arc::new(d.clone());
+    let _ = drawn(&doc, p, &view(), 61);
+    let _ = drawn(&doc, p, &view(), 61);
+    let before = super::layers::kept_bytes();
+    assert!(before > 0, "the blurred card is kept");
+    // A new colour: the new version is kept whole, and the old one goes with its entry.
+    d.get_mut(card).unwrap().fills = vec![Paint::solid(Color::from_hex("2040E0").unwrap())];
+    let edited = Arc::new(d);
+    let _ = drawn(&edited, p, &view(), 61);
+    let _ = drawn(&edited, p, &view(), 61);
+    assert_eq!(super::layers::kept_bytes(), before, "the older version's entry is dropped");
+}

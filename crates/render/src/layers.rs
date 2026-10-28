@@ -13,7 +13,7 @@ use std::collections::hash_map::{DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use figcraft_doc::{Document, Node};
+use figcraft_doc::{Document, Node, NodeId};
 use figcraft_geom::Affine;
 use tiny_skia::Pixmap;
 
@@ -58,13 +58,16 @@ struct Entry {
 
 struct State {
     map: HashMap<Key, Entry>,
+    /// The keys kept for each node: a node's older versions are dropped when a new one is kept
+    /// (see [`put`]).
+    by_node: HashMap<NodeId, Vec<Key>>,
     bytes: usize,
     tick: u64,
 }
 
 fn state() -> &'static Mutex<State> {
     static STATE: OnceLock<Mutex<State>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(State { map: HashMap::new(), bytes: 0, tick: 0 }))
+    STATE.get_or_init(|| Mutex::new(State { map: HashMap::new(), by_node: HashMap::new(), bytes: 0, tick: 0 }))
 }
 
 /// Forget every kept layer (tests compare renders with and without the cache).
@@ -72,6 +75,7 @@ fn state() -> &'static Mutex<State> {
 pub(crate) fn clear() {
     let mut state = state().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     state.map.clear();
+    state.by_node.clear();
     state.bytes = 0;
     let mut seen = seen().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     seen.set.clear();
@@ -86,9 +90,9 @@ pub(crate) fn kept_bytes() -> usize {
 
 /// Whether node `n`'s layer can be kept: nothing in it may read the backdrop (glass, background
 /// blur, masks — see the module docs), it must be on whole device pixels, it must not be drawn
-/// differently every frame (animated GIF frames, outlines), and nothing under it may be drawn as
-/// an outline or left out (those are per-node states a layer's pixels would keep from the frame
-/// they were made in).
+/// differently every frame (animated GIF frames, outlines), nothing under it may be drawn as an
+/// outline or left out (per-node states a layer's pixels would keep from the frame they were made
+/// in), and no paint in it may read a node outside it.
 pub(crate) fn cacheable(ctx: &Ctx, n: &Node) -> bool {
     ctx.cache.is_some() && !ctx.outline_mode && ctx.time == 0.0 && whole(ctx.page_at.0) && whole(ctx.page_at.1) && cacheable_subtree(ctx, n, 0)
 }
@@ -103,6 +107,11 @@ fn cacheable_subtree(ctx: &Ctx, n: &Node, depth: usize) -> bool {
         return false;
     }
     if n.is_mask || ctx.outlined.contains(&n.id) || ctx.skip.contains(&n.id) || crate::backdrop::has_effects(n) {
+        return false;
+    }
+    // A pattern fill's pixels are its source node's, which is outside this subtree: an edit there
+    // changes nothing this layer's key hashes.
+    if n.fills.iter().chain(&n.strokes).any(|p| matches!(p.kind, figcraft_color::PaintKind::Pattern(_))) {
         return false;
     }
     n.children.iter().all(|c| ctx.doc.node(*c).is_none_or(|cn| cacheable_subtree(ctx, cn, depth + 1)))
@@ -152,6 +161,19 @@ pub(crate) fn put(key: Key, root: Arc<Node>, layer: Arc<Layer>) {
     if let Some(old) = state.map.remove(&key) {
         state.bytes = state.bytes.saturating_sub(old.bytes);
     }
+    // A node edited since an entry was made is a new `Arc`: entries keyed on the old one never hit
+    // again, and the nodes they hold (text, paths, children) take memory the pixel budget doesn't
+    // count. Drop them; the same node drawn at another transform keeps its entry.
+    let id = root.id;
+    let mut kept_keys = vec![key];
+    for k in state.by_node.remove(&id).unwrap_or_default() {
+        if state.map.get(&k).is_some_and(|e| Arc::ptr_eq(&e.root, &root)) {
+            kept_keys.push(k);
+        } else if let Some(old) = state.map.remove(&k) {
+            state.bytes = state.bytes.saturating_sub(old.bytes);
+        }
+    }
+    state.by_node.insert(id, kept_keys);
     while state.bytes + bytes > BUDGET {
         let Some(oldest) = state.map.iter().min_by_key(|(_, e)| e.used).map(|(k, _)| *k) else { break };
         if let Some(old) = state.map.remove(&oldest) {
