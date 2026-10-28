@@ -27,9 +27,9 @@ use inspect::inspect;
 pub(crate) use inspect::{inspect_section, prop_row};
 #[cfg(test)]
 pub(crate) use menu::menu_row_width;
-pub use menu::{blend_menu, context_popup, menu_check, menu_item, menu_item_beside_checks, menu_item_with, menu_popup, menu_row};
 #[cfg(test)]
 pub(crate) use menu::preview_blend;
+pub use menu::{blend_menu, context_popup, menu_check, menu_item, menu_item_beside_checks, menu_item_with, menu_popup, menu_row};
 pub(crate) use menu::{block, menu_style, row, row_rect};
 use paints::{appearance, paints, variable_modes};
 pub(crate) use stroke::{CAP_ART_W, cap_art, join_label};

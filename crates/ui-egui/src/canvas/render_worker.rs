@@ -261,6 +261,7 @@ impl Renders {
             revision: job.revision,
             coarse,
             at: job.at,
+            seq: 0,
         };
         if !coarse {
             self.last = Some((job.uid, job.page, job.view.scale));
@@ -543,6 +544,7 @@ mod gpu_job_tests {
             skip: Vec::new(),
             solo: None,
             proof: false,
+            dots: None,
             uid: 1,
             revision: 0,
             zoom_preview: true,

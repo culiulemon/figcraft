@@ -500,8 +500,6 @@ fn seen_geometry(key: &Key) -> bool {
 /// everything but the frosted backdrop. The GPU canvas draws it from a backdrop texture; the CPU
 /// path blurs its backdrop and paints with it.
 pub struct GlassPane {
-    /// The pane's coverage with its margin (`m` each way), from which the geometry was worked out.
-    coverage: Pixmap,
     geometry: Arc<Geometry>,
     pub m: u32,
     pub w: u32,
@@ -574,7 +572,6 @@ pub fn pane(g: &Glass, shape: &Outline, w: u32, h: u32, xf: Affine, scale: f64) 
     let fall = 1.0 - floor;
     let intensity = g.light_intensity as f32;
     Some(GlassPane {
-        coverage: cov,
         geometry: geom,
         m,
         w,

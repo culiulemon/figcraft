@@ -242,8 +242,7 @@ fn the_canvas_shows_images_of_its_own_page_and_never_a_coarser_one_of_its_view()
     assert!(!shows(&c, &refined, Some((ds.uid, NodeId(ds.page.0 + 1)))), "another page");
     assert!(!shows(&c, &refined, None), "no file open");
     // Showing the refined image of the view asked for: a preview of the same content stays off.
-    (c.tex_view, c.tex_of, c.tex_coarse, c.tex_revision, c.tex_seq) =
-        (Some(refined.view.clone()), here, false, Some(refined.revision), refined.seq);
+    (c.tex_view, c.tex_of, c.tex_coarse, c.tex_revision, c.tex_seq) = (Some(refined.view.clone()), here, false, Some(refined.revision), refined.seq);
     assert!(!shows(&c, &preview, here));
     // Once the view asked for moves on, the preview is the better match.
     c.want_view = Some(far.view.clone());
