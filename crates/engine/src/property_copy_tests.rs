@@ -144,6 +144,30 @@ fn a_copied_image_key_taken_in_another_file_gets_the_copied_data() {
 }
 
 #[test]
+fn a_copied_image_whose_hash_key_is_also_taken_gets_a_free_key() {
+    let mut s = Session::new();
+    let a = rect(&mut s);
+    let bytes = vec![1, 2, 3];
+    let copied = figcraft_doc::ImageData { bytes: std::sync::Arc::new(bytes.clone()), width: 2, height: 2 };
+    let taken = figcraft_doc::ImageData { bytes: std::sync::Arc::new(vec![9, 9, 9]), width: 3, height: 3 };
+    // Images are usually keyed by their content hash: here the copied key is that hash, and the
+    // other file already uses it for other data, so the replacement key is taken as well.
+    let hash = figcraft_format::image_hash(&bytes);
+    ex(&mut s, "fill.add", json!({"ids": [a], "paint": {"type": "image", "image": hash}}));
+    s.doc_mut().unwrap().images.insert(hash.clone(), copied.clone());
+    ex(&mut s, "fill.copy", json!({"id": a, "index": 1}));
+    ex(&mut s, "file.new", json!({}));
+    let b = rect(&mut s);
+    s.doc_mut().unwrap().images.insert(hash.clone(), taken.clone());
+    ex(&mut s, "fill.paste", json!({"ids": [b], "index": 0}));
+    let doc = s.doc().unwrap();
+    let figcraft_color::PaintKind::Image(img) = &doc.node(b).unwrap().fills[0].kind else { panic!("the pasted fill is an image") };
+    assert_ne!(img.image, hash, "the taken hash is not reused");
+    assert_eq!(doc.images.get(&img.image), Some(&copied), "the pasted paint points at the copied data");
+    assert_eq!(doc.images.get(&hash), Some(&taken), "the destination's image stays");
+}
+
+#[test]
 fn a_copied_pattern_does_not_paste_into_another_file() {
     let mut s = Session::new();
     let source = rect(&mut s);
