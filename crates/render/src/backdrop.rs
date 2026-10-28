@@ -154,29 +154,51 @@ pub fn effects(n: &Node, shape: &Outline, back: &Pixmap, pad: u32, w: u32, h: u3
     out
 }
 
-/// Hide node `id` and everything painted after it (later siblings up its ancestry, the later
-/// `roots` and the strokes its ancestors paint over their children): what is left is its backdrop
-/// on the page made of `roots` (in z-order).
-pub fn hide_above(doc: &mut Document, id: NodeId, roots: &[NodeId]) {
-    let mut hide: Vec<NodeId> = vec![id];
+/// What is painted after node `id` (and `id` itself): the nodes, and the ancestors whose strokes
+/// are painted over their children (they come after everything in them). [`hide_above`] leaves
+/// them out of a document; the GPU canvas, which has no document to edit, skips them instead.
+#[derive(Clone, Debug, Default)]
+pub struct Above {
+    pub hidden: Vec<NodeId>,
+    /// Layers whose own strokes are painted after their children's.
+    pub strokes: Vec<NodeId>,
+}
+
+/// Collect what [`hide_above`] hides for node `id` among `roots` (in z-order).
+pub fn above(doc: &Document, id: NodeId, roots: &[NodeId]) -> Above {
+    let mut out = Above::default();
     let mut cur = id;
     for _ in 0..=MAX_DEPTH {
         if let Some(i) = roots.iter().position(|r| *r == cur) {
-            hide.extend(roots.iter().skip(i + 1));
+            out.hidden.extend(roots.iter().skip(i + 1));
             break;
         }
         let Some(parent) = doc.node(cur).and_then(|n| n.parent) else { break };
         if let Some(p) = doc.node(parent) {
-            hide.extend(p.paint_order().skip_while(|c| *c != cur).skip(1));
+            out.hidden.extend(p.paint_order().skip_while(|c| *c != cur).skip(1));
         }
-        if let Some(pn) = doc.node_mut(parent) {
-            pn.strokes.clear();
+        if doc.node(parent).is_some() {
+            out.strokes.push(parent);
         }
         cur = parent;
     }
-    for h in hide {
+    out.hidden.push(id);
+    out
+}
+
+/// Hide node `id` and everything painted after it (later siblings up its ancestry, the later
+/// `roots` and the strokes its ancestors paint over their children): what is left is its backdrop
+/// on the page made of `roots` (in z-order).
+pub fn hide_above(doc: &mut Document, id: NodeId, roots: &[NodeId]) {
+    let above = above(doc, id, roots);
+    for h in above.hidden {
         if let Some(n) = doc.node_mut(h) {
             n.visible = false;
+        }
+    }
+    for p in above.strokes {
+        if let Some(pn) = doc.node_mut(p) {
+            pn.strokes.clear();
         }
     }
 }

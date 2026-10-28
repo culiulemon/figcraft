@@ -12,7 +12,7 @@ use tiny_skia::{FillRule, FilterQuality, IntRect, Mask, MaskType, Pixmap, Pixmap
 use crate::backdrop::{self, Under};
 use crate::boolean::{PathCache, locked};
 use crate::paint::{Prepared, composite, prepare_at, ts_blend};
-use crate::{blur, grain, lod, shadow};
+use crate::{blur, grain, layers, lod, shadow};
 
 /// Shared state for one render.
 #[derive(Clone, Copy)]
@@ -37,6 +37,12 @@ pub struct Ctx<'a, 'd> {
     pub time: f64,
     /// Paint bounds already worked out in this render.
     pub bounds: &'a Bounds<'d>,
+    /// Device pixels (page coordinates × scale) of the pixmap's top-left pixel: layer pixels are
+    /// anchored on the page's grid, so they don't depend on where a view or band cuts them.
+    pub page_at: (f64, f64),
+    /// The document's id when isolated layers may be kept between renders (the canvas; see
+    /// [`crate::layers`]), `None` for renders that must be independent (exports, thumbnails).
+    pub cache: Option<u64>,
 }
 
 /// What one render works out about layers with children, which a walk down their subtree finds:
@@ -288,7 +294,7 @@ pub fn stroke_fill(doc: &Document, n: &Node) -> Option<(Arc<BezPath>, FillRule)>
 }
 
 /// Even-odd ring paths need the even-odd rule; everything else non-zero.
-pub(crate) fn stroke_rule(n: &Node, closed: bool) -> FillRule {
+pub fn stroke_rule(n: &Node, closed: bool) -> FillRule {
     if n.stroke.sides.is_some() || (n.stroke.dashes.is_empty() && closed && n.stroke.align != StrokeAlign::Center) {
         FillRule::EvenOdd
     } else {
@@ -473,8 +479,15 @@ pub fn effect_margin(n: &Node) -> f64 {
 pub fn paint_bounds(doc: &Document, id: NodeId) -> Option<Rect> {
     let n = doc.node(id)?;
     let m = effect_margin(n).abs();
+    Some(layer_bounds(doc, id)?.inflate(m, m))
+}
+
+/// What node `id` paints, in page coordinates, without its effects' margin: the rectangle its
+/// isolated layer is drawn into, and what a shadow cast by that layer is cropped to.
+pub fn layer_bounds(doc: &Document, id: NodeId) -> Option<Rect> {
+    let n = doc.node(id)?;
     let local = local_paint_bounds(doc, n, 0, None);
-    Some(figcraft_geom::transform_rect_bbox(doc.world_transform(id), local).inflate(m, m))
+    Some(figcraft_geom::transform_rect_bbox(doc.world_transform(id), local))
 }
 
 fn needs_layer(n: &Node) -> bool {
@@ -505,6 +518,15 @@ fn int_rect(r: Rect, limit: (u32, u32)) -> Option<IntRect> {
 
 /// The most a layer reaches past the view for its effects, in device pixels.
 const MAX_EFFECT_MARGIN_PX: f64 = 2048.0;
+
+/// A layer's rect in page device pixels: its paint bounds rounded out, when it's small enough to
+/// keep (see [`layers`]).
+fn whole_layer(dev: Rect) -> Option<(f64, f64, f64, f64)> {
+    let (x0, y0) = (dev.x0.floor(), dev.y0.floor());
+    let (w, h) = (dev.x1.ceil() - x0, dev.y1.ceil() - y0);
+    let fits = w >= 1.0 && h >= 1.0 && w <= 16_384.0 && h <= 16_384.0 && w * h <= layers::MAX_LAYER_PIXELS;
+    (fits && x0.is_finite() && y0.is_finite()).then_some((x0, y0, w, h))
+}
 
 /// Draw node `id` onto `pix`, where `parent_xf` maps the parent's space to `pix` pixels.
 pub fn draw_node(ctx: &Ctx, pix: &mut Pixmap, id: NodeId, parent_xf: Affine, depth: usize) {
@@ -557,17 +579,44 @@ fn draw_layer(ctx: &Ctx, pix: &mut Pixmap, n: &Node, parent_xf: Affine, depth: u
     // Isolated layer covering the node's paint bounds, clipped to the visible area + margin. Its
     // origin can be negative (inside the margin); the size counts from there, or a layer starting
     // above or left of the pixmap came out short by the margin (a band missing at its far edge).
-    let vis = dev.intersect(view);
-    let (x0, y0) = (vis.x0.floor(), vis.y0.floor());
-    let (w, h) = (vis.x1.ceil() - x0, vis.y1.ceil() - y0);
-    if !(x0.is_finite() && y0.is_finite() && w >= 1.0 && h >= 1.0) {
+    //
+    // Layers are rasterised on the page's device pixel grid (not the pixmap's), so the ones that
+    // didn't change can be kept between frames and composited again: a drag then redraws the layers
+    // that moved, not every layer in the damaged area.
+    let page_xf = Affine::translate((ctx.page_at.0, ctx.page_at.1)) * xf;
+    let key = layers::cacheable(ctx, n).then(|| layers::key(ctx, n, page_xf));
+    if let Some(key) = key
+        && let Some(hit) = layers::get(key)
+    {
+        let at = (hit.anchor.0 - ctx.page_at.0.round() as i32, hit.anchor.1 - ctx.page_at.1.round() as i32);
+        for sh in &hit.shadows {
+            composite(pix, at, &sh.pix, sh.opacity, sh.blend);
+        }
+        composite(pix, at, &hit.pix, n.opacity.clamp(0.0, 1.0), n.blend);
         return;
     }
-    let (lx, ly) = (x0 as i32, y0 as i32);
-    let lw = w.min(16_384.0) as u32;
-    let lh = h.min(16_384.0) as u32;
+    // Drawn a second time unchanged, a layer is kept whole; the first sight of it (and a layer
+    // changing every frame, a drag) is cut to what this render needs, as it always was.
+    let kept = key.filter(|k| layers::settled(*k));
+    let whole = kept.and_then(|_| whole_layer(dev));
+    let (rx0, ry0, rw, rh) = match whole {
+        Some(r) => r,
+        None => {
+            let vis = dev.intersect(view);
+            let (x0, y0) = (vis.x0.floor(), vis.y0.floor());
+            (x0, y0, vis.x1.ceil() - x0, vis.y1.ceil() - y0)
+        }
+    };
+    // The kept layer's place on the page (whole device pixels: `cacheable` checked it).
+    let anchor = (rx0 as i32 + ctx.page_at.0.round() as i32, ry0 as i32 + ctx.page_at.1.round() as i32);
+    if !(rx0.is_finite() && ry0.is_finite() && rw >= 1.0 && rh >= 1.0) {
+        return;
+    }
+    let (lx, ly) = (rx0 as i32, ry0 as i32);
+    let lw = rw.min(16_384.0) as u32;
+    let lh = rh.min(16_384.0) as u32;
     let Some(mut layer) = Pixmap::new(lw, lh) else { return };
-    let lxf = Affine::translate((-f64::from(lx), -f64::from(ly))) * xf;
+    let lxf = Affine::translate((-rx0, -ry0)) * xf;
     let shape = node_outline(ctx.doc, n);
     // Background blur and glass: the whole backdrop under the layer (every surface below this
     // one, composited), through the shape, under the content.
@@ -622,6 +671,7 @@ fn draw_layer(ctx: &Ctx, pix: &mut Pixmap, n: &Node, parent_xf: Affine, depth: u
         layer_effects(ctx, &mut layer, n, id, lxf);
     }
     // Drop shadows go under the layer, in effect-list order.
+    let mut shadows: Vec<layers::ShadowPart> = Vec::new();
     {
         // Kept apart, the backdrop isn't in the layer yet: the shadows are cast from the content
         // with the layer effects it will get (a copy only when it gets some).
@@ -637,7 +687,12 @@ fn draw_layer(ctx: &Ctx, pix: &mut Pixmap, n: &Node, parent_xf: Affine, depth: u
             if let EffectKind::DropShadow(s) = &e.kind
                 && let Some(sh) = shadow::drop_shadow(&caster, s)
             {
-                composite(pix, (lx, ly), &sh, op, s.blend);
+                if kept.is_some() {
+                    // Kept with the layer: the next frame composites it instead of drawing it.
+                    shadows.push(layers::ShadowPart { pix: sh, opacity: op, blend: s.blend });
+                } else {
+                    composite(pix, (lx, ly), &sh, op, s.blend);
+                }
             }
         }
     }
@@ -648,6 +703,15 @@ fn draw_layer(ctx: &Ctx, pix: &mut Pixmap, n: &Node, parent_xf: Affine, depth: u
             layer = b;
         }
         layer_effects(ctx, &mut layer, n, id, lxf);
+    }
+    if let Some(key) = kept {
+        let made = Arc::new(layers::Layer { pix: layer, anchor, shadows });
+        layers::put(key, Arc::clone(&made));
+        for sh in &made.shadows {
+            composite(pix, (lx, ly), &sh.pix, sh.opacity, sh.blend);
+        }
+        composite(pix, (lx, ly), &made.pix, op, n.blend);
+        return;
     }
     composite(pix, (lx, ly), &layer, op, n.blend);
 }

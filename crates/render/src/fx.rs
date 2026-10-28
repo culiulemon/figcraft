@@ -1,7 +1,72 @@
 //! Raster effects on premultiplied RGBA8 pixmaps: blur (3× box ≈ Gaussian), dilate/erode (spread),
 //! alpha extraction and tinting.
 
+use std::sync::{Arc, Mutex, OnceLock};
+
 use tiny_skia::Pixmap;
+
+/// What a glass pane's pixels are computed from, for [`Accelerator::glass`].
+pub struct GlassPaint<'a> {
+    /// The pane's coverage alpha (`cw` × `ch`, one byte a pixel).
+    pub alpha: &'a [u8],
+    /// Its distance to the outline, and the smoothed inward normals (same size).
+    pub dist: &'a [f32],
+    pub normals: &'a [(f32, f32)],
+    pub cw: usize,
+    pub ch: usize,
+    /// The margin the coverage was grown by (`Geometry`'s `m`).
+    pub m: u32,
+    /// The backdrop around the pane, blurred (`pad` pixels more each way).
+    pub frosted: &'a Pixmap,
+    pub w: u32,
+    pub h: u32,
+    pub pad: u32,
+    pub depth: f32,
+    pub bend_max: f32,
+    pub fringe: f32,
+    pub power: f32,
+    pub band: f32,
+    pub reach: f32,
+    pub floor: f32,
+    pub fall: f32,
+    pub intensity: f32,
+    pub light: (f32, f32),
+    /// Which geometry this is (the same id whenever the pane's shape, size and zoom are the same):
+    /// an accelerator keeps it as textures and works it out once.
+    pub geometry: u64,
+}
+
+/// A GPU (or other) accelerator for the raster effects that dominate a render. The CPU paths stay
+/// (exports, tests and machines without a device): this only stands in for them where it can, and
+/// every method says whether it did.
+pub trait Accelerator: Send + Sync {
+    /// Blur `p` in place with standard deviation `sigma` (pixels); false when it can't, and the
+    /// CPU blurs it instead.
+    fn blur(&self, p: &mut Pixmap, sigma: f64) -> bool;
+    /// A glass pane's pixels; `None` when it can't, and the CPU paints them instead.
+    fn glass(&self, paint: &GlassPaint<'_>) -> Option<Pixmap> {
+        let _ = paint;
+        None
+    }
+}
+
+static ACCELERATOR: OnceLock<Mutex<Option<Arc<dyn Accelerator>>>> = OnceLock::new();
+
+/// Install (or remove) the accelerator effects use (the canvas installs the window's GPU).
+pub fn set_accelerator(accelerator: Option<Arc<dyn Accelerator>>) {
+    if let Ok(mut slot) = ACCELERATOR.get_or_init(|| Mutex::new(None)).lock() {
+        *slot = accelerator;
+    }
+}
+
+pub(crate) fn accelerator() -> Option<Arc<dyn Accelerator>> {
+    ACCELERATOR.get()?.lock().ok()?.clone()
+}
+
+/// Whether effects run on an accelerator (the canvas's GPU) rather than on the CPU.
+pub(crate) fn accelerated() -> bool {
+    ACCELERATOR.get().is_some_and(|slot| slot.lock().is_ok_and(|s| s.is_some()))
+}
 
 /// Box radii for three passes approximating a Gaussian of `sigma` (Kovesi).
 fn box_sizes(sigma: f64) -> [usize; 3] {
@@ -22,8 +87,7 @@ fn box_sizes(sigma: f64) -> [usize; 3] {
 }
 
 /// Pixmaps from this many pixels blur and transpose in parallel (desktop).
-#[cfg(not(target_arch = "wasm32"))]
-const PARALLEL_PIXELS: usize = 1 << 16;
+pub(crate) const PARALLEL_PIXELS: usize = 1 << 16;
 
 /// Whether `pixels` go across rayon: large pixmaps, and only from outside its pool. A blur on a
 /// pool thread (a band of `render_view`) is already one of several running in parallel.
@@ -130,6 +194,11 @@ fn transpose(src: &[[u8; 4]], dst: &mut [[u8; 4]], w: usize, h: usize) {
 /// in full at any zoom.
 pub const MAX_SIGMA: f64 = 1_000_000.0;
 
+/// The three box radii a blur of `sigma` uses (an accelerator blurs with the same ones).
+pub fn box_radii(sigma: f64) -> [usize; 3] {
+    box_sizes(if sigma.is_finite() { sigma.min(MAX_SIGMA) } else { MAX_SIGMA })
+}
+
 /// Gaussian-like blur of the whole pixmap with standard deviation `sigma` (pixels): three box
 /// passes along the rows, then three down the columns (as rows of the transposed pixmap).
 pub fn blur(p: &mut Pixmap, sigma: f64) {
@@ -137,6 +206,11 @@ pub fn blur(p: &mut Pixmap, sigma: f64) {
         return;
     }
     let sigma = sigma.min(MAX_SIGMA);
+    if let Some(accelerator) = accelerator()
+        && accelerator.blur(p, sigma)
+    {
+        return;
+    }
     let (w, h) = (p.width() as usize, p.height() as usize);
     let radii = box_sizes(sigma);
     let n = p.data().len() / 4;
