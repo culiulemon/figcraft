@@ -416,6 +416,34 @@ fn dropping_into_and_pulling_out_of_frames_follows_the_pointer() {
 }
 
 #[test]
+fn paste_goes_into_the_selected_group() {
+    // Documented: with a group selected, Paste adds the copied layers to it (as it does for a
+    // selected frame), and Paste here puts them in it at the point; with nothing selected they
+    // stay on the page.
+    let mut s = Session::new();
+    let page = s.page().unwrap();
+    let a = rect(&mut s, 0.0, 0.0, 20.0, 20.0, None);
+    let b = rect(&mut s, 40.0, 0.0, 20.0, 20.0, None);
+    let g = id(ex(&mut s, "object.group", json!({"ids": [a, b]})));
+    let picked = rect(&mut s, 10.0, 0.0, 10.0, 10.0, None);
+    ex(&mut s, "edit.copy", json!({"ids": [picked]}));
+
+    ex(&mut s, "select.set", json!({"ids": [g]}));
+    let pasted = id_of(&ex(&mut s, "edit.paste", json!({}))["ids"][0]).unwrap();
+    assert_eq!(parent(&s, pasted), Some(g));
+    assert_eq!(wb(&s, pasted), (10.0, 0.0, 10.0, 10.0), "in place: the copy was in the group's bounds");
+    ex(&mut s, "select.set", json!({"ids": [g]}));
+    let here = id_of(&ex(&mut s, "edit.paste", json!({"x": 500.0, "y": 300.0}))["ids"][0]).unwrap();
+    assert_eq!(parent(&s, here), Some(g));
+    assert_eq!(wb(&s, here), (500.0, 300.0, 10.0, 10.0));
+
+    ex(&mut s, "select.set", json!({"ids": []}));
+    let loose = id_of(&ex(&mut s, "edit.paste", json!({}))["ids"][0]).unwrap();
+    assert_eq!(parent(&s, loose), Some(page));
+    assert!(s.doc().unwrap().validate().is_empty());
+}
+
+#[test]
 fn sections_go_on_the_page_or_in_sections() {
     // Documented: sections can be nested in sections but can't go in frames or groups.
     let mut s = Session::new();

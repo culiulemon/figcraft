@@ -39,6 +39,17 @@ impl Session {
 
     /// Replace the document with `f(snapshot)` for a live preview during a gesture.
     pub fn preview(&mut self, f: impl FnOnce(&mut Document, &mut Vec<NodeId>) -> Result<()>) -> Result<()> {
+        self.preview_after(f, |_| Ok(()))
+    }
+
+    /// [`preview`](Self::preview), then `after` once derived state has settled (text, auto layout):
+    /// for edits that must follow the box the document ends up with rather than the one the
+    /// gesture asked for.
+    pub fn preview_after(
+        &mut self,
+        f: impl FnOnce(&mut Document, &mut Vec<NodeId>) -> Result<()>,
+        after: impl FnOnce(&mut Document) -> Result<()>,
+    ) -> Result<()> {
         let ds = self.ds_mut()?;
         let Some(it) = ds.interaction.clone() else { return Err(EngineError::Other("no gesture in progress".into())) };
         let mut doc = (*it.doc).clone();
@@ -49,6 +60,7 @@ impl Session {
         if res.is_ok() {
             cmd::styles::detach_edited(&mut doc, &before);
             normalize(&mut doc, &it.doc);
+            after(&mut doc)?;
             // The same preview again (a handle held still) keeps the document: a new one would
             // re-render the canvas for nothing.
             if doc == *ds.doc && sel == ds.selection {

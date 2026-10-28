@@ -99,16 +99,16 @@ const BOTH: Mods = Mods { shift: true, alt: true, cmd: false };
 const CMD: Mods = Mods { shift: false, alt: false, cmd: true };
 
 /// An asymmetric synthetic image: every column is different, so recentering is visible.
-fn image_layer(s: &mut Session) -> NodeId {
+fn image_b64() -> String {
     use base64::Engine as _;
     let image = image::RgbaImage::from_fn(200, 100, |x, y| image::Rgba([x as u8, y as u8, 120, 255]));
     let mut bytes = std::io::Cursor::new(Vec::new());
     image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
-    id(&ex(
-        s,
-        "file.import",
-        json!({"data": base64::engine::general_purpose::STANDARD.encode(bytes.into_inner()), "name": "crop.png", "x": 0, "y": 0}),
-    ))
+    base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())
+}
+
+fn image_layer(s: &mut Session) -> NodeId {
+    id(&ex(s, "file.import", json!({"data": image_b64(), "name": "crop.png", "x": 0, "y": 0})))
 }
 
 #[test]
@@ -200,6 +200,40 @@ fn command_crop_keeps_image_placement_in_the_layers_axes() {
 }
 
 #[test]
+fn command_resize_crops_an_image_fill_inside_auto_layout() {
+    use figcraft_doc::color::{ImageScaleMode, PaintKind};
+    // An auto layout child's box can be re-placed by the layout after the preview: the crop has
+    // to follow the box the layer ends up with, not the one the pointer asked for.
+    let mut s = session();
+    let frame = id(&ex(&mut s, "node.create", json!({"type": "frame", "x": 0, "y": 0, "width": 400, "height": 200})));
+    set(&mut s, &[frame], json!({"layoutMode": "horizontal", "gap": 10, "padding": 10}));
+    let layer = rect(&mut s, 10.0, 10.0, 200.0, 100.0, Some(frame));
+    ex(&mut s, "image.place", json!({"target": layer, "data": image_b64(), "mode": "fill"}));
+    let original = s.doc().unwrap().clone();
+    let before = figcraft_render::render_node(&original, layer, 1.0).unwrap();
+    let b = original.world_bounds(layer).unwrap();
+    drag(&mut s, Point::new(b.x1, b.center().y), Point::new(b.x1 - 100.0, b.center().y), CMD);
+    assert_eq!(size(&s, layer), (100.0, 100.0));
+    let doc = s.doc().unwrap().clone();
+    let img = doc
+        .node(layer)
+        .unwrap()
+        .fills
+        .iter()
+        .find_map(|p| match &p.kind {
+            PaintKind::Image(i) => Some(i),
+            _ => None,
+        })
+        .expect("image fill");
+    assert_eq!(img.scale_mode, ImageScaleMode::Crop);
+    assert!(img.crop.is_some());
+    let after = figcraft_render::render_node(&doc, layer, 1.0).unwrap();
+    for y in 0..100usize {
+        assert_eq!(&after.data()[y * 400..(y + 1) * 400], &before.data()[y * 800..y * 800 + 400], "row {y}: the image stays put");
+    }
+}
+
+#[test]
 fn ordinary_resize_and_scale_keep_image_fill_settings() {
     for (tool, cmd, ctrl) in [("move", false, false), ("move", false, true), ("scale", true, false)] {
         let mut s = session();
@@ -242,7 +276,9 @@ fn command_crop_preserves_each_image_fill_and_leaves_tiles() {
 }
 
 #[test]
-fn command_resize_leaves_fills_when_text_or_auto_layout_recomputes_the_box() {
+fn command_resize_crops_when_auto_layout_settles_the_box_but_leaves_text() {
+    use figcraft_doc::color::{ImageScaleMode, PaintKind};
+    use figcraft_geom::Affine;
     for case in ["text", "child", "frame"] {
         let mut s = session();
         let image = image_layer(&mut s);
@@ -269,13 +305,46 @@ fn command_resize_leaves_fills_when_text_or_auto_layout_recomputes_the_box() {
             }
         };
         ex(&mut s, "select.set", json!({"ids": [layer]}));
-        let doc = s.doc().unwrap();
-        let world = doc.world_transform(layer);
-        let n = doc.node(layer).unwrap();
+        let before = s.doc().unwrap().clone();
+        let bn = before.node(layer).unwrap();
+        let old_img = bn.fills.iter().find_map(|p| match &p.kind {
+            PaintKind::Image(i) => Some(i.clone()),
+            _ => None,
+        });
+        let world = before.world_transform(layer);
+        let n = before.node(layer).unwrap();
         let from = world * Point::new(n.width, n.height / 2.0);
         let to = world * Point::new(10.0, n.height / 2.0);
         drag(&mut s, from, to, CMD);
-        assert_eq!(s.doc().unwrap().node(layer).unwrap().fills, fills, "{case}: keep the existing resize behaviour");
+        let doc = s.doc().unwrap();
+        let n = doc.node(layer).unwrap();
+        if case == "text" {
+            // Text reflow moves the box after the preview: the fill keeps its placement.
+            assert_eq!(n.fills, fills, "text: keep the existing resize behaviour");
+            continue;
+        }
+        // The layout may settle the box at a size the pointer didn't ask for; the crop follows it.
+        let img = n.fills.iter().find_map(|p| match &p.kind {
+            PaintKind::Image(i) => Some(i),
+            _ => None,
+        });
+        let (Some(old_img), Some(img)) = (old_img, img) else { panic!("{case}: image fill") };
+        assert_eq!(img.scale_mode, ImageScaleMode::Crop, "{case}");
+        let data = doc.images.get(&img.image).expect("image data");
+        let (iw, ih) = (f64::from(data.width), f64::from(data.height));
+        let bn = before.node(layer).expect("before");
+        let old_map = Affine::new(old_img.effective_crop(iw, ih, bn.width, bn.height))
+            * Affine::scale_non_uniform(1.0 / bn.width, 1.0 / bn.height)
+            * before.world_transform(layer).inverse();
+        let new_crop = img.effective_crop(iw, ih, n.width, n.height);
+        let new_map = Affine::new(new_crop) * Affine::scale_non_uniform(1.0 / n.width, 1.0 / n.height) * doc.world_transform(layer).inverse();
+        // Points on the page that both boxes show sample the same source pixel.
+        let (a, b) = (before.world_bounds(layer).expect("old bounds"), doc.world_bounds(layer).expect("new bounds"));
+        let (x0, y0, x1, y1) = (a.x0.max(b.x0), a.y0.max(b.y0), a.x1.min(b.x1), a.y1.min(b.y1));
+        assert!(x1 - x0 > 1.0 && y1 - y0 > 1.0, "{case}: the boxes overlap");
+        for p in [Point::new(x0 + 0.5, y0 + 0.5), Point::new((x0 + x1) / 2.0, (y0 + y1) / 2.0), Point::new(x1 - 0.5, y1 - 0.5)] {
+            assert!((new_map * p - old_map * p).hypot() < 1e-6, "{case}: the same page point samples the same source pixel");
+        }
     }
 }
 

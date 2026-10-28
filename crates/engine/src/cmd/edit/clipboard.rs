@@ -208,8 +208,8 @@ pub fn paste_into(s: &mut Session, parent: NodeId, at: Option<(f64, f64)>) -> Re
 
 pub(super) fn paste(s: &mut Session, p: &Value) -> Result<Value> {
     let page = s.page()?;
-    // Figma pastes into the selected frame (if one is selected), at the same position when it fits,
-    // else in the frame's centre; otherwise in place on the page (or the viewport centre).
+    // Figma pastes into the selected frame or group (if one is selected), at the same position when
+    // it fits, else in its centre; otherwise in place on the page (or the viewport centre).
     let sel = s.selection();
     let doc = s.doc()?;
     let copy_local = s.ds()?.uid == s.clipboard.source_doc;
@@ -218,7 +218,11 @@ pub(super) fn paste(s: &mut Session, p: &Value) -> Result<Value> {
             .copied()
             .filter(|i| {
                 sel.len() == 1
-                    && doc.node(*i).is_some_and(|n| n.kind.is_frame_like() && !matches!(n.kind, NodeKind::Instance { .. }) && !n.is_board_atom())
+                    && doc.node(*i).is_some_and(|n| {
+                        (n.kind.is_frame_like() || matches!(n.kind, NodeKind::Group))
+                            && !matches!(n.kind, NodeKind::Instance { .. })
+                            && !n.is_board_atom()
+                    })
             })
             .filter(|i| !copy_local || !s.clipboard.copied_components.iter().any(|root| doc.is_ancestor(*root, *i)))
     });

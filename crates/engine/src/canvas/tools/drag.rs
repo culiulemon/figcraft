@@ -497,98 +497,67 @@ impl Session {
         let keeps = |doc: &Document, id: NodeId| {
             doc.node(id).is_some_and(|n| matches!(n.kind, NodeKind::Section { .. }) || (ev.cmd && single && n.kind.is_frame_like()))
         };
-        self.preview(|doc, _| {
-            if single {
-                let Some((id, world, _, _)) = nodes.first() else { return Ok(()) };
-                let kept = if keeps(doc, *id) { crate::cmd::props::children_worlds(doc, *id) } else { Vec::new() };
-                let mut t = *world * Affine::translate((nx0, ny0));
-                if flip_x {
-                    t *= Affine::new([-1.0, 0.0, 0.0, 1.0, nw, 0.0]);
-                }
-                if flip_y {
-                    t *= Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, nh]);
-                }
-                // Text reflow and auto layout can recompute this box after the preview (a size bound
-                // to a variable lets go of it: the resize is an explicit edit).
-                let n = doc.get(*id)?;
-                let crop_images = ev.cmd
-                    && !matches!(n.kind, NodeKind::Text(_))
-                    && !std::iter::once(*id).chain(doc.ancestors(*id)).any(|a| doc.node(a).is_some_and(|n| n.layout.is_some()));
-                if crop_images {
-                    // Crop the layer's image fills without moving their pixels on the page.
-                    // Work from the interaction snapshot, just like the geometry on every move.
-                    let (w, h) = (n.width.max(1e-6), n.height.max(1e-6));
-                    let to_old =
-                        Affine::scale_non_uniform(1.0 / w, 1.0 / h) * world.inverse() * t * Affine::scale_non_uniform(nw.max(0.01), nh.max(0.01));
-                    let mut fills = n.fills.clone();
-                    for paint in &mut fills {
-                        let PaintKind::Image(img) = &mut paint.kind else { continue };
-                        // A repeating image cannot be represented by a single Crop placement.
-                        if img.scale_mode == ImageScaleMode::Tile {
-                            continue;
-                        }
-                        let Some(data) = doc.images.get(&img.image) else { continue };
-                        let (iw, ih) = (f64::from(data.width), f64::from(data.height));
-                        let crop = if img.scale_mode == ImageScaleMode::Crop {
-                            img.effective_crop(iw, ih, w, h)
-                        } else {
-                            let (rw, rh) = img.rotated_size(iw.max(1.0), ih.max(1.0));
-                            let s = if img.scale_mode == ImageScaleMode::Fit { (w / rw).min(h / rh) } else { (w / rw).max(h / rh) };
-                            [w / (rw * s), 0.0, 0.0, h / (rh * s), (rw * s - w) / (2.0 * rw * s), (rh * s - h) / (2.0 * rh * s)]
-                        };
-                        // A degenerate (zero-scale) layer has no inverse: its image keeps its placement.
-                        let crop = (Affine::new(crop) * to_old).as_coeffs();
-                        if !crop.iter().all(|c| c.is_finite()) {
-                            continue;
-                        }
-                        img.crop = Some(crop);
-                        img.scale_mode = ImageScaleMode::Crop;
+        // Cmd/Ctrl crops the layer's image fills instead of scaling them. The crop is applied once
+        // the box has settled (see `preview_after`): an auto layout child's place or size can follow
+        // the layout rather than the pointer.
+        let crop = (ev.cmd && single).then(|| nodes.first().and_then(|(id, _, _, _)| crop_before(self, *id))).flatten();
+        self.preview_after(
+            |doc, _| {
+                if single {
+                    let Some((id, world, _, _)) = nodes.first() else { return Ok(()) };
+                    let kept = if keeps(doc, *id) { crate::cmd::props::children_worlds(doc, *id) } else { Vec::new() };
+                    let mut t = *world * Affine::translate((nx0, ny0));
+                    if flip_x {
+                        t *= Affine::new([-1.0, 0.0, 0.0, 1.0, nw, 0.0]);
                     }
-                    doc.get_mut(*id)?.fills = fills;
+                    if flip_y {
+                        t *= Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, nh]);
+                    }
+                    doc.set_world_transform(*id, t)?;
+                    if kept.is_empty() {
+                        crate::cmd::props::resize_node(doc, *id, nw.max(0.01), nh.max(0.01))?;
+                    } else {
+                        figcraft_layout::set_size(doc, *id, nw.max(0.01), nh.max(0.01));
+                        crate::cmd::props::restore_worlds(doc, &kept)?;
+                    }
+                    let n = doc.get_mut(*id)?;
+                    if matches!(handle, Handle::Corner(_) | Handle::Edge(1) | Handle::Edge(3)) {
+                        n.child_layout.sizing_h = Sizing::Fixed;
+                    }
+                    if matches!(handle, Handle::Corner(_) | Handle::Edge(0) | Handle::Edge(2)) {
+                        n.child_layout.sizing_v = Sizing::Fixed;
+                    }
+                    if let NodeKind::Text(t) = &mut n.kind {
+                        match handle {
+                            Handle::Edge(1) | Handle::Edge(3) if t.auto_resize == TextAutoResize::Truncate => {}
+                            Handle::Edge(1) | Handle::Edge(3) => t.auto_resize = TextAutoResize::Height,
+                            _ => t.fix_size(true, true),
+                        }
+                    }
+                    return Ok(());
                 }
-                doc.set_world_transform(*id, t)?;
-                if kept.is_empty() {
-                    crate::cmd::props::resize_node(doc, *id, nw.max(0.01), nh.max(0.01))?;
-                } else {
-                    figcraft_layout::set_size(doc, *id, nw.max(0.01), nh.max(0.01));
+                // Several layers: map the old box onto the new one, in the box's axes. Each layer's
+                // centre follows the box (mirrored when it flips); each keeps its rotation and scales
+                // along its own axes (see `axis_factors`), turning over with the box.
+                let (sx, sy) = (if w0 > 1e-9 { (x1 - x0) / w0 } else { 1.0 }, if h0 > 1e-9 { (y1 - y0) / h0 } else { 1.0 });
+                let mirror = Affine::new([sx.signum(), 0.0, 0.0, sy.signum(), 0.0, 0.0]);
+                let inv = frame.inverse();
+                for (id, world, w, h) in &nodes {
+                    let local = inv * *world;
+                    let center = local * Point::new(w / 2.0, h / 2.0);
+                    let (kw, kh) = figcraft_layout::axis_factors(local, sx, sy);
+                    let (w2, h2) = (w * kw, h * kh);
+                    let lin = (mirror * local).with_translation(Vec2::ZERO);
+                    let origin = Point::new(x0 + center.x * sx, y0 + center.y * sy) - lin * Point::new(w2 / 2.0, h2 / 2.0);
+                    let kept = if keeps(doc, *id) { crate::cmd::props::children_worlds(doc, *id) } else { Vec::new() };
+                    doc.set_world_transform(*id, frame * lin.with_translation(origin))?;
+                    crate::cmd::props::resize_node(doc, *id, w2, h2)?;
                     crate::cmd::props::restore_worlds(doc, &kept)?;
                 }
-                let n = doc.get_mut(*id)?;
-                if matches!(handle, Handle::Corner(_) | Handle::Edge(1) | Handle::Edge(3)) {
-                    n.child_layout.sizing_h = Sizing::Fixed;
-                }
-                if matches!(handle, Handle::Corner(_) | Handle::Edge(0) | Handle::Edge(2)) {
-                    n.child_layout.sizing_v = Sizing::Fixed;
-                }
-                if let NodeKind::Text(t) = &mut n.kind {
-                    match handle {
-                        Handle::Edge(1) | Handle::Edge(3) if t.auto_resize == TextAutoResize::Truncate => {}
-                        Handle::Edge(1) | Handle::Edge(3) => t.auto_resize = TextAutoResize::Height,
-                        _ => t.fix_size(true, true),
-                    }
-                }
-                return Ok(());
-            }
-            // Several layers: map the old box onto the new one, in the box's axes. Each layer's
-            // centre follows the box (mirrored when it flips); each keeps its rotation and scales
-            // along its own axes (see `axis_factors`), turning over with the box.
-            let (sx, sy) = (if w0 > 1e-9 { (x1 - x0) / w0 } else { 1.0 }, if h0 > 1e-9 { (y1 - y0) / h0 } else { 1.0 });
-            let mirror = Affine::new([sx.signum(), 0.0, 0.0, sy.signum(), 0.0, 0.0]);
-            let inv = frame.inverse();
-            for (id, world, w, h) in &nodes {
-                let local = inv * *world;
-                let center = local * Point::new(w / 2.0, h / 2.0);
-                let (kw, kh) = figcraft_layout::axis_factors(local, sx, sy);
-                let (w2, h2) = (w * kw, h * kh);
-                let lin = (mirror * local).with_translation(Vec2::ZERO);
-                let origin = Point::new(x0 + center.x * sx, y0 + center.y * sy) - lin * Point::new(w2 / 2.0, h2 / 2.0);
-                let kept = if keeps(doc, *id) { crate::cmd::props::children_worlds(doc, *id) } else { Vec::new() };
-                doc.set_world_transform(*id, frame * lin.with_translation(origin))?;
-                crate::cmd::props::resize_node(doc, *id, w2, h2)?;
-                crate::cmd::props::restore_worlds(doc, &kept)?;
-            }
-            Ok(())
-        })?;
+                Ok(())
+            },
+            move |doc| crop_after(doc, crop.as_ref()),
+        )?;
         self.tool.overlay.guides = guides;
         Ok(())
     }
@@ -617,4 +586,76 @@ impl Session {
         self.tool.overlay.guides = guides;
         Ok(())
     }
+}
+
+/// What a Cmd/Ctrl resize keeps fixed: the layer's box and image placements at the gesture's
+/// start, one entry per image fill (index, image hash, crop that places it in the old box).
+struct CropBefore {
+    id: NodeId,
+    world: Affine,
+    w: f64,
+    h: f64,
+    images: Vec<(usize, String, [f64; 6])>,
+}
+
+/// The crop state of the layer a resize is about to crop, from the interaction snapshot (the
+/// document as it was when the gesture began, which every preview frame re-applies from).
+fn crop_before(s: &Session, id: NodeId) -> Option<CropBefore> {
+    let ds = s.ds().ok()?;
+    let doc = &ds.interaction.as_ref()?.doc;
+    let n = doc.node(id)?;
+    // Text reflow can resettle its box after the preview: an image fill on text keeps its
+    // placement rather than cropping.
+    if matches!(n.kind, NodeKind::Text(_)) {
+        return None;
+    }
+    let (w, h) = (n.width.max(1e-6), n.height.max(1e-6));
+    let mut images = Vec::new();
+    for (i, paint) in n.fills.iter().enumerate() {
+        let PaintKind::Image(img) = &paint.kind else { continue };
+        // A repeating image cannot be represented by a single Crop placement.
+        if img.scale_mode == ImageScaleMode::Tile {
+            continue;
+        }
+        let Some(data) = doc.images.get(&img.image) else { continue };
+        let (iw, ih) = (f64::from(data.width), f64::from(data.height));
+        let crop = if img.scale_mode == ImageScaleMode::Crop {
+            img.effective_crop(iw, ih, w, h)
+        } else {
+            let (rw, rh) = img.rotated_size(iw.max(1.0), ih.max(1.0));
+            let sc = if img.scale_mode == ImageScaleMode::Fit { (w / rw).min(h / rh) } else { (w / rw).max(h / rh) };
+            [w / (rw * sc), 0.0, 0.0, h / (rh * sc), (rw * sc - w) / (2.0 * rw * sc), (rh * sc - h) / (2.0 * rh * sc)]
+        };
+        images.push((i, img.image.clone(), crop));
+    }
+    (!images.is_empty()).then(|| CropBefore { id, world: doc.world_transform(id), w, h, images })
+}
+
+/// Crop each image fill so its pixels stay where they were on the page, mapping the box the layer
+/// ended up with (auto layout may have moved or resized it after the preview) onto the old one.
+fn crop_after(doc: &mut Document, before: Option<&CropBefore>) -> Result<()> {
+    let Some(before) = before else { return Ok(()) };
+    let Some(n) = doc.node(before.id) else { return Ok(()) };
+    let (nw, nh) = (n.width.max(0.01), n.height.max(0.01));
+    let to_old = Affine::scale_non_uniform(1.0 / before.w, 1.0 / before.h)
+        * before.world.inverse()
+        * doc.world_transform(before.id)
+        * Affine::scale_non_uniform(nw, nh);
+    let mut fills = n.fills.clone();
+    for (i, image, crop) in &before.images {
+        let Some(paint) = fills.get_mut(*i) else { continue };
+        let PaintKind::Image(img) = &mut paint.kind else { continue };
+        if &img.image != image {
+            continue;
+        }
+        // A degenerate (zero-scale) layer has no inverse: its image keeps its placement.
+        let crop = (Affine::new(*crop) * to_old).as_coeffs();
+        if !crop.iter().all(|c| c.is_finite()) {
+            continue;
+        }
+        img.crop = Some(crop);
+        img.scale_mode = ImageScaleMode::Crop;
+    }
+    doc.get_mut(before.id)?.fills = fills;
+    Ok(())
 }
