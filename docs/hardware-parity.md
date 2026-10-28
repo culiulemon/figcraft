@@ -41,8 +41,10 @@ drag to 30–34 ms. The GPU canvas (which now draws that page, glass included, i
 pass per segment) reports 12–19 ms a frame in the app for both, with a lower canvas latency (17.8 ms
 against the CPU's 41 ms in the same session) as no pixels cross the bus; in isolation the same page
 is 6.2 ms at 2400 × 1600 (`cargo test -p figcraft-gpu --release segmented_timings -- --ignored`).
-The GPU re-encodes the page each frame — retention like the CPU's is the next slice — so a
-single-layer drag on such a page is where the CPU still wins on render time.
+P11 keeps each page step and each node's encoded scene between frames, so a single-layer drag
+re-encodes only the layers it changed: 0.9–10.9 ms on the corpus pages
+(`segmented_drag_timings`), at or under the CPU's retained renderer on content-dominated pages and
+2–3× it on backdrop pages, which are re-assembled whole each frame.
 
 Nothing has been timed against Figma on the same document (needs `.fig` import). 
 

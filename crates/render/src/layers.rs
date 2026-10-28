@@ -6,7 +6,8 @@
 //! moving layers composites the rest instead of drawing them again.
 //!
 //! Only layers that can't see the backdrop are kept (see [`cacheable`]): glass and background
-//! blurs read what lies under them, and masked frames start as a copy of it.
+//! blurs read what lies under them, and masked frames start as a copy of it. A layer whose
+//! subtree is drawn as an outline or left out is drawn again too.
 
 use std::collections::hash_map::{DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
@@ -46,6 +47,9 @@ const BUDGET: usize = 128 << 20;
 const BUDGET: usize = 24 << 20;
 
 struct Entry {
+    /// The layer's node, held so its address can't be reused by another node while the entry
+    /// lives (see [`key`]).
+    root: Arc<Node>,
     layer: Arc<Layer>,
     bytes: usize,
     /// The [`State::tick`] of the last use: the smallest ones are dropped first.
@@ -81,10 +85,12 @@ pub(crate) fn kept_bytes() -> usize {
 }
 
 /// Whether node `n`'s layer can be kept: nothing in it may read the backdrop (glass, background
-/// blur, masks — see the module docs), it must be on whole device pixels, and it must not be drawn
-/// differently every frame (animated GIF frames, outlines).
+/// blur, masks — see the module docs), it must be on whole device pixels, it must not be drawn
+/// differently every frame (animated GIF frames, outlines), and nothing under it may be drawn as
+/// an outline or left out (those are per-node states a layer's pixels would keep from the frame
+/// they were made in).
 pub(crate) fn cacheable(ctx: &Ctx, n: &Node) -> bool {
-    ctx.cache.is_some() && !ctx.outline_mode && ctx.time == 0.0 && whole(ctx.page_at.0) && whole(ctx.page_at.1) && backdrop_free(ctx.doc, n, 0)
+    ctx.cache.is_some() && !ctx.outline_mode && ctx.time == 0.0 && whole(ctx.page_at.0) && whole(ctx.page_at.1) && cacheable_subtree(ctx, n, 0)
 }
 
 /// Whether `v` is a whole device pixel (the scale round trip leaves a hair either side).
@@ -92,22 +98,27 @@ fn whole(v: f64) -> bool {
     (v - v.round()).abs() < 1e-6
 }
 
-fn backdrop_free(doc: &Document, n: &Node, depth: usize) -> bool {
+fn cacheable_subtree(ctx: &Ctx, n: &Node, depth: usize) -> bool {
     if depth > 64 {
         return false;
     }
-    if n.is_mask || crate::backdrop::has_effects(n) {
+    if n.is_mask || ctx.outlined.contains(&n.id) || ctx.skip.contains(&n.id) || crate::backdrop::has_effects(n) {
         return false;
     }
-    n.children.iter().all(|c| doc.node(*c).is_none_or(|cn| backdrop_free(doc, cn, depth + 1)))
+    n.children.iter().all(|c| ctx.doc.node(*c).is_none_or(|cn| cacheable_subtree(ctx, cn, depth + 1)))
 }
 
 /// The kept layer of `n` drawn through `page_xf` (local → page device pixels), if there is one.
-pub(crate) fn get(key: Key) -> Option<Arc<Layer>> {
+/// `root` is the node itself: the entry's own copy is compared by pointer, so a key that matches
+/// another node (a hash collision, or an address reused after the entry was made) is a miss.
+pub(crate) fn get(key: Key, root: &Arc<Node>) -> Option<Arc<Layer>> {
     let mut state = state().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     state.tick += 1;
     let tick = state.tick;
     let entry = state.map.get_mut(&key)?;
+    if !Arc::ptr_eq(&entry.root, root) {
+        return None;
+    }
     entry.used = tick;
     Some(Arc::clone(&entry.layer))
 }
@@ -130,7 +141,7 @@ pub(crate) fn settled(key: Key) -> bool {
 }
 
 /// Keep `layer`, `n`'s pixels drawn through `page_xf` with its top-left at `anchor`.
-pub(crate) fn put(key: Key, layer: Arc<Layer>) {
+pub(crate) fn put(key: Key, root: Arc<Node>, layer: Arc<Layer>) {
     let bytes = layer.pix.data().len() + layer.shadows.iter().map(|s| s.pix.data().len()).sum::<usize>();
     if bytes > BUDGET {
         return;
@@ -148,7 +159,7 @@ pub(crate) fn put(key: Key, layer: Arc<Layer>) {
         }
     }
     state.bytes += bytes;
-    state.map.insert(key, Entry { layer, bytes, used: tick });
+    state.map.insert(key, Entry { root, layer, bytes, used: tick });
 }
 
 /// What [`settled`] remembers: the keys drawn lately, oldest out first.
@@ -179,7 +190,10 @@ pub(crate) fn key(ctx: &Ctx, n: &Node, page_xf: Affine) -> Key {
 }
 
 /// The identity of a node and everything under it: nodes are shared `Arc`s, so a changed node is a
-/// new address, and a changed child shows here as a changed address too.
+/// new address, and a changed child shows here as a changed address too. An address alone could
+/// name another node once the old one is freed, so a [`Entry`] holds its layer's node (the root,
+/// whose change is what moves its children) and [`get`] compares them by pointer: a reused address
+/// then never yields old pixels.
 fn subtree(doc: &Document, n: &Node, depth: usize) -> u64 {
     let mut h = DefaultHasher::new();
     (n as *const Node as usize).hash(&mut h);
