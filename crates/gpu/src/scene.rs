@@ -1800,8 +1800,10 @@ impl Builder<'_> {
             // filtered and cached there — drawn as vello's image brush through the renderer's own
             // image transform.
             PaintKind::Gradient(_) | PaintKind::Image(_) | PaintKind::Pattern(_) => {
+                // The canvas is what this scene draws, so a large image comes as the smaller copy
+                // the screen shows, as the CPU canvas draws it.
                 let Some(Prepared::Pattern { pixmap, mode, quality: filter, opacity, transform }) =
-                    prepare_at(paint, size.0, size.1, scale, self.doc, 0.0)
+                    prepare_at(paint, size.0, size.1, scale, self.doc, 0.0, true)
                 else {
                     // A missing image, a pattern past its depth: the CPU paints nothing either.
                     return Ok(None);
