@@ -83,6 +83,7 @@ fn job(doc: &Arc<Document>, page: NodeId, uid: u64, view: View) -> Job {
         revision: 0,
         zoom_preview: true,
         refine: false,
+        gpu: false,
         at: web_time::Instant::now(),
     }
 }

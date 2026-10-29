@@ -122,8 +122,14 @@ struct Scratch {
 impl CanvasGpu {
     /// The canvas of `width` × `height` device pixels, or `None` when vello can't run on `device`.
     pub fn new(device: &Device, width: u32, height: u32) -> Option<Self> {
-        let width = width.clamp(1, 16_384);
-        let height = height.clamp(1, 16_384);
+        // The scene's effect layers are kept to 8,192 px a side (see `scene::layer_rect_impl`),
+        // and their blur and shadow passes make textures a little larger: a device whose textures
+        // are smaller than that can't draw the canvas, and stays on the CPU.
+        if max_side(device) < 8_192 {
+            return None;
+        }
+        let width = width.clamp(1, max_side(device));
+        let height = height.clamp(1, max_side(device));
         let renderer = Renderer::new(
             device,
             RendererOptions {
@@ -208,8 +214,9 @@ impl CanvasGpu {
 
     /// Make the canvas `width` × `height` device pixels (reallocates on a resize).
     pub fn resize(&mut self, device: &Device, width: u32, height: u32) {
-        let width = width.clamp(1, 16_384);
-        let height = height.clamp(1, 16_384);
+        let side = max_side(device);
+        let width = width.clamp(1, side);
+        let height = height.clamp(1, side);
         if (width, height) == self.size() {
             return;
         }
@@ -226,12 +233,16 @@ impl CanvasGpu {
         self.layers_pool.clear();
     }
 
-    /// A `width` × `height` layer texture: one a frame was done with when its size matches.
-    fn take_layer(&mut self, device: &Device, label: &str, width: u32, height: u32) -> Texture {
-        if let Some(i) = self.layers_pool.iter().position(|t| t.width() == width && t.height() == height) {
-            return self.layers_pool.swap_remove(i);
+    /// A `width` × `height` layer texture: one a frame was done with when its size matches. `None`
+    /// when the device's textures can't be that big (asking it for one panics).
+    fn take_layer(&mut self, device: &Device, label: &str, width: u32, height: u32) -> Option<Texture> {
+        if !fits(device, width, height) {
+            return None;
         }
-        layer_texture(device, label, width, height)
+        if let Some(i) = self.layers_pool.iter().position(|t| t.width() == width && t.height() == height) {
+            return Some(self.layers_pool.swap_remove(i));
+        }
+        Some(layer_texture(device, label, width, height))
     }
 
     /// Keep `texture` for a later frame's layers (its passes are done: a queue runs in order). The
@@ -400,14 +411,14 @@ impl CanvasGpu {
     /// (vello's targets hold straight alpha, so the render is premultiplied before it is handed on).
     pub(crate) fn render_layer(&mut self, device: &Device, queue: &Queue, scene: &Scene, width: u32, height: u32) -> Option<Texture> {
         let t0 = std::time::Instant::now();
-        let texture = self.take_layer(device, "figcraft layer", width, height);
+        let texture = self.take_layer(device, "figcraft layer", width, height)?;
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let params = RenderParams { base_color: vello::peniko::Color::new([0.0; 4]), width, height, antialiasing_method: AaConfig::Area };
         let steady = steady_atlas(scene);
         let scene = steady.as_ref().unwrap_or(scene);
         self.renderer.render_to_texture(device, queue, scene, &view, &params).ok()?;
         let drawn = t0.elapsed().as_secs_f64() * 1000.0;
-        let out = self.take_layer(device, "figcraft layer", width, height);
+        let out = self.take_layer(device, "figcraft layer", width, height)?;
         let out_view = out.create_view(&wgpu::TextureViewDescriptor::default());
         self.compose.premultiply(device, queue, &view, &out_view);
         self.give_layer(texture);
@@ -725,7 +736,7 @@ impl crate::scene::Layers for GpuLayers<'_> {
             let mut above = (texture.clone(), source.clone(), size);
             for s in wanted {
                 let (sw, sh) = (scale_px(size.0, s), scale_px(size.1, s));
-                let out = self.canvas.take_layer(self.device, "figcraft blur small", sw, sh);
+                let out = self.canvas.take_layer(self.device, "figcraft blur small", sw, sh)?;
                 let view = out.create_view(&wgpu::TextureViewDescriptor::default());
                 self.canvas.compose.downscale(self.device, self.queue, &view, &above.1);
                 mips.push((s, out.clone(), (sw, sh)));
@@ -761,7 +772,7 @@ impl crate::scene::Layers for GpuLayers<'_> {
         }
         // The blend's output comes from the layer pool too: a fresh window-sized texture a frame
         // was an allocation the driver charged 5–15 ms for.
-        let blended = self.canvas.take_layer(self.device, "figcraft progressive blur", size.0, size.1);
+        let blended = self.canvas.take_layer(self.device, "figcraft progressive blur", size.0, size.1)?;
         let out = self.canvas.mix.encode(self.device, self.queue, &mut encoder, &levels, &deviations, (s0, s1, a, b), size, blended)?;
         let encoded = t0.elapsed().as_secs_f64() * 1000.0;
         let t1 = std::time::Instant::now();
@@ -1032,9 +1043,23 @@ fn between(lo: f64, hi: f64, t: f64, limit: f64) -> (f64, f64) {
     (a.max(0.0).min(limit), b.max(0.0).min(limit))
 }
 
+/// The longest texture side `device` can make (the canvas caps it at 16,384 too: egui's own
+/// canvas limit).
+fn max_side(device: &Device) -> u32 {
+    device.limits().max_texture_dimension_2d.clamp(1, 16_384)
+}
+
+/// Whether `device` can make a `w` × `h` texture. Asking it for a bigger one is a validation error
+/// that wgpu's default error handler turns into a panic, so every texture the canvas asks for is
+/// checked first: one it can't make leaves the frame to the CPU renderer.
+pub(crate) fn fits(device: &Device, w: u32, h: u32) -> bool {
+    let max = device.limits().max_texture_dimension_2d;
+    w >= 1 && h >= 1 && w <= max && h <= max
+}
+
 /// A `(w, h)` copy of `src` starting at `(x, y)`, transparent where it lies outside `src`.
 fn crop(device: &Device, queue: &Queue, src: &Texture, (x, y): (i32, i32), (w, h): (u32, u32)) -> Option<Texture> {
-    if w == 0 || h == 0 {
+    if w == 0 || h == 0 || !fits(device, w, h) {
         return None;
     }
     let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -1096,6 +1121,10 @@ fn keep(slot: &mut Option<Scratch>, device: &Device, (w, h): (u32, u32), label: 
         None => true,
     };
     if stale {
+        if !fits(device, w, h) {
+            *slot = None;
+            return None;
+        }
         let texture = layer_texture(device, label, w, h);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         *slot = Some(Scratch { texture, view, size: (w, h) });
@@ -1266,7 +1295,13 @@ pub fn present(doc: &Document, page: NodeId, view: &View, canvas: (u32, u32)) ->
     let background = crate::scene::background(doc, page);
     let Ok(mut slot) = backend.canvas.lock() else { return refusal("canvas is busy") };
     let locked = t0.elapsed().as_secs_f64() * 1000.0;
-    let canvas_size = (canvas.0.clamp(1, 16_384), canvas.1.clamp(1, 16_384));
+    // The window's view and the canvas it is drawn into must fit the device's textures: a larger
+    // one is a validation error (a panic in wgpu's default handler), so the CPU draws the frame.
+    let side = max_side(&backend.device);
+    if view.width > side || view.height > side {
+        return refusal("a view larger than the device's textures");
+    }
+    let canvas_size = (canvas.0.clamp(1, side), canvas.1.clamp(1, side));
     if slot.is_none() {
         let Some(canvas) = CanvasGpu::new(&backend.device, canvas_size.0, canvas_size.1) else {
             return refusal("the GPU can't run the rasterizer");

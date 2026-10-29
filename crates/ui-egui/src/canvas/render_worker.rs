@@ -72,6 +72,9 @@ pub struct Job {
     /// Draw at the view's own resolution even when the last frames were slow: the UI asks for one
     /// when an interaction stops, sharpening the preview it showed while moving.
     pub refine: bool,
+    /// Whether the GPU canvas may draw this frame (the [`figcraft_engine::Prefs::gpu_canvas`]
+    /// preference, desktop only): the CPU renderer is the reference and the fallback.
+    pub gpu: bool,
     /// When the UI asked for it: how long the image took to reach the screen.
     pub at: Instant,
 }
@@ -133,8 +136,10 @@ fn run(job: &Job, view: &View, retained: &mut Retained, coarse: bool) -> Option<
         skip: job.skip.clone(),
         solo: job.solo,
         lod: true,
-        // The canvas keeps unchanged layers between frames (see `figcraft_render::layers`).
-        doc_id: job.uid,
+        // The canvas keeps unchanged layers between frames (see `figcraft_render::layers`). A
+        // browser tab renders without them: the CPU renderer stays stateless there (0 keeps
+        // nothing), as it does for exports and thumbnails.
+        doc_id: if cfg!(target_arch = "wasm32") { 0 } else { job.uid },
         magnified_image_pixels: true,
         dots: job.dots,
         ..Default::default()
@@ -279,21 +284,15 @@ impl Renders {
     }
 }
 
-/// Whether the GPU canvas may draw this job: the editor's outline modes, skipped layers, the
-/// focus view, soft proof and Display P3 documents are the CPU renderer's. `FIGCRAFT_GPU_CANVAS=0`
-/// turns the GPU canvas off (the CPU path is the reference and the fallback).
+/// Whether the GPU canvas may draw this job: the preference is on, and the editor's outline modes,
+/// skipped layers, the focus view, soft proof and Display P3 documents are the CPU renderer's.
 ///
 /// Backdrop effects (glass, background blur) are not checked here: the canvas reads the page in
 /// segments for those (see [`figcraft_gpu::canvas::segmented_frame`]) and refuses — leaving the
 /// frame to the CPU — what it cannot draw exactly.
 #[cfg(not(target_arch = "wasm32"))]
 fn gpu_job(job: &Job) -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ENABLED.get_or_init(|| match std::env::var("FIGCRAFT_GPU_CANVAS") {
-        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "cpu"),
-        Err(_) => true,
-    });
-    enabled && !job.outline && job.outlined.is_empty() && job.skip.is_empty() && job.solo.is_none() && !job.proof && job.doc.color_profile.is_srgb()
+    job.gpu && !job.outline && job.outlined.is_empty() && job.skip.is_empty() && job.solo.is_none() && !job.proof && job.doc.color_profile.is_srgb()
 }
 
 /// The GPU canvas's frame for `job`, if it can draw the page and this job asks nothing of it that
@@ -595,8 +594,19 @@ mod gpu_job_tests {
             revision: 0,
             zoom_preview: true,
             refine: false,
+            gpu: false,
             at: Instant::now(),
         }
+    }
+
+    /// The GPU canvas draws only when the preference asks for it: off by default.
+    #[test]
+    fn the_gpu_canvas_runs_only_when_the_preference_is_on() {
+        let d = Document::new("gpu preference");
+        let p = d.first_page().unwrap();
+        assert!(!gpu_job(&job(d.clone(), p)), "off by default");
+        assert!(gpu_job(&Job { gpu: true, ..job(d.clone(), p) }), "the preference asks for the GPU");
+        assert!(!gpu_job(&Job { gpu: true, outline: true, ..job(d, p) }), "outline mode is the CPU renderer's");
     }
 
     #[test]
@@ -620,7 +630,7 @@ mod gpu_job_tests {
     fn the_gpu_canvas_takes_plain_canvas_jobs() {
         let d = Document::new("gpu job");
         let p = d.first_page().unwrap();
-        let mut j = job(d, p);
+        let mut j = Job { gpu: true, ..job(d, p) };
         assert!(gpu_job(&j));
         j.outline = true;
         assert!(!gpu_job(&j), "outline mode is the CPU renderer's");

@@ -668,6 +668,7 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | Gap 7: the GPU canvas is opt-in (Preferences ▸ Draw the canvas on the GPU, off by default), textures are checked against the device's `max_texture_dimension_2d` before they are made so an undersized device or layer falls back to the CPU instead of panicking, kept layers and the kept CPU frame hash the document's image store so an image arriving after a frame redraws it, and the web build no longer keeps layers (the CPU renderer stays stateless there). Estimates unchanged |
 | 2026-10-28 | minor | Arabic draft: 1,857 UI strings, 620 command labels, 31 menu wordings; count-neutral plurals and web font gate. Native review and panel mirroring remain open; grade and estimates unchanged. Evidence: `locales/ar.toml`, i18n catalog tests and [translation notes](translating.md#arabic-draft) |
 | 2026-10-28 | minor | Gap 7: the browser refines a zoom's preview only once the zoom has paused for 120 ms, so a wheel zoom no longer runs a blocking full render between every two steps. Numbers unchanged |
 | 2026-10-27 | minor | M12: the MCP agent feedback workflow landed (comments as tasks, `comment.prompt`, Copy for AI, `fix_comments` / `watch_comments`, `figcraft://comments`, a bounded event log, `events.poll` and `wait_for_changes`). Figma AI features and local models are still not started, so gap 19's missing list and estimate stand |

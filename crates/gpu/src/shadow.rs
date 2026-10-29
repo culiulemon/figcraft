@@ -113,7 +113,7 @@ impl Shadow {
         params: &[u8],
         label: &str,
     ) -> Option<Texture> {
-        if w == 0 || h == 0 {
+        if w == 0 || h == 0 || !crate::canvas::fits(device, w, h) {
             return None;
         }
         let uniform = device.create_buffer(&BufferDescriptor {

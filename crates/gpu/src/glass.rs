@@ -114,7 +114,7 @@ impl Glass {
     /// The pane's pixels, or `None` when the device can't (the CPU paints them).
     pub(crate) fn paint(&self, device: &Device, queue: &Queue, p: &GlassPaint<'_>) -> Option<Pixmap> {
         let (w, h) = (p.w, p.h);
-        if w == 0 || h == 0 || p.cw == 0 || p.ch == 0 {
+        if w == 0 || h == 0 || p.cw == 0 || p.ch == 0 || !crate::canvas::fits(device, w, h) {
             return None;
         }
         let geometry = self.geometry(device, queue, p.geometry, p.alpha, p.dist, p.normals, p.cw, p.ch)?;
@@ -146,7 +146,7 @@ impl Glass {
     /// no read-back).
     pub(crate) fn paint_texture(&self, device: &Device, queue: &Queue, p: &GlassPane, frosted: &TextureView) -> Option<Texture> {
         let (w, h) = (p.w, p.h);
-        if w == 0 || h == 0 || p.cw() == 0 || p.ch() == 0 {
+        if w == 0 || h == 0 || p.cw() == 0 || p.ch() == 0 || !crate::canvas::fits(device, w, h) {
             return None;
         }
         let geometry = self.geometry(device, queue, p.geometry_id(), p.alpha(), p.dist(), p.normals(), p.cw(), p.ch())?;
@@ -269,6 +269,9 @@ impl Glass {
 
 /// `bytes` (`bytes_per_row` a row) uploaded as a `w` × `h` texture of `format`.
 fn upload(device: &Device, queue: &Queue, label: &str, w: u32, h: u32, format: TextureFormat, bytes: &[u8], bytes_per_row: usize) -> Option<Texture> {
+    if !crate::canvas::fits(device, w, h) {
+        return None;
+    }
     let texture = device.create_texture(&TextureDescriptor {
         label: Some(label),
         size: Extent3d { width: w, height: h, depth_or_array_layers: 1 },
