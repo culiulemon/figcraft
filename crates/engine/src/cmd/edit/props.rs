@@ -390,7 +390,8 @@ pub(super) fn paint_paste(s: &mut Session, p: &Value, fills: bool) -> Result<Val
             // The destination may already use that key for different data (other layers keep
             // that image): the pasted paint takes the copied data's content hash instead. That key
             // can be taken too — images are usually keyed by their hash, so the copied key often
-            // is that hash — and then a numbered variant of it.
+            // is that hash — and then a numbered variant of it. Image keys become archive member
+            // names, which keep only letters and digits, so the number is appended plainly.
             let base = if doc.images.get(&copied).is_some_and(|existing| existing != &d) { figcraft_format::image_hash(&d.bytes) } else { copied };
             let mut key = base.clone();
             let mut n = 0u32;
@@ -399,7 +400,7 @@ pub(super) fn paint_paste(s: &mut Session, p: &Value, fills: bool) -> Result<Val
                 if n > 999 {
                     return Err(bad(cmd, "no free image key for the copied image"));
                 }
-                key = format!("{base}-{n}");
+                key = format!("{base}{n}");
             }
             doc.images.entry(key.clone()).or_insert(d);
             img.image = key;

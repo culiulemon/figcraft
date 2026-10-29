@@ -165,6 +165,22 @@ fn a_copied_image_whose_hash_key_is_also_taken_gets_a_free_key() {
     assert_ne!(img.image, hash, "the taken hash is not reused");
     assert_eq!(doc.images.get(&img.image), Some(&copied), "the pasted paint points at the copied data");
     assert_eq!(doc.images.get(&hash), Some(&taken), "the destination's image stays");
+    let key = img.image.clone();
+    // An image key names an archive member, and only letters and digits are read back: the
+    // numbered key must bring the copied image through a save and reopen.
+    assert!(key.bytes().all(|b| b.is_ascii_alphanumeric()), "the key is archive-valid: {key}");
+    let dir = std::env::temp_dir().join(format!("figcraft-image-key-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("pasted.figcraft").to_string_lossy().to_string();
+    ex(&mut s, "file.save", json!({"path": path}));
+    let mut t = Session::empty();
+    ex(&mut t, "file.open", json!({"path": path}));
+    let saved = t.doc().unwrap();
+    let figcraft_color::PaintKind::Image(img) = &saved.node(b).unwrap().fills[0].kind else { panic!("the pasted fill is an image") };
+    assert_eq!(img.image, key, "the reloaded paint keeps its key");
+    // A reopened image's size is read from its pixels on demand, so only its bytes are compared.
+    assert_eq!(saved.images.get(&key).map(|i| i.bytes.as_slice()), Some(copied.bytes.as_slice()), "the copied image survives the reload");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
