@@ -1,6 +1,6 @@
 use super::{
-    BTreeMap, Effect, EngineError, Map, Node, NodeId, NodeKind, Result, Session, Value, bad, blend, boolean, color, get, json, num, ok, opt_index,
-    paint_of, parse, req_id, req_index, req_string, req_targets, roots, string, targets, z_sorted,
+    BTreeMap, Effect, EngineError, Map, Node, NodeId, NodeKind, Result, Session, Value, bad, blend, boolean, color, fraction_of, get, json, num, ok,
+    opt_index, paint_of, parse, req_id, req_index, req_string, req_targets, roots, string, targets, z_sorted,
 };
 
 pub(super) fn batch_rename(s: &mut Session, p: &Value) -> Result<Value> {
@@ -312,8 +312,8 @@ pub(super) fn paint_set(s: &mut Session, p: &Value, fills: bool) -> Result<Value
                 slot.color_alpha = c.a;
             }
         }
-        if let Some(o) = num(p, "opacity") {
-            slot.opacity = (if o > 1.0 { o / 100.0 } else { o }).clamp(0.0, 1.0) as f32;
+        if let Some(o) = get(p, "opacity").and_then(fraction_of) {
+            slot.opacity = o.clamp(0.0, 1.0) as f32;
             slot.color_alpha = 1.0;
         }
         if let Some(v) = boolean(p, "visible") {

@@ -8,8 +8,8 @@ use serde_json::{Map, Value, json};
 
 use super::{CommandSpec, ok};
 use crate::params::{
-    blend, boolean, color, get, id, id_of, num, num_or, opt_index, paint_of, parse, req_id, req_index, req_num, req_string, req_targets, string,
-    targets,
+    blend, boolean, color, fraction_of, get, id, id_of, num, num_or, opt_index, paint_of, parse, req_id, req_index, req_num, req_string, req_targets,
+    string, targets,
 };
 use crate::{BatchStep, EngineError, Result, Session, bad, spec};
 

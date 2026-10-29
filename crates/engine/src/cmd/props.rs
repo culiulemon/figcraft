@@ -9,14 +9,14 @@ use figcraft_doc::{
 use figcraft_geom::{Affine, Point};
 use serde_json::{Map, Value, json};
 
-use crate::params::{bool_of, color_of, f64_of, get, paints_of};
+use crate::params::{bool_of, color_of, f64_of, fraction_of, get, paints_of};
 use crate::{Result, bad};
 
 /// The per-side stroke weight keys, in `StrokeProps::sides` order (top, right, bottom, left).
 pub const STROKE_SIDES: [&str; 4] = ["strokeTopWeight", "strokeRightWeight", "strokeBottomWeight", "strokeLeftWeight"];
 
 /// Keys `node.set` understands (documented for agents).
-pub const KEYS: &str = "name, visible, locked, opacity (0-1), blend, x, y (relative to the parent frame; groups don't count), width, height, rotation (degrees), \
+pub const KEYS: &str = "name, visible, locked, opacity (0-1 or \"50%\"), blend, x, y (relative to the parent frame; groups don't count), width, height, rotation (degrees), \
 fills (paints or colours; gradients as {type: linearGradient|radialGradient|angularGradient|diamondGradient, stops: [\"#hex\", ...], from?, to?} too), fill (colour, or \"none\"/null: no fill), strokes, stroke (colour, or \"none\"/null: no stroke), strokeWeight, strokeAlign (inside|center|outside), strokeSides [t,r,b,l], strokeTopWeight / strokeRightWeight / strokeBottomWeight / strokeLeftWeight (one side; turns on individual strokes), \
 strokeCap / startCap / endCap, strokeJoin, miterAngle (degrees: sharper joins bevel; or miterLimit as a ratio), dashes [..], widthProfile (preset uniform|wedge|taper|eye|rounded|pinch, [[t, scale], ...] or null), brush (preset id, {preset, spacing, sizeJitter, rotationJitter, scatter, seed} or null), cornerRadius (n or [tl,tr,br,bl]), cornerSmoothing (0-1), effects, \
 clip, isMask, layout (null|horizontal|vertical|grid|{...}), gap, crossGap, padding (n or [t,r,b,l]), paddingTop/Right/Bottom/Left, \
@@ -169,7 +169,7 @@ pub(crate) fn letter_spacing(v: &Value) -> Option<LetterSpacing> {
 fn four(v: &Value) -> Option<[f64; 4]> {
     match v {
         Value::Array(a) => {
-            let f: Vec<f64> = a.iter().filter_map(f64_of).collect();
+            let f: Vec<f64> = a.iter().map(f64_of).collect::<Option<_>>()?;
             match f.as_slice() {
                 [x] => Some([*x; 4]),
                 [a, b] => Some([*a, *b, *a, *b]),
@@ -487,8 +487,7 @@ fn apply_look(cmd: &str, doc: &mut Document, id: NodeId, k: &str, v: &Value) -> 
         "visible" => doc.get_mut(id)?.visible = v.as_bool().ok_or_else(|| bad(cmd, "`visible` must be a boolean"))?,
         "locked" => doc.get_mut(id)?.locked = v.as_bool().ok_or_else(|| bad(cmd, "`locked` must be a boolean"))?,
         "opacity" => {
-            let o = f64_of(v).ok_or_else(|| bad(cmd, "`opacity` must be a number"))?;
-            let o = if o > 1.0 { o / 100.0 } else { o };
+            let o = fraction_of(v).ok_or_else(|| bad(cmd, "`opacity` must be a number"))?;
             doc.get_mut(id)?.opacity = o.clamp(0.0, 1.0) as f32;
         }
         "blend" | "blendMode" => {
@@ -650,13 +649,13 @@ fn apply_layout(cmd: &str, doc: &mut Document, id: NodeId, k: &str, v: &Value) -
             }
         }
         "paddingHorizontal" => {
-            let val = f64_of(v).unwrap_or(0.0).max(0.0);
+            let val = f64_of(v).ok_or_else(|| bad(cmd, format!("`{k}` must be a number")))?.max(0.0);
             let l = layout_mut(cmd, k, doc.get_mut(id)?)?;
             l.padding[1] = val;
             l.padding[3] = val;
         }
         "paddingVertical" => {
-            let val = f64_of(v).unwrap_or(0.0).max(0.0);
+            let val = f64_of(v).ok_or_else(|| bad(cmd, format!("`{k}` must be a number")))?.max(0.0);
             let l = layout_mut(cmd, k, doc.get_mut(id)?)?;
             l.padding[0] = val;
             l.padding[2] = val;
@@ -888,20 +887,20 @@ fn apply_shape(cmd: &str, doc: &mut Document, id: NodeId, k: &str, v: &Value) ->
             }
         }
         "innerRadius" | "ratio" => {
-            let r = f64_of(v).unwrap_or(0.38);
-            let r = if r > 1.0 { r / 100.0 } else { r };
+            let r = fraction_of(v).unwrap_or(0.38);
             match &mut doc.get_mut(id)?.kind {
                 NodeKind::Star { inner_ratio, .. } => *inner_ratio = r.clamp(0.0, 1.0),
                 _ => return Err(bad(cmd, "innerRadius applies to stars")),
             }
         }
         "arcStart" | "arcSweep" | "arcInner" => {
-            let val = f64_of(v).ok_or_else(|| bad(cmd, format!("`{k}` must be a number")))?;
+            let val = if k == "arcInner" { fraction_of(v) } else { f64_of(v) };
+            let val = val.ok_or_else(|| bad(cmd, format!("`{k}` must be a number")))?;
             match &mut doc.get_mut(id)?.kind {
                 NodeKind::Ellipse { start, sweep, inner } => match k {
                     "arcStart" => *start = val.to_radians(),
                     "arcSweep" => *sweep = val.clamp(-360.0, 360.0).to_radians(),
-                    _ => *inner = (if val > 1.0 { val / 100.0 } else { val }).clamp(0.0, 0.99),
+                    _ => *inner = val.clamp(0.0, 0.99),
                 },
                 _ => return Err(bad(cmd, "arc applies to ellipses")),
             }
@@ -1369,5 +1368,14 @@ mod tests {
             assert!(letter_spacing(&json!(s)).is_none(), "letter_spacing accepted {s}");
         }
         assert!(matches!(line_height(&json!("150%")), Some(LineHeight::Percent(p)) if p == 150.0));
+    }
+
+    #[test]
+    fn four_rejects_non_numeric_entries() {
+        assert_eq!(four(&json!([10, "abc"])), None);
+        assert_eq!(four(&json!([10, "abc", null, 20])), None);
+        assert_eq!(four(&json!([10, 20, 30])), None);
+        assert_eq!(four(&json!([1, 2, 3, 4])), Some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(four(&json!([1, 2])), Some([1.0, 2.0, 1.0, 2.0]));
     }
 }

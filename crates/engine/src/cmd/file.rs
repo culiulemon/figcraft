@@ -433,4 +433,7 @@ mod rest_import_tests;
 mod staging_write_tests;
 
 #[cfg(test)]
+mod thumbnail_tests;
+
+#[cfg(test)]
 mod zip_cap_tests;

@@ -67,6 +67,10 @@ impl std::str::FromStr for NodeId {
         // Accept "12" and Figma-style "0:12".
         let t = s.trim();
         let t = t.rsplit(':').next().unwrap_or(t);
+        if t.starts_with('+') {
+            // `u64::parse` accepts a leading '+'; ids are digits only.
+            return "-".parse::<u64>().map(NodeId);
+        }
         t.parse::<u64>().map(NodeId)
     }
 }

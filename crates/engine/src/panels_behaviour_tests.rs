@@ -475,3 +475,29 @@ fn page_navigation_skips_dividers() {
     ex(&mut s, "view.nextPage", json!({}));
     assert_eq!(s.page().unwrap(), later, "Next page stops on the last page");
 }
+
+#[test]
+fn opacity_percent_strings_always_divide_by_100() {
+    let mut s = Session::new();
+    let r = rect(&mut s, "R", 0.0, 0.0, None);
+    for (v, want) in [(json!("1%"), 0.01), (json!("0.5%"), 0.005), (json!("50%"), 0.5), (json!(1), 1.0), (json!(50), 0.5), (json!(0.25), 0.25)] {
+        ex(&mut s, "node.set", json!({"id": r, "props": {"opacity": v.clone()}}));
+        let o = s.doc().unwrap().node(r).unwrap().opacity;
+        assert!((o - want).abs() < 1e-6, "opacity {v} gave {o}, want {want}");
+    }
+}
+
+#[test]
+fn fill_opacity_star_ratio_and_arc_ratio_read_a_percent_suffix() {
+    let mut s = Session::new();
+    let r = rect(&mut s, "R", 0.0, 0.0, None);
+    ex(&mut s, "fill.set", json!({"ids": [r], "color": "#ff0000", "opacity": "1%"}));
+    let fill = s.doc().unwrap().node(r).unwrap().fills[0].opacity;
+    assert!((fill - 0.01).abs() < 1e-6, "fill opacity \"1%\" gave {fill}");
+    let star = id(&ex(&mut s, "shape.star", json!({"x": 0, "y": 0, "width": 100, "height": 100, "props": {"innerRadius": "1%"}})));
+    let figcraft_doc::NodeKind::Star { inner_ratio, .. } = s.doc().unwrap().node(star).unwrap().kind else { panic!("star") };
+    assert!((inner_ratio - 0.01).abs() < 1e-9, "innerRadius \"1%\" gave {inner_ratio}");
+    let arc = id(&ex(&mut s, "shape.ellipse", json!({"x": 0, "y": 0, "width": 100, "height": 100, "props": {"arcInner": "1%"}})));
+    let figcraft_doc::NodeKind::Ellipse { inner, .. } = s.doc().unwrap().node(arc).unwrap().kind else { panic!("ellipse") };
+    assert!((inner - 0.01).abs() < 1e-9, "arcInner \"1%\" gave {inner}");
+}

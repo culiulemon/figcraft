@@ -718,6 +718,45 @@ fn options(data: &[u8], limits: budget::Limits) -> usvg::Options<'static> {
     o
 }
 
+/// Length of the `<!...>` declaration at the start of `s`, skipping `>` inside quotes and an
+/// internal subset (`[ ... ]`).
+fn doctype_end(s: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut depth = 0u32;
+    let mut skip_to = 0;
+    for (i, c) in s.char_indices() {
+        if i < skip_to {
+            continue;
+        }
+        if quote.is_none() && depth > 0 {
+            // Comments and processing instructions in the subset may hold quotes and brackets.
+            let rest = &s[i..];
+            let close = if rest.starts_with("<!--") {
+                Some("-->")
+            } else if rest.starts_with("<?") {
+                Some("?>")
+            } else {
+                None
+            };
+            if let Some(close) = close {
+                let len = rest.find(close)? + close.len();
+                skip_to = i + len;
+                continue;
+            }
+        }
+        match (quote, c) {
+            (Some(q), _) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '[') => depth += 1,
+            (None, ']') => depth = depth.saturating_sub(1),
+            (None, '>') if depth == 0 => return Some(i + 1),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Whether `text` (from the clipboard, say) is an SVG document: `<svg` after an optional byte
 /// order mark, XML declaration, comments, doctype and whitespace.
 pub fn looks_like_svg(text: &str) -> bool {
@@ -731,7 +770,7 @@ pub fn looks_like_svg(text: &str) -> bool {
         } else if s.starts_with("<!--") {
             s.find("-->").map(|i| i + 3)
         } else if s.starts_with("<!") {
-            s.find('>').map(|i| i + 1)
+            doctype_end(s)
         } else {
             None
         };

@@ -220,6 +220,8 @@ impl Session {
         let pending_mark = self.pending_events.len();
         let before: Vec<_> =
             self.docs.iter().map(|ds| (ds.uid, ds.doc.clone(), ds.selection.clone(), ds.page, ds.history.undo.len(), ds.history.limit)).collect();
+        // An undo inside pops the undo steps; a failed group has to bring them back.
+        let undo_before: Vec<_> = self.docs.iter().map(|ds| ds.history.undo.clone()).collect();
         // An edit inside clears the redo steps; a failed group has to bring them back.
         let redo_before: Vec<_> = self.docs.iter().map(|ds| ds.history.redo.clone()).collect();
         let active = self.active;
@@ -251,13 +253,13 @@ impl Session {
                 };
                 self.docs.extend(tab);
             }
-            for ((uid, doc, selection, page, undo_len, limit), redo) in before.iter().zip(redo_before) {
+            for (((uid, doc, selection, page, _, limit), undo), redo) in before.iter().zip(undo_before).zip(redo_before) {
                 if let Some(ds) = self.docs.iter_mut().find(|ds| ds.uid == *uid) {
                     ds.history.redo = redo;
                     ds.doc = doc.clone();
                     ds.selection = selection.clone();
                     ds.page = *page;
-                    ds.history.undo.truncate(*undo_len);
+                    ds.history.undo = undo;
                     ds.history.limit = *limit;
                 }
             }

@@ -182,6 +182,19 @@ mod tests {
     }
 
     #[test]
+    fn junk_axis_padding_is_refused_and_keeps_padding() {
+        let mut s = Session::new();
+        let (f, _, _) = al_frame(&mut s);
+        ex(&mut s, "node.set", json!({"id": f, "props": {"padding": 16}}));
+        for key in ["paddingHorizontal", "paddingVertical"] {
+            for junk in [json!("abc"), json!({"a": 1}), json!([1, 2])] {
+                assert!(s.execute("node.set", &json!({"id": f, "props": {key: junk}})).is_err(), "{key}");
+                assert_eq!(node(&s, f).layout.as_ref().unwrap().padding, [16.0; 4], "{key}");
+            }
+        }
+    }
+
+    #[test]
     fn baseline_alignment_lines_up_text() {
         let mut s = Session::new();
         let f = id(&ex(&mut s, "frame.create", json!({"x": 0, "y": 0, "width": 400, "height": 100, "props": {"layout": "horizontal"}})));

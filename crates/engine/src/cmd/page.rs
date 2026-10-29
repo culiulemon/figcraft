@@ -94,7 +94,7 @@ pub fn specs() -> Vec<CommandSpec> {
             ok()
         }),
         spec!("page.duplicate", "Duplicate page", "{id?}", true, |s, p| {
-            let src = id(p, "id").unwrap_or(s.page()?);
+            let src = page_target(s, "page.duplicate", p)?;
             let doc = s.doc_mut()?;
             let name = format!("Copy of {}", doc.get(src)?.name);
             let np = doc.add_page(&name);

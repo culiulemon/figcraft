@@ -29,6 +29,8 @@ active connections**; additional connections are closed immediately. Socket read
 have a **60 s inactivity timeout**, so idle clients and clients that stop reading release their
 worker. This bounds blocked socket operations, not the total duration of a frame arriving slowly.
 Clients can reconnect after an idle timeout (the attached MCP backend already does).
+Replies have no size limit on the app's side. The attached MCP backend reads them up to **512 MiB
+before the newline** and drops the connection on a longer one (see [MCP server](mcp.md)).
 
 Both the socket queue and the UI queue hold at most **8 requests** each, including requests waiting
 for another window's frame. A full socket queue replies with `"control request queue is full"`

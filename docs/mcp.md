@@ -23,6 +23,10 @@ Attached calls are never automatically replayed after a transport failure: the a
 applied the request before its reply was lost. The error reports that the operation may have
 completed; inspect the document before retrying an edit. The next explicit call reconnects.
 If that connection cannot be established, the error says the request was not sent.
+A reply from the app is read up to **512 MiB before the newline** (the largest window capture is
+256 MiB as base64). The backend stops reading a longer reply at the first byte past the limit and
+treats it like a lost reply: the connection is closed, the operation may have completed, and the
+next call reconnects. For larger exports, give `export` a `path` or lower the scale.
 A connection the app closed while it sat idle is noticed before the next request is written and
 replaced then, so a pause between calls is not an error.
 
