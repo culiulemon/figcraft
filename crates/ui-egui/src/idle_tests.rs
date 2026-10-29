@@ -241,6 +241,7 @@ fn a_finished_background_render_wakes_the_ui() {
         revision: 0,
         zoom_preview: false,
         refine: false,
+        gpu: false,
         at: web_time::Instant::now(),
     });
     let start = Instant::now();

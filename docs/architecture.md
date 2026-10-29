@@ -57,7 +57,8 @@ dialogs themselves; they request UI, and programmatic callers drop those request
 
 ## Rendering
 
-The desktop canvas draws on the GPU where the page is in the GPU rasterizer's feature set
+The desktop canvas draws on the GPU, when Preferences ▸ Draw the canvas on the GPU is on and the
+page is in the GPU rasterizer's feature set
 ([`gpu-rasterizer.md`](gpu-rasterizer.md)): the render thread turns the page into a vello scene and
 draws it into one of two textures, and the window paints that texture, so no pixels cross the bus
 and nothing is uploaded per frame. A node with a single layer blur is drawn into an offscreen

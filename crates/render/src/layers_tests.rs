@@ -242,3 +242,43 @@ fn a_kept_layer_drops_the_nodes_older_versions() {
     let _ = drawn(&edited, p, &view(), 61);
     assert_eq!(super::layers::kept_bytes(), before, "the older version's entry is dropped");
 }
+
+/// An image the store gains after a frame was drawn (a collaborative image entry, an import
+/// finishing) draws the layer that names it again, and the kept frame too: no node changed, but
+/// the fill shows something else now.
+#[test]
+fn an_image_that_arrives_draws_the_layer_again() {
+    let _turn = turn();
+    let (mut d, p, card) = scene();
+    let hash = "a".repeat(64);
+    d.get_mut(card).unwrap().fills = vec![Paint::image(hash.clone(), figcraft_color::ImageScaleMode::Fill)];
+    let before = Arc::new(d.clone());
+    // Two frames settle the card's layer, which the third reuses.
+    let _ = drawn(&before, p, &view(), 31);
+    let _ = drawn(&before, p, &view(), 31);
+    assert!(super::layers::kept_bytes() > 0, "the card's layer is kept");
+    let empty = drawn(&before, p, &view(), 31);
+    assert_eq!(empty.data(), drawn(&before, p, &view(), 0).data(), "without its bytes the card draws nothing");
+
+    let mut png = tiny_skia::Pixmap::new(2, 2).unwrap();
+    png.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+    let bytes = png.encode_png().unwrap();
+    let mut with = d;
+    with.images.insert(hash, figcraft_doc::ImageData { bytes: Arc::new(bytes), width: 2, height: 2 });
+    let after = Arc::new(with);
+    let now = drawn(&after, p, &view(), 31);
+    assert_eq!(now.data(), drawn(&after, p, &view(), 0).data(), "the layer draws the image once it arrives");
+    assert_ne!(now.data(), empty.data(), "the frame changed");
+
+    // The kept frame too: only the store changed, no node did.
+    let mut rt = Retained::default();
+    let first = kept(&mut rt, &before, p, 33);
+    let (_, again, work) = rt.render(&before, p, &view(), &Options { doc_id: 33, ..Options::default() }).unwrap();
+    assert_eq!(work, crate::Work::Reused, "nothing changed: the frame is reused as it is");
+    assert_eq!(again.data(), first.data());
+    let (_, arrived, work) = rt.render(&after, p, &view(), &Options { doc_id: 33, ..Options::default() }).unwrap();
+    assert_ne!(work, crate::Work::Reused, "the arrived image redraws the kept frame");
+    let mut fresh_rt = Retained::default();
+    let (_, want, _) = fresh_rt.render(&after, p, &view(), &Options::default()).unwrap();
+    assert_eq!(arrived.data(), want.data());
+}

@@ -95,7 +95,8 @@ at 2320 × 1440 well under the CPU's fixed 3.6–4.8 ms.
   selection, skipped layers, the focus view, soft proof and non-sRGB documents stay on the CPU.
 - `ui.inspect` reports the choice and the reason for a fallback (`canvas.rasterizer`,
   `canvas.gpuRefusal`), so a scene that stays on the CPU can be explained without a debugger.
-  `FIGCRAFT_GPU_CANVAS=0` (or `off`, `false`, `cpu`) turns the GPU canvas off for a run.
+  Preferences ▸ **Draw the canvas on the GPU** (`pref.gpuCanvas`, off by default) turns the GPU
+  canvas on for a machine; the CPU renderer is the reference and the fallback.
 
 Exit: dragging any page in the P1 feature set is GPU-rendered in the real app; screenshots match
 the CPU render within the parity tolerance; toggling the setting changes nothing visible.
@@ -218,12 +219,21 @@ that rectangle first and blurring the crop is what the segmented canvas does now
 which is both the same arithmetic and much cheaper: the background-blur page at 2400 × 1600 went
 from 11.6 to 3.2 ms a frame.
 
-### P4 — default on, cleanup
+### P4 — opt-in, cleanup
 
-- **Landed.** The GPU canvas is the desktop default (it was from P2; P3's effects and the segmented
-  renderer only widen the feature set), `FIGCRAFT_GPU_CANVAS=0` turns it off, and the fallback,
-  wasm and export policy are written here and in `docs/architecture.md`; `docs/hardware-parity.md`,
-  `docs/gaps.md` and `ROADMAP.md` carry the numbers.
+- **Landed.** The GPU canvas is off by default: Preferences ▸ Draw the canvas on the GPU
+  (`pref.gpuCanvas`) turns it on, a page outside the feature set stays on the CPU for that frame,
+  and the fallback, wasm and export policy are written here and in `docs/architecture.md`;
+  `docs/hardware-parity.md`, `docs/gaps.md` and `ROADMAP.md` carry the numbers.
+- **It can't panic on a texture it can't make.** Every texture is checked against the device's
+  `max_texture_dimension_2d` first (`canvas::fits`); a device whose limit is under 8,192 px — the
+  cap the scene keeps effect layers to — leaves the whole canvas on the CPU, and a layer, shadow,
+  blur or glass texture the device can't hold refuses that frame (`canvas.gpuRefusal` says so).
+- **The CPU renderer stays stateless in the browser.** The retained layer cache (`render::layers`)
+  is a desktop canvas optimisation; the web build renders with `doc_id = 0`, keeping nothing.
+- **An image that arrives after a frame was drawn redraws it.** Both the kept layers and the kept
+  frame hash the document's image store (`layers::images_id`), so a collaborative image entry or an
+  import finishing is never served from stale pixels.
 - **Nothing CPU-only was removed, on purpose.** The CPU renderer is still the oracle for the parity
   suite, the source of every export, the browser's canvas, the fallback for refused pages and the
   reference for what the GPU's own retention should cost (it keeps effect layers and repaints only
@@ -557,7 +567,8 @@ faster.
 
 Deliberate exceptions, documented rather than ported: exports (`svg`, `pdf`, `png`/`jpg`), the parity
 suite and the browser keep the CPU renderer; the editor's outline modes, skipped layers, soft proof
-and Display P3 (P10); a machine whose adapter cannot run vello (the canvas refuses and says why in
+and Display P3 (P10); a machine whose adapter cannot run vello or whose textures are under 8,192 px,
+and a frame with a layer the device's textures can't hold (the canvas refuses and says why in
 `ui.inspect`).
 
 ## Test matrix
@@ -659,8 +670,7 @@ stays on the fallback list.
     frame (occasional GPU wake-ups spike to 7–10 ms, as on plain pages).
   - Parity: mean 0.044/255, worst 31 (the soft edge), against the CPU's three-box blur.
 - 2026-10-24: text proved pixel-identical between the two rasterizers (same glyph outlines from
-  the renderer's layout: `the_gpu_text_matches_the_cpu_render`, 0 differing bytes at 1×), and
-  `FIGCRAFT_GPU_CANVAS=0` turns the GPU canvas off for a run.
+  the renderer's layout: `the_gpu_text_matches_the_cpu_render`, 0 differing bytes at 1×).
 - 2026-10-24: **P3 slice 3 landed** — backdrop effects. The page under a node is drawn into a
   texture (`backdrop::above` lists what to leave out) and read there:
   - **Background blur** on the GPU: blurred, shown through the node's shape, content over it.
@@ -965,4 +975,14 @@ stays on the fallback list.
   blur and a shadow): mean 0.126/255, worst 92, 0.6% of pixels off by more than 8, all on the cards'
   antialiased edges. A paint's plus-darker and a plus-darker layer under a backdrop effect are what
   content still leaves on the CPU.
+- 2026-10-29: **the canvas is opt-in, and four review points are closed.** Preferences ▸ Draw the
+  canvas on the GPU (`pref.gpuCanvas`, off by default; `Jobs` carry it so toggling asks for a fresh
+  frame) replaces the old on-by-default behaviour and `FIGCRAFT_GPU_CANVAS`. Textures are checked
+  against `max_texture_dimension_2d` before they are made (`canvas::fits`), so a device under the
+  scene's 8,192 px layer cap, or a layer, shadow, blur or glass pass the device can't hold, leaves
+  the frame to the CPU instead of panicking. Kept layers and the kept CPU frame hash the document's
+  image store (`layers::images_id`), so an image that arrives after a frame was drawn redraws it;
+  the web build renders with `doc_id = 0`, so the CPU renderer stays stateless there. Tests:
+  `an_image_that_arrives_draws_the_layer_again`, `the_gpu_canvas_runs_only_when_the_preference_is_on`.
+
 

@@ -22,6 +22,9 @@ pub(super) struct JobKey {
     fonts: u64,
     proof: bool,
     dots: Option<figcraft_render::Dots>,
+    /// The GPU canvas preference ([`figcraft_engine::Prefs::gpu_canvas`]): turning it on asks for
+    /// a new frame like any other change the renderer sees.
+    gpu: bool,
 }
 
 /// Whether a finished render goes on screen: an image of the file and page shown (`shown`), and
@@ -89,6 +92,8 @@ pub(super) fn request_render(
     let doc = app.preedit_view().map(|p| p.doc.clone()).unwrap_or_else(|| ds.doc.clone());
     let outlined = if ds.view.outlines_selection { ds.selection.clone() } else { vec![] };
     let proof = ds.view.proof_srgb && !doc.color_profile.is_srgb();
+    // The GPU rasterizer is a desktop feature and off unless the preferences ask for it.
+    let gpu = cfg!(not(target_arch = "wasm32")) && app.session.prefs.gpu_canvas;
     let outline_extras = figcraft_render::Outline { hidden: ds.view.outline_hidden, bounds: ds.view.outline_bounds, light: false };
     // Render beyond the visible viewport. During a pan the previous texture then still covers
     // the screen while the worker renders newly exposed content. Request a new buffer before the
@@ -113,6 +118,7 @@ pub(super) fn request_render(
         fonts: figcraft_text::layout_generation(),
         proof,
         dots,
+        gpu,
     };
     let view = figcraft_render::View { origin: requested, scale, width: size.0, height: size.1 };
     let mut nothing_new = app.canvas.submitted.as_ref() == Some(&key);
@@ -154,6 +160,7 @@ pub(super) fn request_render(
         revision: ds.revision,
         zoom_preview: ds.view.pixel_preview_scale().is_none(),
         refine,
+        gpu,
         at: web_time::Instant::now(),
     };
     app.canvas.want_view = Some(job.view.clone());

@@ -234,6 +234,7 @@ fn render_one(doc: &Document, page: NodeId, view: &View, opts: &Options) -> Opti
         bounds: &bounds,
         page_at: (view.origin.0 * view.scale, view.origin.1 * view.scale),
         cache: (opts.doc_id != 0).then_some(opts.doc_id),
+        images: if opts.doc_id != 0 { layers::images_id(doc) } else { 0 },
     };
     let xf = view.transform();
     let Some(p) = doc.node(page) else { return Some(pix) };
@@ -270,6 +271,7 @@ fn nodes_into(doc: &Document, ids: &[NodeId], view: &View, pix: &mut Pixmap, tim
         bounds: &bounds,
         page_at: (view.origin.0 * view.scale, view.origin.1 * view.scale),
         cache: None,
+        images: 0,
     };
     for id in ids {
         draw::draw_node(&ctx, pix, *id, view.transform() * parent_transform(doc, *id), 0);

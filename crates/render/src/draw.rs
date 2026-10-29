@@ -43,6 +43,9 @@ pub struct Ctx<'a, 'd> {
     /// The document's id when isolated layers may be kept between renders (the canvas; see
     /// [`crate::layers`]), `None` for renders that must be independent (exports, thumbnails).
     pub cache: Option<u64>,
+    /// [`layers::images_id`] of the document when layers may be kept (0 otherwise): an image that
+    /// arrived after a layer was drawn must not leave it reused.
+    pub images: u64,
 }
 
 /// What one render works out about layers with children, which a walk down their subtree finds:

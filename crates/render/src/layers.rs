@@ -40,11 +40,9 @@ type Key = (u64, u64);
 
 /// Layers bigger than this many device pixels aren't kept: they'd crowd out everything else.
 pub(crate) const MAX_LAYER_PIXELS: f64 = 4_194_304.0;
-/// Kept layers, all together (a browser tab gets less).
-#[cfg(not(target_arch = "wasm32"))]
+/// Kept layers, all together. The cache is a desktop canvas optimisation; a browser tab renders
+/// stateless (`crate::Options::doc_id` is 0 there), so there is no budget to keep for one.
 const BUDGET: usize = 128 << 20;
-#[cfg(target_arch = "wasm32")]
-const BUDGET: usize = 24 << 20;
 
 struct Entry {
     /// The layer's node, held so its address can't be reused by another node while the entry
@@ -205,6 +203,20 @@ pub(crate) fn put(key: Key, root: Arc<Node>, layer: Arc<Layer>) {
     state.map.insert(key, Entry { root, layer, bytes, used: tick });
 }
 
+/// What the document's images are right now: every key and the bytes stored under it. A content
+/// hash names fixed bytes, but the store can gain an image after a frame that named it was drawn
+/// (a collaborative image entry, an import finishing), or hold other bytes under a key a document
+/// named before they arrived — both change what a fill draws without changing a node, so a kept
+/// layer has to see them.
+pub(crate) fn images_id(doc: &Document) -> u64 {
+    let mut h = DefaultHasher::new();
+    for (key, data) in &doc.images {
+        key.hash(&mut h);
+        (Arc::as_ptr(&data.bytes) as usize).hash(&mut h);
+    }
+    h.finish()
+}
+
 /// What [`settled`] remembers: the keys drawn lately, oldest out first.
 struct Seen {
     set: std::collections::HashSet<Key>,
@@ -224,6 +236,9 @@ pub(crate) fn key(ctx: &Ctx, n: &Node, page_xf: Affine) -> Key {
     (ctx.cache, ctx.lod, figcraft_text::layout_generation()).hash(&mut first);
     // Images are decoded into the file's colour space: another profile draws them differently.
     ctx.doc.color_profile.hash(&mut first);
+    // An image that arrived (or changed) after a layer was drawn changes what its paints show
+    // without changing a node: a collaborative image entry, an import finishing.
+    ctx.images.hash(&mut first);
     subtree(ctx.doc, n, 0).hash(&mut first);
     let mut second = DefaultHasher::new();
     for v in page_xf.as_coeffs().map(f64::to_bits) {

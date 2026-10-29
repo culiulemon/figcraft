@@ -250,6 +250,9 @@ fn boxes(
     if w == 0 || h == 0 {
         return None;
     }
+    if !crate::canvas::fits(device, w, h) {
+        return None;
+    }
     if blur.scan.is_none() && blur.direct.is_none() {
         return None;
     }
