@@ -1,4 +1,4 @@
-use super::*;
+use super::{ColorProfile, Context, FigApp, RichText, Tokens, json, regular, tr, trf, window};
 
 /// File ▸ Color profile: pick sRGB or Display P3, then keep the colours' appearance (convert the
 /// values) or keep the values (reinterpret them in the new space).

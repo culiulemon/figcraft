@@ -1,4 +1,4 @@
-use super::*;
+use super::{Arc, BTreeSet, Document, Node, NodeId, board, cmd, components, measure, style_vars};
 
 /// Nodes whose `Arc` differs from `before` (new or edited).
 pub fn changed_nodes(doc: &Document, before: &Document) -> Vec<NodeId> {
@@ -10,9 +10,28 @@ pub fn changed_nodes(doc: &Document, before: &Document) -> Vec<NodeId> {
         .collect()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: normalising panics, standing for a bug in it (a command's edit is rolled back).
+    pub(crate) static PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests: panic when [`PANIC`] is set, as a bug in normalising would.
+#[cfg(test)]
+fn test_panic() {
+    if PANIC.with(std::cell::Cell::get) {
+        panic!("normalize: test panic");
+    }
+}
+
+/// Shipped builds: nothing (the test hook compiles away).
+#[cfg(not(test))]
+fn test_panic() {}
+
 /// Keep derived state consistent after edits: text boxes resize to their content, groups wrap
 /// their children, instances follow their main components, auto layout re-flows.
 pub fn normalize(doc: &mut Document, before: &Document) {
+    test_panic();
     // Only what was touched since the last normalisation (edited, added or removed).
     let mut touched: BTreeSet<NodeId> = doc.take_dirty();
     // A variable or style edit changes no layer directly, but bound and linked layers must follow it.
@@ -54,7 +73,12 @@ pub fn normalize(doc: &mut Document, before: &Document) {
         if let Some((w, h)) = figcraft_text::auto_size(n)
             && ((w - n.width).abs() > 1e-6 || (h - n.height).abs() > 1e-6)
         {
+            let dw = w - n.width;
+            let anchor_right = keeps_right_edge(doc, before, n);
             figcraft_layout::set_size(doc, id, w, h);
+            if anchor_right && let Some(n) = doc.node_mut(id) {
+                n.transform *= figcraft_geom::kurbo::Affine::translate((-dw, 0.0));
+            }
         }
     }
     touched.extend(doc.take_dirty());
@@ -137,6 +161,15 @@ pub fn normalize(doc: &mut Document, before: &Document) {
     doc.take_dirty();
     // 5. Comment pins follow their layers to other pages and stay put when the layers are deleted.
     cmd::comment::follow_anchors(doc, before);
+}
+
+/// Whether auto-width text `n` keeps its right edge when its width changes: it was already
+/// right-aligned auto-width text before the edit and no auto layout flow places it.
+fn keeps_right_edge(doc: &Document, before: &Document, n: &Node) -> bool {
+    use figcraft_doc::{TextAlignH, TextAutoResize};
+    let right_auto = |n: &Node| n.kind.text().is_some_and(|t| t.align_h == TextAlignH::Right && t.auto_resize == TextAutoResize::WidthAndHeight);
+    let in_flow = !n.child_layout.absolute && n.parent.and_then(|p| doc.node(p)).is_some_and(|p| p.layout.is_some() && p.kind.is_frame_like());
+    right_auto(n) && before.node(n.id).is_some_and(right_auto) && !in_flow
 }
 
 /// Whether layer `id` changed (since `before`) in a way that can move or resize layers in an auto

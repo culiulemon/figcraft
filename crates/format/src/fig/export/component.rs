@@ -1,7 +1,7 @@
 use super::common::{
     bool_data, changed, prop_type, resolved_alike, scaled, sort_position, symbol_data, text_data, text_value, var_data, variant_pairs,
 };
-use super::*;
+use super::{AUX, BTreeMap, Exporter, Fields, Kv, MAX_NODES, Node, NodeId, NodeKind, PropDef, Value, arr, b, e, fl, guid, o, s};
 
 impl<'d> Exporter<'d> {
     /// A component property definition of `owner` (a component, or a set), `index`-th in its list.

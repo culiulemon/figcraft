@@ -1,11 +1,14 @@
 //! Text menu and text editing commands.
 
-use figcraft_doc::*;
+use figcraft_doc::{
+    LetterSpacing, LineHeight, ListStyle, NodeId, NodeKind, TextAlignH, TextAutoResize, TextCase, TextData, TextDecoration, TextPath, TextStyle,
+    VariableId,
+};
 use serde_json::{Map, Value, json};
 
 use super::props::{styled_name, weight_name};
 use super::{CommandSpec, ok};
-use crate::params::*;
+use crate::params::{boolean, get, id, num, req_id, req_num, req_string, req_targets, string, targets};
 use crate::{Result, Session, bad, spec, textedit};
 
 fn finite(v: f64) -> f64 {
@@ -358,8 +361,8 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         spec!(
             "text.preview",
-            "Preview text change",
-            "{command: style.apply|library.applyStyle|text.setVariations|text.style, params}  shows what the command would do on the canvas without an undo step (a hovered font family or style, text style or named instance, a dragged axis slider), in place of an earlier preview; text.endPreview or any other command ends it, so running the command for real commits it as one undo step",
+            "Preview a change",
+            "{command: style.apply|library.applyStyle|text.setVariations|text.style|node.set|fill.set|stroke.set|selection.setPaint|style.update, params}  shows what the command would do on the canvas without an undo step (a hovered font family or style, text style, named instance, blend mode, or a dragged axis slider), in place of an earlier preview; text.endPreview or any other command ends it, so running the command for real commits it as one undo step",
             false,
             |s, p| {
                 let c = req_string("text.preview", p, "command")?;

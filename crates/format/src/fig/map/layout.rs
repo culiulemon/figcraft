@@ -1,5 +1,5 @@
 use super::paint::{bound, color};
-use super::*;
+use super::{BTreeMap, BTreeSet, Kv, MAX_GRID_TRACK_VALUE, MAX_GRID_TRACKS, Mapper, Obj, Value, View, copy_num, guid, json, num};
 
 impl<'a> Mapper<'a> {
     pub(super) fn auto_layout(&mut self, o: &mut Obj, v: &View<'a>) {

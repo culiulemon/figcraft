@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    Arc, BatchScope, BatchStep, DocState, Document, EngineError, HistoryEntry, Interaction, NodeId, PREVIEW_READ_ONLY, Result, Session, UiRequest,
+    Value, cmd, figcraft_collab, normalize, textpreview,
+};
 
 impl Session {
     /// How many undo and redo steps the active document has (the user's own in a live session).
@@ -202,8 +205,11 @@ impl Session {
     /// own, and when it fails the documents stay at their group-start state.
     pub fn grouped<T>(&mut self, label: &str, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         self.ds()?;
+        let pending_mark = self.pending_events.len();
         let before: Vec<_> =
             self.docs.iter().map(|ds| (ds.uid, ds.doc.clone(), ds.selection.clone(), ds.page, ds.history.undo.len(), ds.history.limit)).collect();
+        // An undo inside pops the undo steps; a failed group has to bring them back.
+        let undo_before: Vec<_> = self.docs.iter().map(|ds| ds.history.undo.clone()).collect();
         // An edit inside clears the redo steps; a failed group has to bring them back.
         let redo_before: Vec<_> = self.docs.iter().map(|ds| ds.history.redo.clone()).collect();
         let active = self.active;
@@ -219,11 +225,13 @@ impl Session {
         self.group_depth += 1;
         let result = f(self);
         self.group_depth -= 1;
+        let at_root = self.group_depth == 0;
         for (uid, _, _, _, _, _) in &before {
             self.live_hold(*uid, false);
         }
 
         if result.is_err() {
+            self.pending_events.truncate(pending_mark);
             // Tabs the group closed come back from the stash, and the group-start order returns.
             let mut current = std::mem::take(&mut self.docs);
             for (uid, ..) in &before {
@@ -233,13 +241,13 @@ impl Session {
                 };
                 self.docs.extend(tab);
             }
-            for ((uid, doc, selection, page, undo_len, limit), redo) in before.iter().zip(redo_before) {
+            for (((uid, doc, selection, page, _, limit), undo), redo) in before.iter().zip(undo_before).zip(redo_before) {
                 if let Some(ds) = self.docs.iter_mut().find(|ds| ds.uid == *uid) {
                     ds.history.redo = redo;
                     ds.doc = doc.clone();
                     ds.selection = selection.clone();
                     ds.page = *page;
-                    ds.history.undo.truncate(*undo_len);
+                    ds.history.undo = undo;
                     ds.history.limit = *limit;
                 }
             }
@@ -250,8 +258,9 @@ impl Session {
             }
             return result;
         }
-        if self.group_depth == 0 {
+        if at_root {
             self.closed_in_group.clear();
+            self.flush_pending_events();
         }
 
         let changed: Vec<_> = before

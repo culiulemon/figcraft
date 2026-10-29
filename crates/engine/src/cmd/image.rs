@@ -5,7 +5,7 @@ use figcraft_doc::{Document, ImagePreset};
 use serde_json::{Value, json};
 
 use super::{CommandSpec, ok};
-use crate::params::*;
+use crate::params::{f64_of, get, num, req_index, req_string, req_targets, string, targets};
 use crate::{Result, Session, bad, spec};
 
 pub fn specs() -> Vec<CommandSpec> {

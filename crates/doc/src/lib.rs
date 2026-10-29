@@ -67,6 +67,10 @@ impl std::str::FromStr for NodeId {
         // Accept "12" and Figma-style "0:12".
         let t = s.trim();
         let t = t.rsplit(':').next().unwrap_or(t);
+        if t.starts_with('+') {
+            // `u64::parse` accepts a leading '+'; ids are digits only.
+            return "-".parse::<u64>().map(NodeId);
+        }
         t.parse::<u64>().map(NodeId)
     }
 }
@@ -159,6 +163,26 @@ pub struct ImageData {
     pub bytes: Arc<Vec<u8>>,
     pub width: u32,
     pub height: u32,
+}
+
+impl ImageData {
+    /// Largest encoded image a document takes from outside: an image member of a `.fig` or
+    /// `.sketch` file, an image file a REST import reads, an image entry from a live session.
+    pub const MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+    /// Whether `key` claims to be a content hash: 64 hex digits, the shape of the sha256 hex
+    /// `figcraft_format::image_hash` makes. Bytes stored under such a key must hash to it.
+    pub fn claims_content_hash(key: &str) -> bool {
+        key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
+    /// Whether `key` can name an image: 1–128 ASCII letters, digits, `-` and `_` (content hashes,
+    /// the svg importer's FNV keys, the REST importer's `rest-image-missing` placeholder). A key
+    /// becomes an archive member name (`images/<key>`) when the file is saved, so only these are
+    /// read back from a file or taken from a collaborator: never `/`, `.` or other path text.
+    pub fn is_valid_key(key: &str) -> bool {
+        (1..=128).contains(&key.len()) && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    }
 }
 
 /// A whole design file.
@@ -407,13 +431,8 @@ impl Document {
     /// Add a page at the end.
     pub fn add_page(&mut self, name: &str) -> NodeId {
         let id = self.alloc_id();
-        let node = Node::new(
-            id,
-            NodeKind::Page { background: Color::DEFAULT_PAGE, flows: Vec::new(), prototype: Default::default(), guides: Vec::new() },
-            name,
-            0.0,
-            0.0,
-        );
+        let node =
+            Node::new(id, NodeKind::Page { background: Color::DEFAULT_PAGE, flows: Vec::new(), prototype: Default::default() }, name, 0.0, 0.0);
         self.nodes.insert(id, Arc::new(node));
         self.dirty.touch(id);
         self.pages.push(id);
@@ -1143,8 +1162,10 @@ impl Document {
             Arc::make_mut(&mut self.libraries).store = store;
         }
         self.pages.retain(|p| self.nodes.get(p).is_some_and(|n| n.is_page()) && Some(*p) != store);
+        // Unlisted pages join the list; a set keeps many pages from making this quadratic (#1078).
+        let mut listed: std::collections::BTreeSet<NodeId> = self.pages.iter().copied().collect();
         for (k, n) in self.nodes.iter() {
-            if n.is_page() && !self.pages.contains(k) && Some(*k) != store {
+            if n.is_page() && Some(*k) != store && listed.insert(*k) {
                 self.pages.push(*k);
             }
         }
@@ -1257,6 +1278,8 @@ mod colors_tests;
 mod diff_tests;
 #[cfg(test)]
 mod effects_tests;
+#[cfg(test)]
+mod guides_tests;
 #[cfg(test)]
 mod handoff_tests;
 #[cfg(test)]

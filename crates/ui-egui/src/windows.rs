@@ -396,7 +396,12 @@ pub(crate) fn request_close(app: &mut FigApp, ctx: &Context) {
 }
 
 fn close_current(app: &mut FigApp, ctx: &Context) {
-    app.windows.closing.push(app.windows.current);
+    // Once only: a second close of the same window before [`begin`] runs (two quits while the
+    // main window is hidden, when only the app's logic runs) would act on the window that took its
+    // place, without asking about that window's files.
+    if !app.windows.closing.contains(&app.windows.current) {
+        app.windows.closing.push(app.windows.current);
+    }
     ctx.request_repaint_of(ViewportId::ROOT);
 }
 

@@ -14,6 +14,8 @@ use crate::theme::{ACCENT, COMPONENT, Tokens, regular, semibold};
 use crate::{FigApp, LeftTab};
 
 pub const ROW: f32 = 32.0;
+/// Width of the icon rail left of the side panel; the Home tab above it is as wide.
+pub const RAIL_WIDTH: f32 = 56.0;
 
 /// A boolean operation's icon.
 pub fn op_icon(op: figcraft_doc::BoolOp) -> Icon {
@@ -728,6 +730,259 @@ fn search_field(ui: &mut Ui, t: &Tokens, w: f32, id: Id, hint: &str, text: &mut 
     }
 }
 
+/// Dragging near the list's top or bottom edge scrolls it, faster closer to the edge.
+fn drag_autoscroll(ui: &mut Ui, dragging: bool) {
+    if dragging && let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
+        const EDGE: f32 = 28.0;
+        let view = ui.clip_rect();
+        let dy = if p.y < view.min.y + EDGE {
+            (view.min.y + EDGE - p.y).min(EDGE)
+        } else if p.y > view.max.y - EDGE {
+            -(p.y - (view.max.y - EDGE)).min(EDGE)
+        } else {
+            0.0
+        };
+        if dy != 0.0 && view.x_range().contains(p.x) {
+            ui.scroll_with_delta(vec2(0.0, dy * 0.5));
+            ui.ctx().request_repaint();
+        }
+    }
+}
+
+/// A row's icon or name colour: the component tint (faded when hidden), else `normal` or `faded`.
+fn row_color(component: bool, shown: bool, normal: Color32, faded: Color32) -> Color32 {
+    if component {
+        COMPONENT.gamma_multiply(if shown { 1.0 } else { 0.5 })
+    } else if shown {
+        normal
+    } else {
+        faded
+    }
+}
+
+/// The pointer `p` over row `rects` = [row, padded row]: the drop zone it shows (-1 above, 0 into,
+/// 1 below), whether holding there should open the collapsed row, and whether the button was released.
+fn drop_zone(ui: &mut Ui, p: egui::Pos2, rects: [Rect; 2], x0: f32, id: NodeId, collapsed: bool, n: &figcraft_doc::Node) -> (i8, bool, bool) {
+    let [r, rr] = rects;
+    let mut open = false;
+    let rel = (p.y - r.min.y) / r.height();
+    let into = n.kind.is_container() && !matches!(n.kind, NodeKind::Instance { .. }) && (0.25..0.75).contains(&rel);
+    let zone: i8 = if into {
+        0
+    } else if rel < 0.5 {
+        -1
+    } else {
+        1
+    };
+    let y = match zone {
+        -1 => r.min.y,
+        1 => r.max.y,
+        _ => r.center().y,
+    };
+    if zone == 0 {
+        ui.painter().rect_stroke(rr, CornerRadius::same(5), Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
+        // Holding over a collapsed group or frame opens it, to drop deeper inside.
+        if collapsed {
+            open = hold_opens(ui, id);
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    } else {
+        crate::widgets::insertion_line(ui.painter(), x0, rr.max.x, y);
+    }
+    (zone, open, ui.input(|i| i.pointer.any_released()))
+}
+
+/// True once the pointer has stayed over row `id` for 0.6 s (the timer then restarts).
+fn hold_opens(ui: &mut Ui, id: NodeId) -> bool {
+    let hold_id = Id::unique("layer_drag_hold");
+    let now = ui.input(|i| i.time);
+    match ui.data(|d| d.get_temp::<(NodeId, f64)>(hold_id)) {
+        Some((held, since)) if held == id => {
+            if now - since > 0.6 {
+                ui.data_mut(|d| d.remove::<(NodeId, f64)>(hold_id));
+                return true;
+            }
+        }
+        _ => {
+            ui.data_mut(|d| d.insert_temp(hold_id, (id, now)));
+        }
+    }
+    false
+}
+
+/// Applies a finished sweep across the eyes or padlocks, or keeps it going while the button is down.
+fn finish_sweep(app: &mut FigApp, ui: &mut Ui, sw: Sweep) {
+    let (released, down) = ui.input(|i| (i.pointer.any_released(), i.pointer.primary_down()));
+    if released {
+        let (cmd, key) = if sw.lock { ("object.toggleLock", "locked") } else { ("object.toggleVisible", "visible") };
+        // A sweep started in the design can end after a switch to Dev Mode.
+        if !crate::menus::dev_mode_refuses(app, cmd) {
+            app.run(cmd, json!({"ids": sw.ids, key: if sw.lock { sw.on } else { !sw.on }}));
+        }
+    }
+    // A sweep whose release the panel never saw (it wasn't shown) is dropped.
+    if released || !down {
+        ui.data_mut(|d| d.remove::<Sweep>(sweep_id()));
+    } else {
+        ui.data_mut(|d| d.insert_temp(sweep_id(), sw));
+    }
+}
+
+/// A click on row `id`: plain selects it, Shift extends from the anchor, Cmd (or Shift without an
+/// anchor) toggles it.
+fn select_clicked(app: &mut FigApp, rows: &[Row], sel: &[NodeId], id: NodeId, m: egui::Modifiers) {
+    app.ui.layers_focus = true;
+    app.ui.pages_focus = None;
+    let order: Vec<NodeId> = rows.iter().map(|r| r.id).collect();
+    let pos = |x: NodeId| order.iter().position(|o| *o == x);
+    let anchor = app.ui.layer_anchor.filter(|a| sel.contains(a)).and_then(pos);
+    if m.shift
+        && let (Some(ai), Some(bi)) = (anchor, pos(id))
+    {
+        // Shift: the visible rows from the anchor to here (added to the selection with Cmd).
+        let (lo, hi) = (ai.min(bi), ai.max(bi));
+        let mut s: Vec<NodeId> = if m.command { sel.to_vec() } else { vec![] };
+        for x in order.get(lo..=hi).unwrap_or_default() {
+            if !s.contains(x) {
+                s.push(*x);
+            }
+        }
+        app.run("select.set", json!({"ids": s}));
+    } else if m.shift || m.command {
+        let mut s = sel.to_vec();
+        if let Some(pos) = s.iter().position(|x| *x == id) {
+            s.remove(pos);
+        } else {
+            s.push(id);
+        }
+        app.ui.layer_anchor = Some(id);
+        app.run("select.set", json!({"ids": s}));
+    } else {
+        app.ui.layer_anchor = Some(id);
+        app.run("select.set", json!({"ids": [id]}));
+    }
+    // A click in the panel needs no reveal scroll.
+    app.ui.layers_seen_sel = app.session.selection();
+    if let Ok(ds) = app.session.ds_mut()
+        && ds.text_edit.is_some()
+    {
+        let _ = figcraft_engine::textedit::end(&mut app.session);
+    }
+}
+
+/// Drops `moving` on `target` (`zone`: 0 into it, -1 above, 1 below), unless Dev Mode refuses
+/// (a drag started in the design can end after a switch to it).
+fn drop_layers(app: &mut FigApp, doc: &Document, moving: &[NodeId], target: NodeId, zone: i8) {
+    if crate::menus::dev_mode_refuses(app, "node.reparent") {
+        return;
+    }
+    let ids = moving.to_vec();
+    match zone {
+        0 => {
+            app.run("node.reparent", json!({"ids": ids, "parent": target}));
+        }
+        z => {
+            // Above in the list = higher z = after the target among siblings.
+            if let Some(parent) = doc.node(target).and_then(|n| n.parent) {
+                let idx = doc.index_in_parent(target).unwrap_or(0);
+                let gap = if z < 0 { idx + 1 } else { idx };
+                // `index` is the final position: the dragged layers below the gap leave it.
+                let below = doc.node(parent).map_or(0, |p| p.children.iter().take(gap).filter(|c| ids.contains(c)).count());
+                app.run("node.reparent", json!({"ids": ids, "parent": parent, "index": gap - below}));
+            }
+        }
+    }
+}
+
+/// The eye and padlock of a row: painted when hovered (`over`, false in Dev Mode) or set, and, outside
+/// Dev Mode, clickable; a drag over them starts a sweep. Returns the layers whose eye / padlock was clicked.
+fn eye_lock(
+    ui: &mut Ui,
+    t: &Tokens,
+    rects: [Rect; 2],
+    row: &Row,
+    n: &figcraft_doc::Node,
+    over: bool,
+    dev: bool,
+    sweep: &mut Option<Sweep>,
+) -> (Option<NodeId>, Option<NodeId>) {
+    let [r, rr] = rects;
+    let (mut vis, mut lock) = (None, None);
+    // A sweep across the eyes or padlocks takes in the rows the pointer passes.
+    if let Some(sw) = sweep.as_mut()
+        && !sw.ids.contains(&row.id)
+        && ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| r.y_range().contains(p.y))
+    {
+        sw.ids.push(row.id);
+    }
+    let swept = |lock: bool| sweep.as_ref().filter(|sw| sw.lock == lock && sw.ids.contains(&row.id)).map(|sw| sw.on);
+    // Lock / eye on hover (or when set); a layer in a locked one shows a faint padlock.
+    let hidden = swept(false).unwrap_or(!n.visible);
+    let locked = swept(true).unwrap_or(n.locked);
+    // In Dev Mode they only show what is set.
+    let show_lock = over || locked || row.locked_above;
+    let show_eye = over || hidden;
+    let er = Rect::from_center_size(pos2(rr.max.x - 14.0, r.center().y), vec2(20.0, 20.0));
+    let lr = Rect::from_center_size(pos2(rr.max.x - 36.0, r.center().y), vec2(20.0, 20.0));
+    if show_eye {
+        icons::paint(ui.painter(), er.shrink(3.0), if hidden { Icon::EyeOff } else { Icon::Eye }, t.icon_secondary);
+    }
+    if show_eye && !dev {
+        let eresp = ui.interact(er, ui.scope_id().with(("eye", row.id)), Sense::click_and_drag());
+        a11y::toggle(&eresp, tr("Hidden"), hidden);
+        if eresp.clicked() {
+            vis = Some(row.id);
+        }
+        if eresp.drag_started() {
+            *sweep = Some(Sweep { lock: false, on: n.visible, ids: vec![row.id] });
+        }
+    }
+    if show_lock {
+        let col = if locked || !row.locked_above { t.icon_secondary } else { t.text_tertiary };
+        icons::paint(ui.painter(), lr.shrink(3.0), if locked || row.locked_above { Icon::Lock } else { Icon::Unlock }, col);
+    }
+    if show_lock && !dev {
+        let lresp = ui.interact(lr, ui.scope_id().with(("lock", row.id)), Sense::click_and_drag());
+        a11y::toggle(&lresp, tr("Locked"), locked || row.locked_above);
+        if lresp.clicked() {
+            lock = Some(row.id);
+        }
+        if lresp.drag_started() {
+            *sweep = Some(Sweep { lock: true, on: !n.locked, ids: vec![row.id] });
+        }
+    }
+    (vis, lock)
+}
+
+/// Expands the ancestors of a selection not seen yet (once, so manual collapsing sticks); whether it was new.
+fn reveal_selection(app: &mut FigApp, doc: &Document, page: NodeId, sel: &[NodeId]) -> bool {
+    let reveal = sel != app.ui.layers_seen_sel;
+    if reveal {
+        for s in sel {
+            for a in doc.ancestors(*s) {
+                if a != page {
+                    app.ui.expanded.insert(a);
+                }
+            }
+        }
+        app.ui.layers_seen_sel = sel.to_vec();
+    }
+    reveal
+}
+
+/// A row's background: selected, inside a selected layer, or outlined when hovered.
+/// `state` is [selected, in_selected, component].
+fn paint_row_bg(ui: &Ui, t: &Tokens, rr: Rect, state: [bool; 3], hovered: bool) {
+    let [selected, in_selected, is_comp] = state;
+    if selected {
+        ui.painter().rect_filled(rr, CornerRadius::same(5), if is_comp { t.component_row } else { t.selected_row });
+    } else if in_selected {
+        ui.painter().rect_filled(rr, CornerRadius::ZERO, t.selected_row_child);
+    } else if hovered {
+        ui.painter().rect_stroke(rr, CornerRadius::same(5), Stroke::new(1.0, if is_comp { COMPONENT } else { ACCENT }), egui::StrokeKind::Inside);
+    }
+}
+
 /// Draw the layer tree with search, cached rows, reveal-selection expansion and scrolling,
 /// rename/Tab navigation, selection and drag/drop, sweep toggles and Dev Mode restrictions.
 fn layers(app: &mut FigApp, ui: &mut Ui) {
@@ -761,17 +1016,7 @@ fn layers(app: &mut FigApp, ui: &mut Ui) {
     let hover = ds.hover;
     // Reveal a new selection: expand its ancestors and scroll its row into view, once, so
     // "Collapse layers" and manual collapsing stick.
-    let reveal = sel != app.ui.layers_seen_sel;
-    if reveal {
-        for s in &sel {
-            for a in doc.ancestors(*s) {
-                if a != page {
-                    app.ui.expanded.insert(a);
-                }
-            }
-        }
-        app.ui.layers_seen_sel = sel.clone();
-    }
+    let reveal = reveal_selection(app, &doc, page, &sel);
     let filter = app.ui.layer_filter.trim().to_lowercase();
     let rows = rows_for(ui, &doc, page, &app.ui.expanded, &filter);
     let mut scroll_to = if reveal { sel.first().and_then(|s| rows.iter().position(|r| r.id == *s)) } else { None };
@@ -831,24 +1076,7 @@ fn layers(app: &mut FigApp, ui: &mut Ui) {
                 ui.add(egui::Label::new(egui::RichText::new(hint).font(regular(11.0)).color(t.text_secondary)).wrap());
             });
         }
-        // Dragging near the list's top or bottom edge scrolls it, faster closer to the edge.
-        if dragging.is_some()
-            && let Some(p) = ui.input(|i| i.pointer.hover_pos())
-        {
-            const EDGE: f32 = 28.0;
-            let view = ui.clip_rect();
-            let dy = if p.y < view.min.y + EDGE {
-                (view.min.y + EDGE - p.y).min(EDGE)
-            } else if p.y > view.max.y - EDGE {
-                -(p.y - (view.max.y - EDGE)).min(EDGE)
-            } else {
-                0.0
-            };
-            if dy != 0.0 && view.x_range().contains(p.x) {
-                ui.scroll_with_delta(vec2(0.0, dy * 0.5));
-                ui.ctx().request_repaint();
-            }
-        }
+        drag_autoscroll(ui, dragging.is_some());
         let first = ((viewport.min.y / pitch).floor().max(0.0) as usize).min(rows.len());
         let last = ((viewport.max.y / pitch).ceil().max(0.0) as usize).saturating_add(1).min(rows.len());
         let band = Rect::from_x_y_ranges(ui.max_rect().x_range(), (top + first as f32 * pitch)..=(top + last as f32 * pitch));
@@ -879,18 +1107,7 @@ fn layers(app: &mut FigApp, ui: &mut Ui) {
             a11y::ring_around(ui, rr, &resp);
             // Over the row, its eye and padlock included (they sit on top of it).
             let over = resp.contains_pointer();
-            if selected {
-                ui.painter().rect_filled(rr, CornerRadius::same(5), if is_comp { t.component_row } else { t.selected_row });
-            } else if in_selected {
-                ui.painter().rect_filled(rr, CornerRadius::ZERO, t.selected_row_child);
-            } else if over || hover == Some(row.id) {
-                ui.painter().rect_stroke(
-                    rr,
-                    CornerRadius::same(5),
-                    Stroke::new(1.0, if is_comp { COMPONENT } else { ACCENT }),
-                    egui::StrokeKind::Inside,
-                );
-            }
+            paint_row_bg(ui, &t, rr, [selected, in_selected, is_comp], over || hover == Some(row.id));
             if over {
                 hovered_row = Some(row.id);
             }
@@ -912,13 +1129,7 @@ fn layers(app: &mut FigApp, ui: &mut Ui) {
             }
             let icon = node_icon(&doc, row.id);
             let shown = n.visible && !row.dimmed;
-            let icon_col = if is_comp || icon == Icon::Slot {
-                COMPONENT.gamma_multiply(if shown { 1.0 } else { 0.5 })
-            } else if shown {
-                t.icon
-            } else {
-                t.text_tertiary
-            };
+            let icon_col = row_color(is_comp || icon == Icon::Slot, shown, t.icon, t.text_tertiary);
             icons::paint(ui.painter(), Rect::from_center_size(pos2(x0 + 22.0, r.center().y), vec2(14.0, 14.0)), icon, icon_col);
             let name_x = x0 + 36.0;
             if app.ui.rename.is_some_and(|rn| rn.id == row.id) {
@@ -926,68 +1137,18 @@ fn layers(app: &mut FigApp, ui: &mut Ui) {
                     rename_done = Some((row.id, new));
                 }
             } else {
-                let col = if is_comp {
-                    COMPONENT.gamma_multiply(if shown { 1.0 } else { 0.5 })
-                } else if shown {
-                    t.text
-                } else {
-                    t.text_tertiary
-                };
-                let font = if doc.node(n.parent.unwrap_or(page)).is_some_and(|p| p.is_page())
-                    && (n.kind.is_frame_like() || matches!(n.kind, NodeKind::Section { .. }))
-                {
-                    semibold(11.0)
-                } else {
-                    regular(11.0)
-                };
+                let col = row_color(is_comp, shown, t.text, t.text_tertiary);
+                let top_level = doc.node(n.parent.unwrap_or(page)).is_some_and(|p| p.is_page());
+                let font =
+                    if top_level && (n.kind.is_frame_like() || matches!(n.kind, NodeKind::Section { .. })) { semibold(11.0) } else { regular(11.0) };
                 let name = if n.name.is_empty() { tr(n.kind.label()).to_string() } else { n.name.clone() };
                 // Room left of the lock and eye buttons.
                 let max_w = (rr.max.x - 56.0 - name_x).max(20.0);
                 crate::bidi::paint_name(ui.painter(), pos2(name_x, r.center().y), &name, font, col, max_w);
             }
-            // A sweep across the eyes or padlocks takes in the rows the pointer passes.
-            if let Some(sw) = sweep.as_mut()
-                && !sw.ids.contains(&row.id)
-                && ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| r.y_range().contains(p.y))
-            {
-                sw.ids.push(row.id);
-            }
-            let swept = |lock: bool| sweep.as_ref().filter(|sw| sw.lock == lock && sw.ids.contains(&row.id)).map(|sw| sw.on);
-            // Lock / eye on hover (or when set); a layer in a locked one shows a faint padlock.
-            let hidden = swept(false).unwrap_or(!n.visible);
-            let locked = swept(true).unwrap_or(n.locked);
-            // In Dev Mode they only show what is set.
-            let show_lock = (over && !dev) || locked || row.locked_above;
-            let show_eye = (over && !dev) || hidden;
-            let er = Rect::from_center_size(pos2(rr.max.x - 14.0, r.center().y), vec2(20.0, 20.0));
-            let lr = Rect::from_center_size(pos2(rr.max.x - 36.0, r.center().y), vec2(20.0, 20.0));
-            if show_eye {
-                icons::paint(ui.painter(), er.shrink(3.0), if hidden { Icon::EyeOff } else { Icon::Eye }, t.icon_secondary);
-            }
-            if show_eye && !dev {
-                let eresp = ui.interact(er, ui.scope_id().with(("eye", row.id)), Sense::click_and_drag());
-                a11y::toggle(&eresp, tr("Hidden"), hidden);
-                if eresp.clicked() {
-                    vis = Some(row.id);
-                }
-                if eresp.drag_started() {
-                    sweep = Some(Sweep { lock: false, on: n.visible, ids: vec![row.id] });
-                }
-            }
-            if show_lock {
-                let col = if locked || !row.locked_above { t.icon_secondary } else { t.text_tertiary };
-                icons::paint(ui.painter(), lr.shrink(3.0), if locked || row.locked_above { Icon::Lock } else { Icon::Unlock }, col);
-            }
-            if show_lock && !dev {
-                let lresp = ui.interact(lr, ui.scope_id().with(("lock", row.id)), Sense::click_and_drag());
-                a11y::toggle(&lresp, tr("Locked"), locked || row.locked_above);
-                if lresp.clicked() {
-                    lock = Some(row.id);
-                }
-                if lresp.drag_started() {
-                    sweep = Some(Sweep { lock: true, on: !n.locked, ids: vec![row.id] });
-                }
-            }
+            let (v, l) = eye_lock(ui, &t, [r, rr], row, n, over && !dev, dev, &mut sweep);
+            vis = v.or(vis);
+            lock = l.or(lock);
             if resp.clicked() {
                 clicked = Some((row.id, ui.input(|i| i.modifiers)));
             }
@@ -1016,43 +1177,12 @@ fn layers(app: &mut FigApp, ui: &mut Ui) {
                 && let Some(p) = ui.input(|i| i.pointer.hover_pos())
                 && r.contains(p)
             {
-                let rel = (p.y - r.min.y) / r.height();
-                let into = n.kind.is_container() && !matches!(n.kind, NodeKind::Instance { .. }) && (0.25..0.75).contains(&rel);
-                let zone: i8 = if into {
-                    0
-                } else if rel < 0.5 {
-                    -1
-                } else {
-                    1
-                };
-                let y = match zone {
-                    -1 => r.min.y,
-                    1 => r.max.y,
-                    _ => r.center().y,
-                };
-                if zone == 0 {
-                    ui.painter().rect_stroke(rr, CornerRadius::same(5), Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
-                    // Holding over a collapsed group or frame opens it, to drop deeper inside.
-                    if row.has_kids && !app.ui.expanded.contains(&row.id) {
-                        let hold_id = Id::unique("layer_drag_hold");
-                        let now = ui.input(|i| i.time);
-                        match ui.data(|d| d.get_temp::<(NodeId, f64)>(hold_id)) {
-                            Some((id, since)) if id == row.id => {
-                                if now - since > 0.6 {
-                                    toggle = Some(row.id);
-                                    ui.data_mut(|d| d.remove::<(NodeId, f64)>(hold_id));
-                                }
-                            }
-                            _ => {
-                                ui.data_mut(|d| d.insert_temp(hold_id, (row.id, now)));
-                            }
-                        }
-                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
-                    }
-                } else {
-                    crate::widgets::insertion_line(ui.painter(), x0, rr.max.x, y);
+                let collapsed = row.has_kids && !app.ui.expanded.contains(&row.id);
+                let (zone, open, released) = drop_zone(ui, p, [r, rr], x0, row.id, collapsed, n);
+                if open {
+                    toggle = Some(row.id);
                 }
-                if ui.input(|i| i.pointer.any_released()) {
+                if released {
                     drop = Some((row.id, zone));
                 }
             }
@@ -1087,46 +1217,15 @@ fn layers(app: &mut FigApp, ui: &mut Ui) {
         }
     }
     if let Some(sw) = sweep {
-        let (released, down) = ui.input(|i| (i.pointer.any_released(), i.pointer.primary_down()));
-        if released {
-            let (cmd, key) = if sw.lock { ("object.toggleLock", "locked") } else { ("object.toggleVisible", "visible") };
-            // A sweep started in the design can end after a switch to Dev Mode.
-            if !crate::menus::dev_mode_refuses(app, cmd) {
-                app.run(cmd, json!({"ids": sw.ids, key: if sw.lock { sw.on } else { !sw.on }}));
-            }
-        }
-        // A sweep whose release the panel never saw (it wasn't shown) is dropped.
-        if released || !down {
-            ui.data_mut(|d| d.remove::<Sweep>(sweep_id()));
-        } else {
-            ui.data_mut(|d| d.insert_temp(sweep_id(), sw));
-        }
+        finish_sweep(app, ui, sw);
     }
     if ui.input(|i| i.pointer.any_released()) {
         ui.data_mut(|d| {
             d.remove::<NodeId>(drag_id);
             d.remove::<(NodeId, f64)>(Id::unique("layer_drag_hold"));
         });
-        // A drag started in the design can end after a switch to Dev Mode.
-        if let (Some(_), Some((target, zone))) = (dragging, drop)
-            && !crate::menus::dev_mode_refuses(app, "node.reparent")
-        {
-            let ids = moving.clone();
-            match zone {
-                0 => {
-                    app.run("node.reparent", json!({"ids": ids, "parent": target}));
-                }
-                z => {
-                    // Above in the list = higher z = after the target among siblings.
-                    if let Some(parent) = doc.node(target).and_then(|n| n.parent) {
-                        let idx = doc.index_in_parent(target).unwrap_or(0);
-                        let gap = if z < 0 { idx + 1 } else { idx };
-                        // `index` is the final position: the dragged layers below the gap leave it.
-                        let below = doc.node(parent).map_or(0, |p| p.children.iter().take(gap).filter(|c| ids.contains(c)).count());
-                        app.run("node.reparent", json!({"ids": ids, "parent": parent, "index": gap - below}));
-                    }
-                }
-            }
+        if let (Some(_), Some((target, zone))) = (dragging, drop) {
+            drop_layers(app, &doc, &moving, target, zone);
         }
     }
     if let Ok(ds) = app.session.ds_mut() {
@@ -1159,43 +1258,7 @@ fn layers(app: &mut FigApp, ui: &mut Ui) {
         a11y::refocus_row(&mut app.ui.nav);
     }
     if let Some((id, m)) = clicked {
-        app.ui.layers_focus = true;
-        app.ui.pages_focus = None;
-        let order: Vec<NodeId> = rows.iter().map(|r| r.id).collect();
-        let pos = |x: NodeId| order.iter().position(|o| *o == x);
-        let anchor = app.ui.layer_anchor.filter(|a| sel.contains(a)).and_then(pos);
-        if m.shift
-            && let (Some(ai), Some(bi)) = (anchor, pos(id))
-        {
-            // Shift: the visible rows from the anchor to here (added to the selection with Cmd).
-            let (lo, hi) = (ai.min(bi), ai.max(bi));
-            let mut s: Vec<NodeId> = if m.command { sel.clone() } else { vec![] };
-            for x in order.get(lo..=hi).unwrap_or_default() {
-                if !s.contains(x) {
-                    s.push(*x);
-                }
-            }
-            app.run("select.set", json!({"ids": s}));
-        } else if m.shift || m.command {
-            let mut s = sel.clone();
-            if let Some(pos) = s.iter().position(|x| *x == id) {
-                s.remove(pos);
-            } else {
-                s.push(id);
-            }
-            app.ui.layer_anchor = Some(id);
-            app.run("select.set", json!({"ids": s}));
-        } else {
-            app.ui.layer_anchor = Some(id);
-            app.run("select.set", json!({"ids": [id]}));
-        }
-        // A click in the panel needs no reveal scroll.
-        app.ui.layers_seen_sel = app.session.selection();
-        if let Ok(ds) = app.session.ds_mut()
-            && ds.text_edit.is_some()
-        {
-            let _ = figcraft_engine::textedit::end(&mut app.session);
-        }
+        select_clicked(app, &rows, &sel, id, m);
     }
     let _ = Color32::TRANSPARENT;
 }

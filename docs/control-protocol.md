@@ -29,6 +29,8 @@ active connections**; additional connections are closed immediately. Socket read
 have a **60 s inactivity timeout**, so idle clients and clients that stop reading release their
 worker. This bounds blocked socket operations, not the total duration of a frame arriving slowly.
 Clients can reconnect after an idle timeout (the attached MCP backend already does).
+Replies have no size limit on the app's side. The attached MCP backend reads them up to **512 MiB
+before the newline** and drops the connection on a longer one (see [MCP server](mcp.md)).
 
 Both the socket queue and the UI queue hold at most **8 requests** each, including requests waiting
 for another window's frame. A full socket queue replies with `"control request queue is full"`
@@ -122,6 +124,26 @@ it and duplicate it:
 ### `engine.commands {}`
 
 Every command: `[{id, label, params, menu, shortcut, undoable}]`.
+
+### `events.poll {after?, timeoutMs?, topics?, limit?}`
+
+Wait for live changes: the app's in-memory event log records `comment.added`, `comment.replied`,
+`comment.edited`, `comment.reacted`, `comment.resolved`, `comment.moved` and `comment.deleted`
+(`topics`: `comments` (default), `document`, `all`). Only comment events are emitted today;
+`document` and `all` are accepted for forward compatibility. Returns pending events after `after`
+at once, otherwise waits up to `timeoutMs` (default 20 000, max 25 000; 0 = no wait):
+
+```json
+{"id":1,"method":"events.poll","params":{"after":41,"timeoutMs":20000}}
+{"id":1,"ok":true,"result":{"events":[{"seq":42,"kind":"comment.added","document":"Checkout","path":"…","data":{"commentId":12}}],"cursor":42,"reset":false,"dropped":0}}
+```
+
+`cursor` is the sequence to pass next; `reset: true` means `after` is ahead of the log (the app
+restarted) and the caller should re-read the comments; `dropped` counts events lost because `after`
+is older than the retained window (1024 events). The method is answered by the control worker
+against the shared log, not by the UI thread, so it does not freeze the app, use a request slot, or
+need a drawn frame: it works while the window is minimised. Other requests on the same connection
+wait until the poll finishes (at most 25 s); use a separate connection to keep editing meanwhile.
 
 ### `document.inspect {depth?, allPages?}`
 

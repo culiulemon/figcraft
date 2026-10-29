@@ -21,7 +21,15 @@ fn initialize_negotiates_versions() {
         let caps = &r["result"]["capabilities"];
         assert!(caps["tools"].is_object() && caps["resources"].is_object() && caps["prompts"].is_object());
         let ins = r["result"]["instructions"].as_str().unwrap();
-        assert!(ins.contains("y DOWN") && ins.contains("RELATIVE TO THE PARENT") && ins.contains("list_commands") && ins.contains("screenshot"));
+        assert!(
+            ins.contains("y DOWN")
+                && ins.contains("RELATIVE TO THE PARENT")
+                && ins.contains("list_commands")
+                && ins.contains("screenshot")
+                && ins.contains("comment.list")
+                && ins.contains("wait_for_changes")
+                && ins.contains("figcraft://comments")
+        );
         assert!(!s.is_initialized());
         assert!(s.handle_line(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none());
         assert!(s.is_initialized());
@@ -113,7 +121,7 @@ fn resources_and_templates() {
     let mut c = Client::new();
     let list = c.rpc("resources/list", json!({}));
     let uris: Vec<&str> = list["result"]["resources"].as_array().unwrap().iter().map(|r| r["uri"].as_str().unwrap()).collect();
-    assert!(uris.contains(&"figcraft://document"));
+    assert!(uris.contains(&"figcraft://document") && uris.contains(&"figcraft://comments"));
     let t = c.rpc("resources/templates/list", json!({}));
     let tpl: Vec<&str> = t["result"]["resourceTemplates"].as_array().unwrap().iter().map(|r| r["uriTemplate"].as_str().unwrap()).collect();
     assert_eq!(tpl, ["figcraft://node/{id}", "figcraft://command/{id}"]);
@@ -127,6 +135,18 @@ fn resources_and_templates() {
     assert_eq!(n["name"], "Hero");
     let r = c.rpc("resources/read", json!({"uri": "figcraft://command/layout.add"}));
     assert!(r["result"]["contents"][0]["text"].as_str().unwrap().contains("Add auto layout"));
+    // Open comments are a resource; resolving one removes it.
+    c.run("comment.add", json!({"x": 20, "y": 30, "text": "Fix the padding", "anchor": id}));
+    let r = c.rpc("resources/read", json!({"uri": "figcraft://comments"}));
+    let comments: Value = serde_json::from_str(r["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(comments["comments"].as_array().unwrap().len(), 1);
+    assert_eq!(comments["comments"][0]["text"], "Fix the padding");
+    assert_eq!(comments["comments"][0]["anchor"], id);
+    let cid = comments["comments"][0]["id"].clone();
+    c.run("comment.resolve", json!({"id": cid}));
+    let r = c.rpc("resources/read", json!({"uri": "figcraft://comments"}));
+    let comments: Value = serde_json::from_str(r["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(comments["comments"].as_array().unwrap().is_empty());
     for bad in ["figcraft://node/123456", "figcraft://node/xyz", "figcraft://command/nope", "http://example.com"] {
         assert_eq!(c.rpc("resources/read", json!({"uri": bad}))["error"]["code"], -32002, "{bad}");
     }
@@ -138,7 +158,7 @@ fn prompts_list_and_get() {
     let mut c = Client::new();
     let r = c.rpc("prompts/list", json!({}));
     let names: Vec<&str> = r["result"]["prompts"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["mobile_screen", "design_system", "landing_page", "prototype_flow"]);
+    assert_eq!(names, ["mobile_screen", "design_system", "landing_page", "prototype_flow", "fix_comments", "watch_comments"]);
     let r = c.rpc("prompts/get", json!({"name": "mobile_screen", "arguments": {"screen": "login"}}));
     let text = r["result"]["messages"][0]["content"]["text"].as_str().unwrap();
     assert!(text.contains("login") && text.contains("iPhone 16") && text.contains("#3B5BDB") && !text.contains("{device}"));
@@ -147,6 +167,32 @@ fn prompts_list_and_get() {
     assert_eq!(c.rpc("prompts/get", json!({"name": "landing_page", "arguments": {"product": ["x"]}}))["error"]["code"], -32602);
     let r = c.rpc("prompts/get", json!({"name": "prototype_flow"}));
     assert!(r["result"]["messages"][0]["content"]["text"].as_str().unwrap().contains("Home, Details, Checkout"));
+    let r = c.rpc("prompts/get", json!({"name": "fix_comments", "arguments": {"auto_resolve": "no", "author": "Ada"}}));
+    let text = r["result"]["messages"][0]["content"]["text"].as_str().unwrap();
+    assert!(text.contains("comment.list") && text.contains("comment.resolve") && text.contains("Ada"));
+    assert!(text.contains("\"all\"") && text.contains("\"no\""));
+    assert!(!text.contains("{page}") && !text.contains("{auto_resolve}") && !text.contains("{author}"));
+    let r = c.rpc("prompts/get", json!({"name": "watch_comments", "arguments": {"minutes": "3"}}));
+    let text = r["result"]["messages"][0]["content"]["text"].as_str().unwrap();
+    assert!(text.contains("wait_for_changes") && text.contains("3 minutes") && !text.contains("{minutes}"));
+    assert!(text.contains("latest message") && text.contains("your own reply"), "{text}");
+    assert!(text.contains("dropped") && text.contains("cursor was 0"), "{text}");
+}
+
+#[test]
+fn wait_for_changes_reads_comment_events_headless() {
+    let mut c = Client::new();
+    let id = c.create(json!({"type": "frame", "width": 100, "height": 100}));
+    let comment = c.run("comment.add", json!({"x": 10, "y": 10, "text": "Fix", "anchor": id}));
+    let cid = comment["id"].clone();
+    let r = c.ok("wait_for_changes", json!({"after": 0, "timeoutMs": 0}));
+    assert_eq!(r["events"].as_array().unwrap().len(), 1);
+    assert_eq!(r["events"][0]["kind"], "comment.added");
+    assert_eq!(r["events"][0]["data"]["commentId"], cid);
+    let cursor = r["cursor"].as_u64().unwrap();
+    let r = c.ok("wait_for_changes", json!({"after": cursor, "timeoutMs": 0}));
+    assert!(r["events"].as_array().unwrap().is_empty());
+    assert!(c.err("wait_for_changes", json!({"topics": ["nope"]})).contains("unknown topic"));
 }
 
 #[test]

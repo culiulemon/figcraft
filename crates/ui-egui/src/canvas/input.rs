@@ -1,4 +1,4 @@
-use super::*;
+use super::{FigApp, Point, PointerKind, Pos2, Rect, Ui, json, pointer_event};
 
 /// The zoom tool while Z is held (Alt: zoom out): a click zooms a step about the pointer, a drag
 /// zooms to the dragged area. Takes the pointer from the other tools while it's active.
@@ -25,30 +25,7 @@ fn zoom_tool(app: &mut FigApp, ui: &Ui, resp: &egui::Response, pos: Pos2, mods: 
     true
 }
 
-/// The pointer and keys on the canvas. False when something on it with a cursor of its own has
-/// the pointer (a comment pin, a ruler guide, a gradient or padding handle): the tool's cursor
-/// then doesn't show.
-pub(super) fn input(app: &mut FigApp, ui: &mut Ui, resp: &egui::Response) -> bool {
-    if crate::proto_canvas::input(app, ui, resp) {
-        // A prototype gesture is a press on the canvas too: the Pages list gives up the keyboard.
-        app.ui.pages_focus = None;
-        return true;
-    }
-    let ctx = ui.ctx().clone();
-    // Two fingers pan as well as pinch (a touch screen has no scroll wheel).
-    let (mods, scroll, zoom_delta, hover_pos, space) = ctx.input(|i| {
-        let pan = i.multi_touch().map_or(egui::Vec2::ZERO, |m| m.translation_delta);
-        (i.modifiers, i.smooth_scroll_delta + pan, i.zoom_delta(), i.pointer.hover_pos(), i.key_down(egui::Key::Space))
-    });
-    let editing_text = app.session.ds().map(|d| d.text_edit.is_some()).unwrap_or(false);
-    let typing_elsewhere = crate::a11y::field_focused(&ctx);
-    app.canvas.space_pan = space && !editing_text && !typing_elsewhere;
-    if !app.canvas.dragging && crate::selection_spacing::input(app, &ctx, hover_pos, resp.hovered(), app.canvas.space_pan) {
-        return false;
-    }
-    // Dropped files import onto the canvas, behind a card while they do ([`crate::pending_open`]);
-    // a dropped document opens as a file of its own, as on the home screen. Dev Mode imports
-    // nothing into the design, and says so once for the whole drop.
+fn import_dropped(app: &mut FigApp, ctx: &egui::Context, hover_pos: Option<egui::Pos2>) {
     let dropped = ctx.input(|i| i.raw.dropped_files.clone());
     let mut refused = false;
     for f in dropped {
@@ -75,6 +52,33 @@ pub(super) fn input(app: &mut FigApp, ui: &mut Ui, resp: &egui::Response) -> boo
         };
         app.ui.pending_opens.push(crate::pending_open::PendingOpen { label: name, params, command: "file.import", target: Some(target), read });
     }
+}
+
+/// The pointer and keys on the canvas. False when something on it with a cursor of its own has
+/// the pointer (a comment pin, a ruler guide, a gradient or padding handle): the tool's cursor
+/// then doesn't show.
+pub(super) fn input(app: &mut FigApp, ui: &mut Ui, resp: &egui::Response) -> bool {
+    if crate::proto_canvas::input(app, ui, resp) {
+        // A prototype gesture is a press on the canvas too: the Pages list gives up the keyboard.
+        app.ui.pages_focus = None;
+        return true;
+    }
+    let ctx = ui.ctx().clone();
+    // Two fingers pan as well as pinch (a touch screen has no scroll wheel).
+    let (mods, scroll, zoom_delta, hover_pos, space) = ctx.input(|i| {
+        let pan = i.multi_touch().map_or(egui::Vec2::ZERO, |m| m.translation_delta);
+        (i.modifiers, i.smooth_scroll_delta + pan, i.zoom_delta(), i.pointer.hover_pos(), i.key_down(egui::Key::Space))
+    });
+    let editing_text = app.session.ds().map(|d| d.text_edit.is_some()).unwrap_or(false);
+    let typing_elsewhere = crate::a11y::field_focused(&ctx);
+    app.canvas.space_pan = space && !editing_text && !typing_elsewhere;
+    if !app.canvas.dragging && crate::selection_spacing::input(app, &ctx, hover_pos, resp.hovered(), app.canvas.space_pan) {
+        return false;
+    }
+    // Dropped files import onto the canvas, behind a card while they do ([`crate::pending_open`]);
+    // a dropped document opens as a file of its own, as on the home screen. Dev Mode imports
+    // nothing into the design, and says so once for the whole drop.
+    import_dropped(app, &ctx, hover_pos);
     let Some(pos) = hover_pos.filter(|p| app.canvas.rect.contains(*p)) else {
         // A drag released off the canvas, or off the window, ends where the pointer was last seen.
         if app.canvas.dragging && !ctx.input(|i| i.pointer.primary_down()) {
@@ -179,6 +183,21 @@ pub(super) fn input(app: &mut FigApp, ui: &mut Ui, resp: &egui::Response) -> boo
     let primary_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
     let primary_down = ctx.input(|i| i.pointer.primary_down());
     let primary_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+    // The press and the release carry their own positions: both in one frame (a quick click or a
+    // slow frame) would otherwise send the press from the hover position the pointer ended at.
+    let (press_pos, release_pos) = ctx.input(|i| {
+        let (mut press, mut release) = (None, None);
+        for e in &i.events {
+            if let egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, .. } = e {
+                if *pressed {
+                    press = Some(*pos);
+                } else {
+                    release = Some(*pos);
+                }
+            }
+        }
+        (press, release)
+    });
     let kind = if primary_pressed && resp.hovered() {
         app.canvas.dragging = true;
         app.ui.context_menu = None;
@@ -217,13 +236,14 @@ pub(super) fn input(app: &mut FigApp, ui: &mut Ui, resp: &egui::Response) -> boo
         app.canvas.pressure = force;
     }
     if let Some(k) = kind {
-        send(app, k, pos, &mods);
+        let at = if matches!(k, PointerKind::Down) { press_pos.unwrap_or(pos) } else { pos };
+        send(app, k, at, &mods);
         // The pointer also let go within this frame (a quick click, or a slow frame): the tools get
         // the release too, so the press's gesture ends — a quick click with a shape tool still
         // draws and returns to Move, and a double-click right after drawing finds the Move tool.
         if matches!(k, PointerKind::Down) && primary_released {
             app.canvas.dragging = false;
-            send(app, PointerKind::Up, pos, &mods);
+            send(app, PointerKind::Up, release_pos.unwrap_or(pos), &mods);
         }
     }
     true
@@ -243,16 +263,21 @@ fn send(app: &mut FigApp, kind: PointerKind, pos: Pos2, m: &egui::Modifiers) {
 }
 
 /// Right-click at screen `pos`: select what's under the pointer (`deep`: the nested layer), then
-/// open the context menu there.
+/// open the context menu there. A frame's name label counts as the frame, as on a press, so a
+/// label drawn over its section picks the frame, not the section behind it. A layer that is
+/// already selected keeps the whole selection.
 pub fn open_context_menu(app: &mut FigApp, pos: Pos2, deep: bool) {
     let p = app.to_page(pos);
     if let Ok(ds) = app.session.ds() {
         let (doc, page, sel, zoom) = (ds.doc.clone(), ds.page, ds.selection.clone(), ds.view.zoom.max(1e-6));
-        if let Some(leaf) = app.session.hit(&doc, page, p, 2.0 / zoom) {
-            let target = figcraft_doc::geometry::select_target(&doc, leaf, &sel, deep);
-            if !sel.contains(&target) {
-                app.session.set_selection(vec![target]);
-            }
+        // A frame's name label is the frame, as on a press, even where it sits over a section.
+        let label = figcraft_engine::tools::label_at(&doc, page, &app.session.tool.labels, p);
+        let hit = app.session.hit(&doc, page, p, 2.0 / zoom);
+        let target = label.or_else(|| hit.map(|leaf| figcraft_doc::geometry::select_target(&doc, leaf, &sel, deep)));
+        if let Some(target) = target
+            && !sel.contains(&target)
+        {
+            app.session.set_selection(vec![target]);
         }
     }
     app.ui.context_menu = Some((pos, app.session.selection()));

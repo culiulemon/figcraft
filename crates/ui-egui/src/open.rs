@@ -1,7 +1,7 @@
 #[cfg(target_arch = "wasm32")]
 use super::services::browser_can_read;
 use super::services::{ReadFuture, unreadable};
-use super::*;
+use super::{OsStr, Path, theme};
 
 /// The file types File ▸ Open and a drop on the home screen open.
 pub(crate) const OPEN_EXTENSIONS: &[&str] = &["figcraft", "fig", "sketch", "json", "svg", "png", "jpg", "jpeg", "webp", "gif", "tif", "tiff"];

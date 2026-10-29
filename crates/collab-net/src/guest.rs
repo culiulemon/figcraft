@@ -1,7 +1,8 @@
 //! Joining a session: the client end of the transport, with reconnect.
 //!
 //! A supervisor thread connects, says hello, then writes (presence throttled to about 30 a
-//! second, latest wins; a ping when quiet) while a reader thread takes in what the host sends.
+//! second, latest wins; a ping every keep-alive interval) while a reader thread takes in what the
+//! host sends.
 //! When the connection drops after having been live, it reconnects with growing pauses; a
 //! refusal or the host ending the session is final.
 //!
@@ -280,13 +281,15 @@ fn session(
             }
         }
     };
-    let mut last_sent = Instant::now();
+    // A ping every keep-alive interval, whatever else is sent: presence gets no answer, and the
+    // reader counts only what the host sends.
+    let mut last_ping = Instant::now();
     let hello = hello(cfg, resume);
     let mut welcomed = false;
     let mut throttle = Throttle::new(PRESENCE_INTERVAL);
-    let outcome = if send(&mut writer, &hello, &mut last_sent) {
+    let outcome = if send(&mut writer, &hello) {
         loop {
-            let ping_at = last_sent + cfg.limits.keepalive;
+            let ping_at = last_ping + cfg.limits.keepalive;
             let wake = earliest([throttle.due(), Some(ping_at)]).unwrap_or(ping_at);
             let mut out = None;
             let mut now_send = Vec::new();
@@ -312,16 +315,17 @@ fn session(
                 Ok(Cmd::Welcomed(_) | Cmd::Lost(..)) => {}
                 Err(RecvTimeoutError::Timeout) => {}
             }
-            if !now_send.iter().all(|m| send(&mut writer, m, &mut last_sent)) {
+            if !now_send.iter().all(|m| send(&mut writer, m)) {
                 break Outcome::Retry("the connection dropped".into());
             }
             let now = Instant::now();
             let out = out.or_else(|| throttle.take_due(now));
-            let ok = match out {
-                Some(p) => send(&mut writer, &ClientMsg::Presence(p), &mut last_sent),
-                None if now >= last_sent + cfg.limits.keepalive => send(&mut writer, &ClientMsg::Ping, &mut last_sent),
-                None => true,
-            };
+            let ok = out.is_none_or(|p| send(&mut writer, &ClientMsg::Presence(p)));
+            let ok = ok
+                && (now < last_ping + cfg.limits.keepalive || {
+                    last_ping = now;
+                    send(&mut writer, &ClientMsg::Ping)
+                });
             if !ok {
                 break Outcome::Retry("the connection dropped".into());
             }
@@ -335,8 +339,7 @@ fn session(
 }
 
 /// Send one message; false when the connection is gone.
-fn send(ws: &mut WebSocket<Duplex>, msg: &ClientMsg, last_sent: &mut Instant) -> bool {
-    *last_sent = Instant::now();
+fn send(ws: &mut WebSocket<Duplex>, msg: &ClientMsg) -> bool {
     message::encode(msg).is_ok_and(|b| ws.send(Message::Binary(Bytes::from(b))).is_ok())
 }
 

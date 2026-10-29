@@ -1,5 +1,8 @@
 use super::menu::{menu_item, menu_popup, row};
-use super::*;
+use super::{
+    Align2, Color32, CornerRadius, Document, ExportFormat, ExportSetting, FigApp, Icon, Id, NodeId, PAD, Paint, Rect, Sense, Stroke, Tip, Tokens, Ui,
+    a11y, icons, pos2, regular, semibold, tr, trf, vec2, widgets,
+};
 
 /// One group of inspected properties: label, value (with a swatch for colours) and the style or
 /// variable it comes from. Clicking a row copies its value.

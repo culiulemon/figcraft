@@ -27,7 +27,7 @@ pub use select_layer::open_select_layer;
 use select_layer::{SELECT_LAYER, select_layer_ask_id, select_layer_menu};
 #[cfg(test)]
 pub(crate) use tree::{AIM_REST, HOVER_DELAY, heading_for, in_triangle};
-use tree::{At, menu_frame, plain_row_hover, set_open, submenu_at};
+use tree::{At, SubmenuOptions, menu_frame, plain_row_hover, set_open, submenu_at};
 pub(crate) use tree::{forget_tree, item, separator, submenu};
 
 /// Commands the UI layer implements itself (dialogs and platform actions).
@@ -188,6 +188,11 @@ pub fn invoke(app: &mut FigApp, id: &str) {
         "collab.join" => crate::live::open_join(app, ""),
         // So is the server address for publishing (it carries the server key).
         "collab.publish" => crate::live::open_publish(app),
+        "edit.copyProperties" => {
+            if app.run(id, json!({})).is_some() {
+                app.toast(tr("Properties copied"));
+            }
+        }
         "edit.copy" | "edit.cut" => {
             let ids = app.session.selection();
             // For other apps: text layers' text, other layers as SVG; taken before a cut removes them.
@@ -403,8 +408,12 @@ pub fn popups(app: &mut FigApp, ctx: &egui::Context) {
                 }
                 ui.add_space(6.0);
                 for top in TOP_MENUS {
-                    if submenu_at(ui, Id::unique(("menu", *top)), top, tr(top), 12.0, false, &t, |ui| menu_level(app, ui, top).then_some(()))
-                        .is_some()
+                    if submenu_at(
+                        ui,
+                        SubmenuOptions { area: Id::unique(("menu", *top)), key: top, label: tr(top), gap: 12.0, constrain: false, tokens: &t },
+                        |ui| menu_level(app, ui, top).then_some(()),
+                    )
+                    .is_some()
                     {
                         close = true;
                     }

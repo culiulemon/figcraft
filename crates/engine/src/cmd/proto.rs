@@ -1,11 +1,14 @@
 //! Prototype commands: interactions, flows, settings, presenting.
 
-use figcraft_doc::proto::*;
-use figcraft_doc::*;
+use figcraft_doc::proto::{
+    Action, DeviceRotation, Easing, Expr, Flow, Interaction, MAX_DELAY_MS, MAX_EXPR_DEPTH, OverlayPosition, PrototypeSettings, Transition, Trigger,
+    walk_mut,
+};
+use figcraft_doc::{Document, NodeId, NodeKind, VariableValue, Variables};
 use serde_json::{Value, json};
 
 use super::{CommandSpec, ok};
-use crate::params::*;
+use crate::params::{boolean, color, f64_of, get, id, num, parse, req_id, req_num, req_targets, string};
 use crate::{Result, Session, bad, spec};
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -158,7 +161,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "proto.linkNotice",
             "Notice before leaving for a link",
-            "{show? (default true; false skips it)}  whether a presented prototype's Open link to a website first says that it leaves the prototype, with Open link and Cancel; kept with the preferences → {shown}",
+            "{show? (default true; false skips it)}  whether a presented prototype's Open link the viewer clicked (or fired by a key) first says that it leaves the prototype, with Open link and Cancel (a link a delay or hover fired always does); kept with the preferences → {shown}",
             false,
             |s, p| {
                 let show = boolean(p, "show").unwrap_or(true);
@@ -498,6 +501,7 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
 mod tests {
     use super::*;
     use crate::params::id_of;
+    use figcraft_doc::proto::{Direction, Overflow, ScrollPosition};
 
     fn frame(s: &mut Session, x: f64) -> NodeId {
         let r = s.execute("node.create", &json!({"type": "frame", "x": x, "y": 0, "width": 100, "height": 200})).unwrap();

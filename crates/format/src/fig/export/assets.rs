@@ -1,5 +1,8 @@
 use super::common::{layout_grid, node_field, prop_type, resolved_type, scope_name, variant_pairs};
-use super::*;
+use super::{
+    AUX, Action, Affine, Bound, Color, Exporter, Fields, Kv, LAYERS, MAX_NODES, Node, NodeId, NodeKind, Overlay, OverlayPosition, Paint, StyleKind,
+    TextData, VariableValue, arr, b, color, e, fl, guid, matrix, o, position, root_fields, s, u, xy,
+};
 
 impl<'d> Exporter<'d> {
     /// GUIDs for every layer (pages first, then depth-first), component property definitions,

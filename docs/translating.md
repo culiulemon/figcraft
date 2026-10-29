@@ -81,6 +81,24 @@ it (`crates/text/build.rs`); the commit releases pin doesn't yet (`docs/releasin
 picker leaves Georgian out. A new CJK or other non-Latin language also needs its script in
 `cjk::language`, or a built-in craft-fonts face.
 
+## Arabic draft
+
+`ar.toml` adds العربية as a draft: 1,857 UI entries, 620 command labels and 31 menu
+wordings (2,508 entries, measured 2026-10-28). Contributed by @hussain-hz with OpenAI Codex;
+not yet reviewed by a native speaker. Existing language catalogs are unchanged.
+
+The catalog uses Modern Standard Arabic, logical Unicode order, Western digits, and Arabic
+punctuation. Product names, command ids, keyboard glyphs and `{placeholders}` are preserved.
+English plural entries give only `other`, with count-neutral wording such as `عدد الطبقات: {n}`.
+This is deliberate: the current `Text::Plural` has no zero/two fields. It is not an implementation
+of Arabic's six CLDR categories; wording remains valid for 0, 1, 2 and larger integer counts.
+
+Arabic text uses the existing bidi/shaping and Arabic system-font fallback on desktop. Web builds
+require an embedded Noto Sans Arabic face to offer Arabic. The current web font budget filters
+that face out, so Arabic is not offered on the web yet. No font is added to
+this repository. The interface's panels are not mirrored; this catalog does not claim a complete
+right-to-left interface. Native review and representative in-app checks remain required.
+
 ## Adding a language
 
 1. Copy `crates/ui-egui/locales/es.toml` to `<code>.toml` (a BCP 47 code: `fr`, `pt-BR`, `ja`) and

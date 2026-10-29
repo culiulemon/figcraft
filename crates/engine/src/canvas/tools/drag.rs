@@ -2,7 +2,11 @@ use super::handles::{
     SNAP_PX, handle_at, in_quad, label_at, locked_in, on_corner_square, paints_below, resized_box, scale_factor, selection_box, selection_frame,
     shape_hint,
 };
-use super::*;
+use super::{
+    Affine, ArcHandle, ArcHint, Cursor, Document, Gesture, Guide, Handle, ImageScaleMode, LayoutMode, NodeId, NodeKind, PaintKind, Point,
+    PointerEvent, Rect, ResizeStart, Result, ScaleHint, Session, Sizing, Targets, TextAutoResize, ToolId, Vec2, move_world, roots, select_target,
+    textedit, within_slop,
+};
 
 impl Session {
     pub(super) fn move_down(&mut self, ev: &PointerEvent) -> Result<()> {
@@ -90,6 +94,10 @@ impl Session {
         let behind_sel = |t: Option<NodeId>| {
             t.is_none_or(|t| sel.iter().any(|s| *s != t && (doc.is_ancestor(t, *s) || (in_own_box(*s) && paints_below(&doc, t, *s)))))
         };
+        // What the press hit (a label or a painted layer): a click that doesn't become a drag
+        // selects just it. A press that reaches nothing above the selection uses the selection as
+        // its drag target instead; that fallback is not a clicked layer.
+        let clicked = target;
         let target = match sel.iter().copied().find(|s| !locked_in(&doc, *s)) {
             Some(first) if label.is_none() && !ev.shift && behind_sel(target) && selection_box(&doc, &sel).is_some_and(|q| in_quad(&q, ev.p())) => {
                 Some(first)
@@ -98,13 +106,18 @@ impl Session {
         };
         match target {
             Some(target) => {
-                // Clicking inside the current selection's box keeps it (drag them all).
+                // Clicking inside the current selection's box keeps it (drag them all); a click
+                // that doesn't become a drag narrows it to the clicked layer.
                 let in_sel_box = sel.len() > 1 && doc.bounds_of(&sel).is_some_and(|b| b.contains(ev.p())) && !ev.shift;
                 // Shift on a selected layer takes it out on release if the press doesn't become a
                 // drag; a drag moves the selection with it. Where no drag can start, it goes now.
                 let deselect = (ev.shift && sel.contains(&target)).then_some(target);
                 let without_target = || sel.iter().copied().filter(|x| *x != target).collect::<Vec<_>>();
-                let new_sel = if in_sel_box && (sel.contains(&target) || sel.iter().any(|s| doc.is_ancestor(*s, target))) {
+                // A release without a drag narrows the selection to the layer the press hit. A
+                // selected frame's name label sits outside the selection bounds, so it counts too.
+                let keep = clicked
+                    .filter(|c| (label.is_some() || in_sel_box) && !ev.cmd && (sel.contains(c) || sel.iter().any(|s| doc.is_ancestor(*s, *c))));
+                let new_sel = if keep.is_some() {
                     sel.clone()
                 } else if ev.shift && deselect.is_none() {
                     let mut s2 = sel.clone();
@@ -116,10 +129,13 @@ impl Session {
                     vec![target]
                 };
                 self.set_selection(new_sel.clone());
-                // Dev Mode only selects (Shift-click still deselects): nothing moves.
+                // Dev Mode only selects (Shift-click still deselects): nothing moves. No move
+                // gesture starts, so a click selects the layer it hit now instead of on release.
                 if !edits {
                     if deselect.is_some() {
                         self.set_selection(without_target());
+                    } else if let Some(k) = keep.filter(|_| sel.len() > 1) {
+                        self.set_selection(vec![k]);
                     }
                     return Ok(());
                 }
@@ -128,6 +144,9 @@ impl Session {
                 if new_sel.is_empty() || doc.node(target).is_some_and(|n| n.locked) || ids.is_empty() {
                     if deselect.is_some() {
                         self.set_selection(without_target());
+                    } else if let Some(k) = keep {
+                        // No drag can start here, so the click narrows the selection now.
+                        self.set_selection(vec![k]);
                     }
                     return Ok(());
                 }
@@ -144,7 +163,7 @@ impl Session {
                     }
                     return Err(e);
                 }
-                self.tool.gesture = Gesture::Move { start: ev.p(), ids, targets, duplicate: ev.alt, moved: false, deselect };
+                self.tool.gesture = Gesture::Move { start: ev.p(), ids, targets, duplicate: ev.alt, moved: false, deselect, keep };
                 self.tool.overlay.cursor = if ev.alt { Cursor::Copy } else { Cursor::Default };
             }
             None => {

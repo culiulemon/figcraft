@@ -17,7 +17,9 @@ use serde_json::json;
 use super::{CanvasState, shows};
 use figcraft_render::Retained;
 
-use crate::render_worker::{Done, Inline, Job, PREVIEW_AFTER_MS, PREVIEW_FACTOR, Renders, Worker, better, coarse_view, preview_with, render_now};
+use crate::render_worker::{
+    Done, Inline, Job, PREVIEW_AFTER_MS, PREVIEW_FACTOR, Renders, SETTLE_MS, Worker, better, coarse_view, preview_with, render_now,
+};
 
 /// A page of ellipses with a rectangle on top; the session and the rectangle.
 fn document() -> (Session, NodeId) {
@@ -406,8 +408,8 @@ fn the_browser_worker_previews_by_measured_render_time_then_refines_the_next_fra
     let s = slow_scene(&[view(2.0), view(1.0)], 3.0 * PREVIEW_AFTER_MS);
     let ds = s.ds().unwrap();
     let at = |scale| job(&ds.doc, ds.page, ds.uid, view(scale));
-    // The production threshold, as the browser has it.
-    let mut w = Inline::new(egui::Context::default());
+    // The production threshold, as the browser has it; refined the next frame (settling: below).
+    let mut w = Inline::with_settle(egui::Context::default(), std::time::Duration::ZERO);
     w.submit(at(2.0));
     let first = w.poll().expect("the first image");
     assert!(!first.coarse && !w.in_flight(), "the first render has no measure to preview by");
@@ -427,4 +429,104 @@ fn the_browser_worker_previews_by_measured_render_time_then_refines_the_next_fra
     assert!(p.coarse && (p.view.scale - 0.25 / PREVIEW_FACTOR).abs() < 1e-12);
     assert!(w.poll().is_some_and(|d| !d.coarse && d.view.scale == 0.25));
     assert!(w.poll().is_none() && !w.in_flight());
+}
+
+#[test]
+fn the_browser_worker_refines_a_zoom_only_once_it_settles() {
+    let view = |scale| view_at((300.0, 200.0), scale, 1200, 1200);
+    let s = slow_scene(&[view(2.0), view(1.0)], 3.0 * PREVIEW_AFTER_MS);
+    let ds = s.ds().unwrap();
+    let at = |scale| job(&ds.doc, ds.page, ds.uid, view(scale));
+    let settle = std::time::Duration::from_millis(SETTLE_MS);
+    let mut w = Inline::with_settle(egui::Context::default(), settle);
+    w.submit(at(2.0));
+    assert!(w.poll().is_some_and(|d| !d.coarse), "the first render: no preview, no wait");
+    // Zooming: each step shows its preview, never a full render in between.
+    for scale in [1.5, 1.0] {
+        w.submit(at(scale));
+        assert!(w.poll().is_some_and(|d| d.coarse));
+        assert!(w.poll().is_none() && w.in_flight(), "not refined while the zoom may go on");
+    }
+    std::thread::sleep(settle);
+    let d = w.poll().expect("refined once it settled");
+    assert!(!d.coarse && d.view.scale == 1.0 && !w.in_flight());
+    // A pan at the same zoom has no preview and is refined at once.
+    w.submit(job(&ds.doc, ds.page, ds.uid, view_at((340.0, 200.0), 1.0, 1200, 1200)));
+    assert!(w.poll().is_some_and(|d| !d.coarse));
+}
+
+/// The wait counts from the preview being shown, not from the request: rendering the preview can
+/// take longer than the wait (the page is blocked meanwhile, so no newer request could come), and
+/// counted from the request the refinement would follow in the very next frame. The time the
+/// preview's render would take is stood in for by a sleep between the request and the poll.
+#[test]
+fn the_wait_counts_from_the_preview_not_from_the_request() {
+    let view = |scale| view_at((300.0, 200.0), scale, 1200, 1200);
+    // Renders from scratch of at least the settle, so the wait is the whole settle (see the cap).
+    let s = slow_scene(&[view(2.0), view(1.0)], SETTLE_MS as f64);
+    let ds = s.ds().unwrap();
+    let at = |scale| job(&ds.doc, ds.page, ds.uid, view(scale));
+    let settle = std::time::Duration::from_millis(SETTLE_MS);
+    let mut w = Inline::with_settle(egui::Context::default(), settle);
+    w.submit(at(2.0));
+    assert!(w.poll().is_some_and(|d| !d.coarse));
+    w.submit(at(1.0));
+    std::thread::sleep(settle + std::time::Duration::from_millis(30));
+    assert!(w.poll().is_some_and(|d| d.coarse), "the preview, longer after the request than the wait");
+    assert!(w.poll().is_none() && w.in_flight(), "the wait starts only now");
+    std::thread::sleep(settle);
+    assert!(w.poll().is_some_and(|d| !d.coarse && d.view.scale == 1.0));
+}
+
+/// Until the zoom's full render has run, the kept image is of the old zoom, so a pan or an edit
+/// at the new zoom renders from scratch too: it shows a preview and restarts the wait rather than
+/// running a full render between it and the next step. Once refined, requests at that zoom build
+/// on the kept image: no preview, no wait.
+#[test]
+fn same_zoom_requests_before_the_zoom_refines_keep_waiting_and_refine_at_once_after() {
+    let view = |c, scale| view_at(c, scale, 1200, 1200);
+    let s = slow_scene(&[view((300.0, 200.0), 2.0), view((300.0, 200.0), 1.0)], 3.0 * PREVIEW_AFTER_MS);
+    let ds = s.ds().unwrap();
+    let at = |c, scale| job(&ds.doc, ds.page, ds.uid, view(c, scale));
+    let settle = std::time::Duration::from_millis(SETTLE_MS);
+    let mut w = Inline::with_settle(egui::Context::default(), settle);
+    w.submit(at((300.0, 200.0), 2.0));
+    assert!(w.poll().is_some_and(|d| !d.coarse), "the first render: no preview, no wait");
+    // A zoom step, then a pan at the new zoom before the pause: a preview each, no full render.
+    w.submit(at((300.0, 200.0), 1.0));
+    assert!(w.poll().is_some_and(|d| d.coarse));
+    assert!(w.poll().is_none() && w.in_flight());
+    w.submit(at((340.0, 200.0), 1.0));
+    assert!(w.poll().is_some_and(|d| d.coarse), "from scratch still: the kept image is of the old zoom");
+    assert!(w.poll().is_none() && w.in_flight(), "the wait starts over");
+    std::thread::sleep(settle);
+    let d = w.poll().expect("refined once it settled");
+    assert!(!d.coarse && d.view.scale == 1.0 && !w.in_flight());
+    // From then on a pan at this zoom builds on the kept image: no preview, refined at once.
+    w.submit(at((380.0, 200.0), 1.0));
+    let d = w.poll().expect("the refined image");
+    assert!(!d.coarse && !w.in_flight());
+}
+
+/// The wait never costs more than the full render it may save: a preview is refined once the
+/// last full render's time has passed when that is shorter than `SETTLE_MS`, so a key zoom or a
+/// page switch on a page whose renders are quick is not held coarse for longer than before.
+#[test]
+fn the_wait_is_capped_by_the_time_of_the_last_full_render() {
+    let view = |scale| view_at((300.0, 200.0), scale, 1200, 1200);
+    let s = slow_scene(&[view(2.0), view(1.0)], 3.0 * PREVIEW_AFTER_MS);
+    let ds = s.ds().unwrap();
+    let at = |scale| job(&ds.doc, ds.page, ds.uid, view(scale));
+    // A settle far longer than this page's renders: the wait is their time instead.
+    let settle = std::time::Duration::from_secs(10);
+    let mut w = Inline::with_settle(egui::Context::default(), settle);
+    w.submit(at(2.0));
+    let first = w.poll().expect("the first image");
+    assert!(!first.coarse && first.ms >= PREVIEW_AFTER_MS, "slow enough to preview: {} ms", first.ms);
+    w.submit(at(1.0));
+    assert!(w.poll().is_some_and(|d| d.coarse));
+    assert!(w.poll().is_none() && w.in_flight(), "not refined in the very next frame");
+    std::thread::sleep(std::time::Duration::from_secs_f64(first.ms / 1000.0));
+    let d = w.poll().expect("refined once the last full render's time has passed, not the settle");
+    assert!(!d.coarse && d.view.scale == 1.0 && !w.in_flight());
 }

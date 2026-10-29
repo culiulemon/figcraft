@@ -1,4 +1,6 @@
-use super::*;
+use super::{
+    Color32, FRAC_PI_2, FRAC_PI_4, Icon, Mesh, PI, Painter, Pos2, Rect, Shape, Stroke, TAU, Vec2, arc_pts, capsule, pos2, triangulate, vec2,
+};
 
 struct P<'a> {
     painter: &'a Painter,
@@ -190,6 +192,89 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
     draw(&p, icon);
 }
 
+/// An open hand: four fingers (the middle one tallest), then the palm and the thumb.
+fn hand(p: &P) {
+    for (x, top) in [(4.5, 5.0), (6.5, 3.5), (8.5, 4.0), (10.5, 5.5)] {
+        let mut f = vec![(x, 8.0)];
+        f.extend(arc_pts(x + 1.0, top, 1.0, PI, TAU));
+        f.push((x + 2.0, 8.0));
+        p.path(&f, false);
+    }
+    let mut h = vec![(12.5, 8.0), (12.5, 10.0)];
+    h.extend(arc_pts(9.5, 10.0, 3.0, 0.0, FRAC_PI_2));
+    h.extend([(8.0, 13.0), (3.0, 9.4)]);
+    h.extend(arc_pts(3.6, 8.6, 1.0, 2.2, 5.3));
+    h.push((4.5, 8.5));
+    p.path(&h, false);
+}
+
+/// A curve with a smooth point and its handle line.
+fn bend(p: &P) {
+    let pts: Vec<(f32, f32)> = (0..=16)
+        .map(|i| {
+            let t = i as f32 / 16.0;
+            let u = 1.0 - t;
+            (u * u * 2.5 + 2.0 * u * t * 8.0 + t * t * 13.5, u * u * 13.5 + 2.0 * u * t * 1.5 + t * t * 13.5)
+        })
+        .collect();
+    p.path(&pts, false);
+    p.line(3.0, 7.5, 13.0, 7.5);
+    p.dot(3.0, 7.5, 1.3);
+    p.dot(13.0, 7.5, 1.3);
+    p.fill_rect(7.0, 6.0, 9.0, 9.0, 0.0);
+}
+
+/// A five-pointed star, filled.
+fn star(p: &P) {
+    let pts: Vec<(f32, f32)> = (0..10)
+        .map(|i| {
+            let a = -FRAC_PI_2 + PI * i as f32 / 5.0;
+            let r = if i % 2 == 0 { 6.0 } else { 2.7 };
+            (8.0 + r * a.cos(), 8.6 + r * a.sin())
+        })
+        .collect();
+    p.path(&pts, true);
+}
+
+/// The Component icon.
+fn draw_component(p: &P) {
+    for (cx, cy) in [(8.0, 4.2), (11.8, 8.0), (8.0, 11.8), (4.2, 8.0)] {
+        p.fill(&[(cx, cy - 2.5), (cx + 2.5, cy), (cx, cy + 2.5), (cx - 2.5, cy)]);
+    }
+}
+
+/// The ComponentSet icon.
+fn draw_componentset(p: &P) {
+    for (cx, cy) in [(8.0, 4.3), (11.7, 8.0), (8.0, 11.7), (4.3, 8.0)] {
+        p.path(&[(cx, cy - 2.2), (cx + 2.2, cy), (cx, cy + 2.2), (cx - 2.2, cy)], true);
+    }
+}
+
+/// The Group icon.
+fn draw_group(p: &P) {
+    for (x, y, dx, dy) in [(2.5, 2.5, 1.0, 1.0), (13.5, 2.5, -1.0, 1.0), (2.5, 13.5, 1.0, -1.0), (13.5, 13.5, -1.0, -1.0)] {
+        p.poly(&[(x + 3.5 * dx, y), (x, y), (x, y + 3.5 * dy)], false);
+    }
+}
+
+/// The Grid/LayoutGrid icons.
+fn draw_grid_layoutgrid(p: &P) {
+    for i in [2.5, 6.5, 10.5] {
+        for j in [2.5, 6.5, 10.5] {
+            p.rect(i, j, i + 3.0, j + 3.0, 0.0);
+        }
+    }
+}
+
+/// The FlipH icon.
+fn draw_fliph(p: &P) {
+    for y in [1.0, 5.0, 9.0, 13.0] {
+        p.line(7.5, y, 7.5, y + 2.0);
+    }
+    p.poly(&[(5.5, 3.5), (5.5, 12.5), (1.5, 12.5)], true);
+    p.fill(&[(9.0, 3.0), (14.0, 13.0), (9.0, 13.0)]);
+}
+
 /// Draw `icon` on the 16-unit grid through `p`, which maps grid units to the target box.
 fn draw(p: &P, icon: Icon) {
     use Icon::*;
@@ -201,19 +286,7 @@ fn draw(p: &P, icon: Icon) {
             p.poly(&[(9.5, 2.5), (13.5, 2.5), (13.5, 6.5)], false);
         }
         Hand => {
-            // An open hand: four fingers (the middle one tallest), then the palm and the thumb.
-            for (x, top) in [(4.5, 5.0), (6.5, 3.5), (8.5, 4.0), (10.5, 5.5)] {
-                let mut f = vec![(x, 8.0)];
-                f.extend(arc_pts(x + 1.0, top, 1.0, PI, TAU));
-                f.push((x + 2.0, 8.0));
-                p.path(&f, false);
-            }
-            let mut h = vec![(12.5, 8.0), (12.5, 10.0)];
-            h.extend(arc_pts(9.5, 10.0, 3.0, 0.0, FRAC_PI_2));
-            h.extend([(8.0, 13.0), (3.0, 9.4)]);
-            h.extend(arc_pts(3.6, 8.6, 1.0, 2.2, 5.3));
-            h.push((4.5, 8.5));
-            p.path(&h, false);
+            hand(p);
         }
         Frame => {
             // Inset a unit from the box: four long hinted strokes read heavier than the
@@ -235,19 +308,7 @@ fn draw(p: &P, icon: Icon) {
             p.fill(&capsule((2.8, 13.2), (5.9, 10.1), 1.3));
         }
         Bend => {
-            // A curve with a smooth point and its handle line.
-            let pts: Vec<(f32, f32)> = (0..=16)
-                .map(|i| {
-                    let t = i as f32 / 16.0;
-                    let u = 1.0 - t;
-                    (u * u * 2.5 + 2.0 * u * t * 8.0 + t * t * 13.5, u * u * 13.5 + 2.0 * u * t * 1.5 + t * t * 13.5)
-                })
-                .collect();
-            p.path(&pts, false);
-            p.line(3.0, 7.5, 13.0, 7.5);
-            p.dot(3.0, 7.5, 1.3);
-            p.dot(13.0, 7.5, 1.3);
-            p.fill_rect(7.0, 6.0, 9.0, 9.0, 0.0);
+            bend(p);
         }
         PaintBucket => {
             p.poly(&[(2.5, 8.0), (7.5, 3.0), (12.5, 8.0), (7.5, 13.0)], true);
@@ -273,16 +334,7 @@ fn draw(p: &P, icon: Icon) {
         }
         Ellipse => p.circle(8.0, 8.0, 5.5),
         Polygon => p.poly(&[(8.0, 2.5), (13.5, 12.5), (2.5, 12.5)], true),
-        Star => {
-            let pts: Vec<(f32, f32)> = (0..10)
-                .map(|i| {
-                    let a = -FRAC_PI_2 + PI * i as f32 / 5.0;
-                    let r = if i % 2 == 0 { 6.0 } else { 2.7 };
-                    (8.0 + r * a.cos(), 8.6 + r * a.sin())
-                })
-                .collect();
-            p.path(&pts, true);
-        }
+        Star => star(p),
         Image => {
             p.rect(2.5, 3.5, 13.5, 12.5, 1.0);
             p.poly(&[(2.5, 11.5), (6.0, 8.0), (9.0, 11.0), (10.5, 9.5), (13.5, 12.5)], false);
@@ -352,22 +404,10 @@ fn draw(p: &P, icon: Icon) {
                 p.arc(13.0, 4.5, 2.5, PI, TAU);
             }
         }
-        Component => {
-            for (cx, cy) in [(8.0, 4.2), (11.8, 8.0), (8.0, 11.8), (4.2, 8.0)] {
-                p.fill(&[(cx, cy - 2.5), (cx + 2.5, cy), (cx, cy + 2.5), (cx - 2.5, cy)]);
-            }
-        }
-        ComponentSet => {
-            for (cx, cy) in [(8.0, 4.3), (11.7, 8.0), (8.0, 11.7), (4.3, 8.0)] {
-                p.path(&[(cx, cy - 2.2), (cx + 2.2, cy), (cx, cy + 2.2), (cx - 2.2, cy)], true);
-            }
-        }
+        Component => draw_component(p),
+        ComponentSet => draw_componentset(p),
         Instance => p.path(&[(8.0, 2.0), (14.0, 8.0), (8.0, 14.0), (2.0, 8.0)], true),
-        Group => {
-            for (x, y, dx, dy) in [(2.5, 2.5, 1.0, 1.0), (13.5, 2.5, -1.0, 1.0), (2.5, 13.5, 1.0, -1.0), (13.5, 13.5, -1.0, -1.0)] {
-                p.poly(&[(x + 3.5 * dx, y), (x, y), (x, y + 3.5 * dy)], false);
-            }
-        }
+        Group => draw_group(p),
         Vector => {
             p.path(&[(3.0, 12.5), (6.0, 4.0), (10.0, 12.0), (13.0, 3.5)], false);
             p.fill_rect(1.5, 11.0, 4.5, 14.0, 0.0);
@@ -413,13 +453,7 @@ fn draw(p: &P, icon: Icon) {
             p.circle(7.0, 7.0, 4.5);
             p.line(10.5, 10.5, 14.0, 14.0);
         }
-        Grid | LayoutGrid => {
-            for i in [2.5, 6.5, 10.5] {
-                for j in [2.5, 6.5, 10.5] {
-                    p.rect(i, j, i + 3.0, j + 3.0, 0.0);
-                }
-            }
-        }
+        Grid | LayoutGrid => draw_grid_layoutgrid(p),
         AlignLeft => {
             p.line(2.5, 2.0, 2.5, 14.0);
             p.fill_rect(4.0, 4.0, 13.0, 7.0, 0.0);
@@ -462,13 +496,7 @@ fn draw(p: &P, icon: Icon) {
         }
         Rotate => p.arc_arrow(8.0, 8.5, 5.0, -PI * 0.55, PI * 1.25),
         Reset => p.arc_arrow(8.0, 8.5, 5.0, -PI * 0.45, -PI * 2.25),
-        FlipH => {
-            for y in [1.0, 5.0, 9.0, 13.0] {
-                p.line(7.5, y, 7.5, y + 2.0);
-            }
-            p.poly(&[(5.5, 3.5), (5.5, 12.5), (1.5, 12.5)], true);
-            p.fill(&[(9.0, 3.0), (14.0, 13.0), (9.0, 13.0)]);
-        }
+        FlipH => draw_fliph(p),
         FlipV => {
             for x in [1.0, 5.0, 9.0, 13.0] {
                 p.line(x, 7.5, x + 2.0, 7.5);

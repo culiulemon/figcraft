@@ -8,7 +8,10 @@
 use std::sync::Arc;
 
 use egui::{Align2, Color32, CornerRadius, Id, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
-use figcraft_doc::*;
+use figcraft_doc::{
+    DecorationLength, Document, LeadingTrim, LetterSpacing, LineHeight, ListStyle, NodeId, NodeKind, TextAlignH, TextAlignV, TextAutoResize,
+    TextCase, TextData, TextDecoration, TextStyle, VariableType, trim_num,
+};
 use serde_json::{Value, json};
 
 use crate::FigApp;

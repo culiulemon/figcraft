@@ -1,4 +1,4 @@
-use super::*;
+use super::{Deserialize, Serialize};
 
 /// The canvas view of a document: what's at the centre of the viewport and the zoom.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

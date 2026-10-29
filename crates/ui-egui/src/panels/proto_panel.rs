@@ -8,7 +8,7 @@ use figcraft_doc::proto::{
     Action, ConditionalBlock, Direction, Easing, GAMEPAD_BUTTONS, Interaction, KeyMods, Overflow, OverlayAnchor, OverlayPosition, ScrollPosition,
     Transition, Trigger, is_gamepad_button,
 };
-use figcraft_doc::*;
+use figcraft_doc::{Document, Node, NodeId, NodeKind, VariableValue, proto};
 use serde_json::{Value, json};
 
 use crate::FigApp;
@@ -640,15 +640,24 @@ fn interactions(app: &mut FigApp, ui: &mut Ui, doc: &Document, page: NodeId, nod
     {
         let panel_left = ui.clip_rect().min.x;
         let y = anchor.map(|a| a.min.y).unwrap_or(ui.clip_rect().min.y + 80.0);
-        editor_popover(app, ui.ctx(), doc, page, id, k, it, pos2(panel_left - 8.0, y));
+        editor_popover(app, ui.ctx(), InteractionPopover { doc, page, node: id, index: k, interaction: it, anchor: pos2(panel_left - 8.0, y) });
     } else if open.is_some_and(|(n, _)| n == id) {
         open_editor(ui.ctx(), None);
     }
 }
 
 /// The interaction editor, floating left of the panel (`at` is its top-right corner).
-#[allow(clippy::too_many_arguments)]
-fn editor_popover(app: &mut FigApp, ctx: &egui::Context, doc: &Document, page: NodeId, node: NodeId, k: usize, it: &Interaction, at: Pos2) {
+struct InteractionPopover<'a> {
+    doc: &'a Document,
+    page: NodeId,
+    node: NodeId,
+    index: usize,
+    interaction: &'a Interaction,
+    anchor: Pos2,
+}
+
+fn editor_popover(app: &mut FigApp, ctx: &egui::Context, popover: InteractionPopover<'_>) {
+    let InteractionPopover { doc, page, node, index: k, interaction: it, anchor: at } = popover;
     let t = Tokens::get(ctx);
     let width = 280.0;
     let screen = ctx.content_rect();
@@ -832,17 +841,20 @@ fn trigger_rows(app: &mut FigApp, ui: &mut Ui, node: NodeId, k: usize, it: &Inte
 const PAD_MENU_W: f32 = 92.0;
 
 /// A destination picker for the action at `slot`: `make` builds the action for the destination.
-#[allow(clippy::too_many_arguments)]
-fn dest_dropdown(
-    app: &mut FigApp,
-    ui: &mut Ui,
-    doc: &Document,
-    options: &[NodeId],
-    cur: Option<NodeId>,
-    label: &str,
-    make: impl Fn(NodeId) -> Action,
-    slot: &Slot,
-) {
+struct DestinationPicker<'a, Make> {
+    doc: &'a Document,
+    options: &'a [NodeId],
+    current: Option<NodeId>,
+    label: &'a str,
+    make: Make,
+    slot: &'a Slot,
+}
+
+fn dest_dropdown<Make>(app: &mut FigApp, ui: &mut Ui, picker: DestinationPicker<'_, Make>)
+where
+    Make: Fn(NodeId) -> Action,
+{
+    let DestinationPicker { doc, options, current: cur, label, make, slot } = picker;
     widgets::sublabels(ui, label, None);
     row(ui, 32.0, |ui| {
         let text = cur.map(|d| name_of(doc, d)).unwrap_or_else(|| tr("None").into());
@@ -871,22 +883,45 @@ pub(crate) fn action_fields(app: &mut FigApp, ui: &mut Ui, doc: &Document, page:
         Action::Navigate { dest, preserve_scroll } => {
             let (dest, preserve_scroll) = (*dest, *preserve_scroll);
             let mk = |d| Action::Navigate { dest: d, preserve_scroll };
-            dest_dropdown(app, ui, doc, &nav_targets(doc, page), Some(dest), tr("Destination"), mk, slot);
+            dest_dropdown(
+                app,
+                ui,
+                DestinationPicker { doc, options: &nav_targets(doc, page), current: Some(dest), label: tr("Destination"), make: mk, slot },
+            );
             row(ui, 28.0, |ui| {
                 if widgets::checkbox(ui, preserve_scroll, tr("Preserve scroll position")) {
                     set_action(app, slot, Action::Navigate { dest, preserve_scroll: !preserve_scroll });
                 }
             });
         }
-        Action::SwapOverlay { dest } => dest_dropdown(app, ui, doc, &frames, Some(*dest), tr("Overlay"), |d| Action::SwapOverlay { dest: d }, slot),
+        Action::SwapOverlay { dest } => dest_dropdown(
+            app,
+            ui,
+            DestinationPicker { doc, options: &frames, current: Some(*dest), label: tr("Overlay"), make: |d| Action::SwapOverlay { dest: d }, slot },
+        ),
         Action::ChangeTo { dest } => {
             let vs = variants_for(doc, node);
-            dest_dropdown(app, ui, doc, &vs, Some(*dest), tr("Variant"), |d| Action::ChangeTo { dest: d }, slot);
+            dest_dropdown(
+                app,
+                ui,
+                DestinationPicker { doc, options: &vs, current: Some(*dest), label: tr("Variant"), make: |d| Action::ChangeTo { dest: d }, slot },
+            );
         }
         Action::ScrollTo { dest, offset } => {
             let (dest, offset) = (*dest, *offset);
             let layers: Vec<NodeId> = doc.top_level_frame(node).map(|f| doc.subtree(f).into_iter().skip(1).take(400).collect()).unwrap_or_default();
-            dest_dropdown(app, ui, doc, &layers, Some(dest), tr("Scroll to layer"), move |d| Action::ScrollTo { dest: d, offset }, slot);
+            dest_dropdown(
+                app,
+                ui,
+                DestinationPicker {
+                    doc,
+                    options: &layers,
+                    current: Some(dest),
+                    label: tr("Scroll to layer"),
+                    make: move |d| Action::ScrollTo { dest: d, offset },
+                    slot,
+                },
+            );
             // Where the layer ends up from the top-left of what scrolls (room for a fixed header).
             widgets::sublabels(ui, tr("Offset"), None);
             row(ui, 32.0, |ui| {
@@ -920,7 +955,7 @@ pub(crate) fn action_fields(app: &mut FigApp, ui: &mut Ui, doc: &Document, page:
         Action::OpenOverlay { dest, position, close_on_outside, background, offset, anchor } => {
             let (dest, position, close_on_outside, background, offset, anchor) = (*dest, *position, *close_on_outside, *background, *offset, *anchor);
             let mk = move |d: NodeId| Action::OpenOverlay { dest: d, position, close_on_outside, background, offset, anchor };
-            dest_dropdown(app, ui, doc, &frames, Some(dest), tr("Overlay"), mk, slot);
+            dest_dropdown(app, ui, DestinationPicker { doc, options: &frames, current: Some(dest), label: tr("Overlay"), make: mk, slot });
             widgets::sublabels(ui, tr("Overlay position"), None);
             row(ui, 32.0, |ui| {
                 let resp = widgets::dropdown(ui, tr(position.label()), ui.available_width(), None);

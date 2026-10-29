@@ -630,63 +630,82 @@ fn imports_the_fixture() {
     assert!(is_fig(&bytes));
     let (doc, warnings) = import(&bytes, "fallback").unwrap();
     assert_eq!(doc.name, "Fixture");
+    assert_fixture_layers(&doc);
+    assert_fixture_styles(&doc);
+    assert_fixture_variables(&doc);
+    assert_fixture_components(&doc);
+    assert_fixture_prototype(&doc, &warnings);
+}
+
+fn assert_fixture_layers(doc: &Document) {
     // The internal page is skipped.
     assert_eq!(doc.pages.len(), 1);
     let page = doc.node(doc.pages[0]).unwrap();
     assert_eq!(page.name, "Page A");
     // Siblings by position: the frame comes first even though it's listed after the component.
     assert_eq!(doc.node(page.children[0]).unwrap().name, "Screen");
-    let screen = named(&doc, "Screen");
+    let screen = named(doc, "Screen");
     let names: Vec<&str> = screen.children.iter().map(|c| doc.node(*c).unwrap().name.as_str()).collect();
     assert_eq!(names, ["Photo", "Title", "Group", "Styled", "Card", "Button copy", "Note"]);
     // Image fill from the archive.
-    let photo = named(&doc, "Photo");
+    let photo = named(doc, "Photo");
     let figcraft_doc::color::PaintKind::Image(img) = &photo.fills[0].kind else { panic!("not an image fill") };
     assert_eq!(doc.images.get(&img.image).map(|i| (i.width, i.height)), Some((2, 1)));
     assert_eq!((photo.corners.radii[0], photo.stroke.weight), (6.0, 2.0));
     // Text with a bold run over "the".
-    let NodeKind::Text(t) = &named(&doc, "Title").kind else { panic!("not text") };
+    let NodeKind::Text(t) = &named(doc, "Title").kind else { panic!("not text") };
     assert_eq!(t.characters, "Hi there");
     assert_eq!(t.style.font_size, 16.0);
     assert_eq!(t.leading_trim, figcraft_doc::LeadingTrim::CapHeight, "vertical trim (#466)");
     assert_eq!(t.runs.len(), 1);
     assert_eq!((t.runs[0].start, t.runs[0].end, t.runs[0].style.font_style.as_str()), (3, 6, "Bold"));
     // The group's children keep their place on the page (group at 100, 100).
-    assert!(matches!(named(&doc, "Group").kind, NodeKind::Group));
-    let tri = named(&doc, "Tri");
+    assert!(matches!(named(doc, "Group").kind, NodeKind::Group));
+    let tri = named(doc, "Tri");
     assert!(matches!(&tri.kind, NodeKind::Vector { network } if !network.regions.is_empty()));
     let abs = doc.world_transform(tri.id).translation();
     assert!((abs.x - 105.0).abs() < 1e-6 && (abs.y - 106.0).abs() < 1e-6, "{abs:?}");
-    assert!(matches!(named(&doc, "Star").kind, NodeKind::Star { count: 6, .. }));
-    // The linked style supplies the paint.
-    let styled = named(&doc, "Styled");
+    assert!(matches!(named(doc, "Star").kind, NodeKind::Star { count: 6, .. }));
+}
+
+fn assert_fixture_styles(doc: &Document) {
+    let styled = named(doc, "Styled");
     assert_eq!(styled.styles.fill.as_deref(), Some("1:3"));
     assert!(doc.styles.iter().any(|s| s.name == "Brand"));
     let figcraft_doc::color::PaintKind::Solid { color } = styled.fills[0].kind else { panic!("not solid") };
     assert_eq!((color.r, color.g, color.b), (0.0, 0.0, 1.0));
-    // Variables, the fill binding and the explicit mode.
+}
+
+fn assert_fixture_variables(doc: &Document) {
+    let screen = named(doc, "Screen");
     assert_eq!(doc.variables.collections.len(), 1);
     assert_eq!(doc.variables.variables[0].kind, VariableType::Color);
-    assert_eq!(named(&doc, "Card").bound.get("fill").map(String::as_str), Some("1:5"));
+    assert_eq!(named(doc, "Card").bound.get("fill").map(String::as_str), Some("1:5"));
     assert_eq!(screen.var_modes.get("1:4").map(String::as_str), Some("1:91"));
-    // The component keeps its property; the instance is expanded with the value applied.
-    let button = named(&doc, "Button");
+}
+
+fn assert_fixture_components(doc: &Document) {
+    let button = named(doc, "Button");
     assert!(matches!(&button.kind, NodeKind::Component { props, .. } if props.contains_key("Show icon")));
-    let inst = named(&doc, "Button copy");
+    let inst = named(doc, "Button copy");
     assert!(
         matches!(&inst.kind, NodeKind::Instance { component, props } if *component == button.id && props.get("Show icon") == Some(&Value::Bool(false)))
     );
     let icon = doc.node(inst.children[0]).unwrap();
     assert_eq!(icon.name, "Renamed icon");
     assert!(!icon.visible);
-    // Prototype: the click navigates to the component; the flow starts at the screen.
-    let it = &photo.interactions[0];
+}
+
+fn assert_fixture_prototype(doc: &Document, warnings: &[String]) {
+    let button = named(doc, "Button");
+    let screen = named(doc, "Screen");
+    let it = &named(doc, "Photo").interactions[0];
     assert!(matches!(it.actions[0], figcraft_doc::proto::Action::Navigate { dest, .. } if dest == button.id));
     assert_eq!(it.duration_ms, 250);
     let Some(NodeKind::Page { flows, .. }) = doc.node(doc.pages[0]).map(|p| &p.kind) else { panic!("no page") };
     assert_eq!((flows[0].name.as_str(), flows[0].start), ("Main flow", screen.id));
     // The sticky note comes in as a frame, with a warning.
-    assert!(matches!(named(&doc, "Note").kind, NodeKind::Frame));
+    assert!(matches!(named(doc, "Note").kind, NodeKind::Frame));
     assert!(warnings.iter().any(|w| w.contains("sticky layers import as frames")), "{warnings:?}");
 }
 
@@ -756,6 +775,23 @@ fn a_data_blob_past_the_blobs_stays_a_placeholder() {
     let c = canvas(&schema(), &message_with_image_in_blobs(5));
     let (_, warnings) = import(&c, "Pasted").unwrap();
     assert!(warnings.iter().any(|w| w.contains("isn't in the file")), "{warnings:?}");
+}
+
+/// A file can point any number of image hashes at one large blob; each used to get its own copy
+/// of it (#1059).
+#[test]
+fn hashes_naming_one_blob_share_one_copy_of_it() {
+    let image = |hash: u8, blob: u64| o(vec![("image", o(vec![("hash", Kv::Bytes(vec![hash; 20])), ("dataBlob", u(blob))]))]);
+    let msg = o(vec![
+        ("blobs", Kv::Array(vec![o(vec![("bytes", Kv::Bytes(png()))]), o(vec![("bytes", Kv::Bytes(vec![7; 16]))])])),
+        ("nodeChanges", Kv::Array((1..=50).map(|h| image(h, 0)).chain([image(99, 1), image(98, 2)]).collect())),
+    ]);
+    let copies = embedded_copies(&msg);
+    assert_eq!(copies.len(), 51, "the hash naming no blob is left out");
+    let first = &copies[&"01".repeat(20)];
+    assert_eq!(**first, *png());
+    assert_eq!(copies.values().filter(|c| Arc::ptr_eq(c, first)).count(), 50);
+    assert_eq!(*copies[&"63".repeat(20)], [7; 16]);
 }
 
 #[test]

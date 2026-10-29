@@ -1,4 +1,4 @@
-use super::*;
+use super::{Document, Gesture, Node, NodeId, Overlay, Point, PointerEvent, PointerKind, Result, Session, ShapeHandle, ToolId, json, textedit};
 
 impl Session {
     /// Keys the current mode handles before menu shortcuts (vector edit mode's tools and point

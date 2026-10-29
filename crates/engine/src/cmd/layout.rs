@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use super::props::sizing;
 use super::{CommandSpec, ok};
-use crate::params::*;
+use crate::params::{get, num, req_num, req_targets, string};
 use crate::{Result, Session, bad, spec};
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -179,6 +179,19 @@ mod tests {
         ex(&mut s, "node.set", json!({"id": f, "props": {"paddingTop": -5}}));
         assert_eq!(node(&s, f).layout.as_ref().unwrap().padding[0], 0.0);
         assert!(s.execute("node.set", &json!({"id": f, "props": {"paddingLeft": "wide"}})).is_err());
+    }
+
+    #[test]
+    fn junk_axis_padding_is_refused_and_keeps_padding() {
+        let mut s = Session::new();
+        let (f, _, _) = al_frame(&mut s);
+        ex(&mut s, "node.set", json!({"id": f, "props": {"padding": 16}}));
+        for key in ["paddingHorizontal", "paddingVertical"] {
+            for junk in [json!("abc"), json!({"a": 1}), json!([1, 2])] {
+                assert!(s.execute("node.set", &json!({"id": f, "props": {key: junk}})).is_err(), "{key}");
+                assert_eq!(node(&s, f).layout.as_ref().unwrap().padding, [16.0; 4], "{key}");
+            }
+        }
     }
 
     #[test]

@@ -2,7 +2,10 @@ use super::connectors::{end_json, other_end};
 use super::derived::ends_now;
 use super::edit::label_of;
 use super::items::edit_text;
-use super::*;
+use super::{
+    BoardItem, Document, ERASER_PX, End, EngineError, Gesture, NodeId, Point, PointerEvent, Result, SHAPE, STICKY, Session, Side, ToolId, id_of,
+    is_board, json,
+};
 
 // ---------------------------------------------------------------------------------------------
 // The board tools.

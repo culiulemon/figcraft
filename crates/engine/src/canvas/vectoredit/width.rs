@@ -10,7 +10,7 @@
 //! The points live in the stroke's [`WidthProfile`] and apply to every subpath (positions are
 //! fractions of each subpath's length).
 
-use figcraft_doc::*;
+use figcraft_doc::{Document, NodeId, WidthProfile, WidthSide};
 use figcraft_geom::{Point, Vec2};
 use figcraft_pathops::width::{Polyline, nearest, polylines};
 use serde::Serialize;
@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 
 use super::{editing, set_state};
 use crate::cmd::CommandSpec;
-use crate::params::*;
+use crate::params::{get, num, req_index, req_num, string};
 use crate::tools::{Gesture, PointerEvent};
 use crate::{Result, Session, bad, spec};
 

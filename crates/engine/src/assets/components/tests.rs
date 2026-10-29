@@ -383,6 +383,22 @@ fn resized_instances_follow_constraints_and_auto_layout() {
     healthy(&s);
 }
 
+/// The tail of `component_properties_apply_to_instances`: unbind, delete, then a variant property.
+fn unbind_delete_and_vary(s: &mut Session, c: NodeId, i: NodeId, title: NodeId, dot: NodeId) {
+    // Unbind and delete.
+    ex(s, "component.bindProperty", json!({"layer": dot, "property": null, "field": "visible"}));
+    assert!(node(s, copy_of(s, i, dot)).visible);
+    ex(s, "component.deleteProperty", json!({"id": c, "name": "Heading"}));
+    assert!(node(s, title).prop_refs.is_empty());
+    assert!(matches!(&node(s, i).kind, NodeKind::Instance { props, .. } if !props.contains_key("Heading")));
+    let desc = ex(s, "component.properties", json!({"id": i}));
+    assert_eq!(desc["properties"].as_array().unwrap().len(), 1);
+    // A variant property on a lone component makes it a component set.
+    let set = idv(&ex(s, "component.addProperty", json!({"id": c, "name": "Theme", "type": "variant", "default": "Light"})));
+    assert!(matches!(node(s, set).kind, NodeKind::ComponentSet { .. }));
+    assert_eq!(node(s, c).name, "Theme=Light");
+}
+
 #[test]
 fn component_properties_apply_to_instances() {
     let mut s = Session::new();
@@ -414,18 +430,7 @@ fn component_properties_apply_to_instances() {
     assert!(s.execute("component.bindProperty", &json!({"layer": dot, "property": "Heading"})).is_err());
     assert!(s.execute("component.bindProperty", &json!({"layer": ititle, "property": "Heading"})).is_err());
     assert!(s.execute("component.addProperty", &json!({"id": c, "name": "Heading", "type": "text"})).is_err());
-    // Unbind and delete.
-    ex(&mut s, "component.bindProperty", json!({"layer": dot, "property": null, "field": "visible"}));
-    assert!(node(&s, copy_of(&s, i, dot)).visible);
-    ex(&mut s, "component.deleteProperty", json!({"id": c, "name": "Heading"}));
-    assert!(node(&s, title).prop_refs.is_empty());
-    assert!(matches!(&node(&s, i).kind, NodeKind::Instance { props, .. } if !props.contains_key("Heading")));
-    let desc = ex(&mut s, "component.properties", json!({"id": i}));
-    assert_eq!(desc["properties"].as_array().unwrap().len(), 1);
-    // A variant property on a lone component makes it a component set.
-    let set = idv(&ex(&mut s, "component.addProperty", json!({"id": c, "name": "Theme", "type": "variant", "default": "Light"})));
-    assert!(matches!(node(&s, set).kind, NodeKind::ComponentSet { .. }));
-    assert_eq!(node(&s, c).name, "Theme=Light");
+    unbind_delete_and_vary(&mut s, c, i, title, dot);
     healthy(&s);
 }
 

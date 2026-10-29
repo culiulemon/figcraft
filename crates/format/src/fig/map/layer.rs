@@ -2,7 +2,10 @@ use super::component::{Entry, Inst, OverrideRow, prop_ref};
 use super::connector::connector_has_saved_label;
 use super::layout::{layout_grid, tracks};
 use super::paint::{effect, export_setting, paint, paint_bound, stroke};
-use super::*;
+use super::{
+    Affine, BTreeMap, BTreeSet, Kv, MAX_COMMANDS, MAX_DEPTH, Mapper, Obj, Value, View, copy_num, copy_str, guid, json, matrix, network, num, rows,
+    size,
+};
 
 /// How the layers of a resized container follow it when the file gives no derived layout for
 /// them: a frame's by their constraints, from its main's size to its own; a group's scale with it.
@@ -59,6 +62,22 @@ impl Fit {
         let at = if centred { nb.center() } else { figcraft_doc::geom::Point::new(nb.x0, nb.y0) };
         (size, Affine::translate((x0 - at.x, y0 - at.y)) * lin)
     }
+}
+
+struct LayerChildren<'s, 'a> {
+    id: &'s str,
+    inst: Option<&'s Inst<'a>>,
+    base: &'s Kv<'a>,
+    child_space: Affine,
+    view: &'s View<'a>,
+    object: &'s mut Obj,
+    ty: &'s str,
+    rest_id: &'s str,
+    connector_snapshot: bool,
+    connector_terminal: bool,
+    depth: usize,
+    included: Option<&'s BTreeSet<String>>,
+    slot_content: Option<String>,
 }
 
 impl<'a> Mapper<'a> {
@@ -136,16 +155,7 @@ impl<'a> Mapper<'a> {
             connector_snapshot && (!connector_has_saved_label(&view) || depth >= MAX_DEPTH || self.count.saturating_add(1) >= self.budget());
         // A supported connector snapshot has its own note below instead of the generic stand-in one.
         let stand = stand_in(own).filter(|_| !connector_snapshot);
-        let ty = match own {
-            "ROUNDED_RECTANGLE" => "RECTANGLE",
-            "SYMBOL" => "COMPONENT",
-            "FRAME" if view.flag("isStateGroup") == Some(true) => "COMPONENT_SET",
-            "FRAME" if view.flag("resizeToFit") == Some(true) => "GROUP",
-            "VARIABLE" | "VARIABLE_SET" => return None,
-            "CONNECTOR" if connector_snapshot && connector_terminal => "VECTOR",
-            "CONNECTOR" if connector_snapshot => "FRAME",
-            t => stand.map_or(t, |s| s.0),
-        };
+        let ty = Self::mapped_type(own, &view, connector_snapshot, connector_terminal, stand)?;
         if let Some((_, what)) = stand.filter(|_| own != "TEXT_PATH") {
             self.warn(format!("{} layers import as {what}", own.to_ascii_lowercase().replace('_', " ")));
         }
@@ -225,18 +235,59 @@ impl<'a> Mapper<'a> {
             source.insert("slotOverride".into(), json!(true));
         }
         let child_space = if matches!(ty, "GROUP" | "BOOLEAN_OPERATION") { space * view.transform().unwrap_or_default() } else { Affine::IDENTITY };
-        let mut kids = if connector_snapshot && !connector_terminal { self.connector_snapshot_children(&view, &rest_id) } else { Vec::new() };
+        let mut kids = self.map_layer_children(LayerChildren {
+            id,
+            inst,
+            base,
+            child_space,
+            view: &view,
+            object: &mut o,
+            ty,
+            rest_id: &rest_id,
+            connector_snapshot,
+            connector_terminal,
+            depth,
+            included,
+            slot_content,
+        });
+        if stand.is_some_and(|s| s.0 == "FRAME") {
+            kids.splice(0..0, self.shape_with_text(&mut o, &view, own, &rest_id));
+            kids.extend(self.inner_text(&o, &view, &rest_id, own == "STICKY"));
+        }
+        if !kids.is_empty() {
+            o.insert("children".into(), Value::Array(kids));
+        }
+        Some(Value::Object(o))
+    }
+
+    fn map_layer_children(&mut self, context: LayerChildren<'_, 'a>) -> Vec<Value> {
+        let LayerChildren {
+            id,
+            inst,
+            base,
+            child_space,
+            view,
+            object: o,
+            ty,
+            rest_id,
+            connector_snapshot,
+            connector_terminal,
+            depth,
+            included,
+            slot_content,
+        } = context;
+        let mut kids = if connector_snapshot && !connector_terminal { self.connector_snapshot_children(view, rest_id) } else { Vec::new() };
         if connector_terminal {
             // The saved vector is flattened into the connector node when no child slot remains.
         } else if ty == "INSTANCE" {
-            if let Some((sub, sym)) = self.instance(&mut o, &view, id, inst, &rest_id) {
+            if let Some((sub, sym)) = self.instance(o, view, id, inst, rest_id) {
                 let main = self.nodes.get(&sym).map(|m| View::of(m));
                 let fit = Fit::frame(main.as_ref().and_then(View::size), view.size());
                 // An instance that records no auto layout of its own has its main's.
                 let view = match main {
                     Some(m) if view.get("stackMode").is_none() && m.get("stackMode").is_some() => {
                         let layered = View { fitted: view.fitted, ..m.with(view.layers.iter().copied()) };
-                        self.auto_layout(&mut o, &layered);
+                        self.auto_layout(o, &layered);
                         layered
                     }
                     _ => view.clone(),
@@ -252,7 +303,7 @@ impl<'a> Mapper<'a> {
                 content_inst.slot_content = true;
             }
             for c in self.children(&content) {
-                kids.extend(self.layer_filtered(&c, content_inst.as_ref(), child_space, Some(&view), None, depth + 1, included));
+                kids.extend(self.layer_filtered(&c, content_inst.as_ref(), child_space, Some(view), None, depth + 1, included));
             }
         } else {
             // Inside an instance a layer's children are its main's: they follow it from the main's
@@ -263,17 +314,29 @@ impl<'a> Mapper<'a> {
                 (Some(_), _) => Fit::frame(View::of(base).size(), view.size()),
             };
             for c in self.children(id) {
-                kids.extend(self.layer_filtered(&c, inst, child_space, Some(&view), fit, depth + 1, included));
+                kids.extend(self.layer_filtered(&c, inst, child_space, Some(view), fit, depth + 1, included));
             }
         }
-        if stand.is_some_and(|s| s.0 == "FRAME") {
-            kids.splice(0..0, self.shape_with_text(&mut o, &view, own, &rest_id));
-            kids.extend(self.inner_text(&o, &view, &rest_id, own == "STICKY"));
+        kids
+    }
+
+    fn mapped_type<'s>(
+        own: &'s str,
+        view: &View<'a>,
+        connector_snapshot: bool,
+        connector_terminal: bool,
+        stand: Option<(&'static str, &'static str)>,
+    ) -> Option<&'s str> {
+        match own {
+            "ROUNDED_RECTANGLE" => Some("RECTANGLE"),
+            "SYMBOL" => Some("COMPONENT"),
+            "FRAME" if view.flag("isStateGroup") == Some(true) => Some("COMPONENT_SET"),
+            "FRAME" if view.flag("resizeToFit") == Some(true) => Some("GROUP"),
+            "VARIABLE" | "VARIABLE_SET" => None,
+            "CONNECTOR" if connector_snapshot && connector_terminal => Some("VECTOR"),
+            "CONNECTOR" if connector_snapshot => Some("FRAME"),
+            t => Some(stand.map_or(t, |s| s.0)),
         }
-        if !kids.is_empty() {
-            o.insert("children".into(), Value::Array(kids));
-        }
-        Some(Value::Object(o))
     }
 
     /// A non-rectangular shape-with-text's shape, as a vector under its frame (which gives up its

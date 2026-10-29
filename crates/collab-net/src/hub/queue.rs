@@ -1,5 +1,7 @@
 use super::limits::ip_blocks;
-use super::*;
+use super::{
+    Arc, AtomicUsize, Bytes, ClientMsg, CloseCode, HashMap, IpAddr, Mutex, Ordering, PoisonError, Presence, SyncSender, TcpStream, TrySendError,
+};
 
 /// A message for one connection's writer: bytes (with what they count against, released when
 /// they are sent or dropped), or the close.

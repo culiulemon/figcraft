@@ -2,7 +2,7 @@
 //! deleting, cutting and joining. Pure functions on a [`VectorNetwork`]; the session wrappers in
 //! `vectoredit.rs` re-fit the node afterwards.
 
-use figcraft_doc::*;
+use figcraft_doc::{HandleMirroring, Region, Segment, VectorNetwork, Vertex, WindingRule};
 use figcraft_geom::kurbo::{CubicBez, ParamCurve, ParamCurveNearest};
 use figcraft_geom::{Affine, Point, Vec2};
 

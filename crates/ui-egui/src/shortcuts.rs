@@ -179,7 +179,12 @@ pub(crate) fn handle_input(
     let now = ctx.input(|i| i.time);
     for ev in &events {
         match ev {
-            Event::Copy => crate::menus::invoke(app, "edit.copy"),
+            // egui-winit sends Cmd/Ctrl+C as a copy event whatever Alt does, so Copy properties
+            // (Alt+Cmd/Ctrl+C) arrives here and never as a key.
+            Event::Copy => {
+                let props = ctx.input(|i| i.modifiers.alt);
+                crate::menus::invoke(app, if props { "edit.copyProperties" } else { "edit.copy" });
+            }
             Event::Cut => cut(app),
             Event::Paste(text) if !swallowed.drop_text => crate::menus::paste(app, Some(text), None),
             Event::Key { key, physical_key, pressed: true, modifiers, repeat }

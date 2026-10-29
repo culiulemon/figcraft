@@ -4,13 +4,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use figcraft_doc::*;
+use figcraft_doc::{Collection, CollectionId, Document, Mode, ModeId, Variable, VariableId, VariableValue, Variables, trim_num};
 use serde_json::{Value, json};
 
 use super::CommandSpec;
 use crate::codegen::{css_var_name, css_var_of};
 use crate::library::{is_remote_collection, local_collections};
-use crate::params::*;
+use crate::params::{get, string};
 use crate::{EngineError, Result, Session, bad, spec};
 
 pub fn specs() -> Vec<CommandSpec> {

@@ -209,8 +209,14 @@ fn embedded_variables_match_separate_ones() {
 #[test]
 fn interactions_triggers_actions_and_transitions() {
     let (doc, warnings) = import_with(&file_json(), Some(&variables_json()), &no_images).unwrap();
-    let id = |n: &str| named(&doc, n).id;
-    let button = named(&doc, "Button");
+    assert_interactions(&doc, &warnings);
+    assert_legacy_transition(&doc);
+    assert_interactions_without_variables();
+}
+
+fn assert_interactions(doc: &Document, warnings: &[String]) {
+    let id = |n: &str| named(doc, n).id;
+    let button = named(doc, "Button");
     let its = &button.interactions;
     assert_eq!(its.len(), 8, "{its:#?}");
 
@@ -239,18 +245,22 @@ fn interactions_triggers_actions_and_transitions() {
     assert_eq!(its[7].trigger, Trigger::MouseUp);
     assert_eq!(its[7].actions, [Action::ScrollTo { dest: id("Home"), offset: [0.0, 0.0] }], "unresolved destinations are dropped");
 
-    // The legacy single transition.
-    let details = named(&doc, "Details");
+    assert!(!has(warnings, "modifier keys"), "{warnings:?}");
+    for w in ["video triggers", "without a destination"] {
+        assert!(has(warnings, w), "{w}: {warnings:?}");
+    }
+}
+
+fn assert_legacy_transition(doc: &Document) {
+    let id = |n: &str| named(doc, n).id;
+    let details = named(doc, "Details");
     assert_eq!(details.interactions.len(), 1);
     let legacy = &details.interactions[0];
     assert_eq!((&legacy.trigger, &legacy.actions[..]), (&Trigger::OnClick, &[Action::Navigate { dest: id("Home"), preserve_scroll: false }][..]));
     assert_eq!((legacy.transition, legacy.duration_ms, legacy.easing), (Transition::Dissolve, 200, Easing::EaseIn));
+}
 
-    assert!(!has(&warnings, "modifier keys"), "{warnings:?}");
-    for w in ["video triggers", "without a destination"] {
-        assert!(has(&warnings, w), "{w}: {warnings:?}");
-    }
-    // Without variables, set-variable actions have nothing to set.
+fn assert_interactions_without_variables() {
     let (doc, warnings) = import(&file_json(), &no_images).unwrap();
     assert_eq!(named(&doc, "Button").interactions.len(), 6);
     assert!(has(&warnings, "set-variable actions") && has(&warnings, "set-variable-mode actions"), "{warnings:?}");

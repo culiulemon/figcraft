@@ -1,7 +1,7 @@
 use super::component::{assigned, prop_guid};
 use super::paint::color;
 use super::variables::variable_value;
-use super::*;
+use super::{Affine, BTreeMap, BTreeSet, Kv, MAX_DEPTH, Mapper, Obj, Value, View, copy_str, guid, json, rows};
 
 impl<'a> Mapper<'a> {
     /// The DOCUMENT with its pages.

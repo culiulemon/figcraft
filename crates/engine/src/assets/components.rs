@@ -33,7 +33,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use figcraft_doc::*;
+use figcraft_doc::{
+    ChildLayout, ContentAlign, CrossAlign, DocError, Document, MainAlign, Node, NodeId, NodeKind, PropDef, Sizing, TextAutoResize, TextData,
+};
 use figcraft_geom::Affine;
 use serde_json::Value;
 

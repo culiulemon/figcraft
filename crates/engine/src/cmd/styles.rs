@@ -3,11 +3,14 @@
 use std::collections::BTreeMap;
 
 use figcraft_color::{Color, Paint, PaintKind};
-use figcraft_doc::*;
+use figcraft_doc::{
+    Collection, CollectionId, Document, Effect, EffectKind, Mode, ModeId, Node, NodeId, NodeKind, Style, StyleId, StyleKind, TextData, TextStyle,
+    Variable, VariableId, VariableType, VariableValue, Variables, trim_num,
+};
 use serde_json::{Value, json};
 
 use super::{CommandSpec, ok};
-use crate::params::*;
+use crate::params::{color_of, f64_of, get, id, num, paints_of, req_string, req_targets, string, targets};
 use crate::{EngineError, Result, Session, bad, spec};
 
 pub fn specs() -> Vec<CommandSpec> {

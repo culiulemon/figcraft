@@ -6,12 +6,15 @@
 //! output is a starting point, not a pixel-exact translation.
 
 use figcraft_color::{Color, PaintKind};
-use figcraft_doc::*;
+use figcraft_doc::{
+    ContentAlign, CrossAlign, Document, EffectKind, LayoutMode, LetterSpacing, LineHeight, MainAlign, Node, NodeId, NodeKind, Shadow, Sizing,
+    TextAlignH, TextCase, TextDecoration, Variable,
+};
 use serde_json::json;
 
 use crate::cmd::CommandSpec;
 use crate::component_codegen::{Component, Param};
-use crate::params::*;
+use crate::params::{get, id_of, num_or, string, targets};
 use crate::{bad, spec};
 
 mod arkui;
@@ -515,6 +518,21 @@ mod tests {
         assert!(ark.contains(".textAlign(TextAlign.Center)"), "{ark}");
         let width = doc.node(t).map(|n| n.width).unwrap_or_default();
         assert!(ark.contains(&format!(".width({})", num(width))), "the alignment has a box: {ark}");
+    }
+
+    #[test]
+    fn arkui_percent_line_height_and_letter_spacing_are_absolute_numbers() {
+        // ArkUI's `letterSpacing` falls back to the default for a percent string, and `lineHeight`
+        // takes no percent at all: both are numbers of vp, a percent being of the font size.
+        let mut s = Session::new();
+        let f = id_of(&s.execute("frame.create", &json!({"x": 0, "y": 0, "width": 200, "height": 100})).unwrap()["id"]).unwrap();
+        let t = id_of(&s.execute("text.create", &json!({"text": "Hi", "x": 0, "y": 0, "parent": f})).unwrap()["id"]).unwrap();
+        s.execute("node.set", &json!({"id": t, "props": {"fontSize": 20.0, "lineHeight": "150%", "letterSpacing": "10%"}})).unwrap();
+        let doc = s.doc().unwrap();
+        let ark = code_for(doc, f, CodeLang::ArkUi);
+        assert!(ark.contains(".lineHeight(30)"), "{ark}");
+        assert!(ark.contains(".letterSpacing(2)"), "{ark}");
+        assert!(!ark.contains('%'), "no percent strings: {ark}");
     }
 
     #[test]

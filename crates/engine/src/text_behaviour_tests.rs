@@ -370,3 +370,168 @@ fn max_lines_on_auto_height_text_hugs_that_many_lines() {
     s.execute("text.maxLines", &json!({"ids": [fixed], "lines": 2})).unwrap();
     assert_eq!(resize_mode(&s, fixed), TextAutoResize::Truncate);
 }
+
+/// A synthetic monospaced TrueType font (outline-less glyphs, every printable ASCII character 500 of
+/// 1000 units wide), loaded into the font database so text measures the same on every machine.
+fn test_mono_font() -> &'static str {
+    const FAMILY: &str = "FigCraft Test Mono";
+    static LOADED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    LOADED.get_or_init(|| {
+        let families = figcraft_text::load_font_bytes(synthetic_mono_font(FAMILY));
+        assert_eq!(families, [FAMILY], "the synthetic font loads");
+    });
+    FAMILY
+}
+
+fn synthetic_mono_font(family: &str) -> Vec<u8> {
+    let be16 = |v: &mut Vec<u8>, x: u16| v.extend_from_slice(&x.to_be_bytes());
+    let glyphs: u16 = 1 + (0x7E - 0x20 + 1);
+    let mut head = Vec::new();
+    for x in [0x0001_0000u32, 0x0001_0000, 0, 0x5F0F_3CF5] {
+        head.extend_from_slice(&x.to_be_bytes());
+    }
+    be16(&mut head, 0); // flags
+    be16(&mut head, 1000); // unitsPerEm
+    head.extend_from_slice(&[0; 16]); // created, modified
+    for x in [0u16, (-200i16) as u16, 500, 800, 0, 8, 2, 0, 0] {
+        be16(&mut head, x); // bbox, macStyle, lowestRecPPEM, direction hint, short loca, glyph format
+    }
+    let mut hhea = 0x0001_0000u32.to_be_bytes().to_vec();
+    for x in [800u16, (-200i16) as u16, 0, 500, 0, 0, 500, 1, 0, 0, 0, 0, 0, 0, 0, glyphs] {
+        be16(&mut hhea, x);
+    }
+    let mut maxp = 0x0001_0000u32.to_be_bytes().to_vec();
+    be16(&mut maxp, glyphs);
+    for x in [0u16, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0] {
+        be16(&mut maxp, x);
+    }
+    let mut hmtx = Vec::new();
+    for _ in 0..glyphs {
+        be16(&mut hmtx, 500);
+        be16(&mut hmtx, 0);
+    }
+    let loca = vec![0; 2 * (usize::from(glyphs) + 1)];
+    let glyf = vec![0; 4];
+    // cmap: one Windows Unicode BMP subtable, format 4, 0x20..=0x7E → glyphs 1.. plus the end segment.
+    let mut cmap = Vec::new();
+    for x in [0u16, 1, 3, 1, 0, 12] {
+        be16(&mut cmap, x);
+    }
+    for x in [4u16, 32, 0, 4, 4, 1, 0, 0x7E, 0xFFFF, 0, 0x20, 0xFFFF, (1i16 - 0x20) as u16, 1, 0, 0] {
+        be16(&mut cmap, x);
+    }
+    let strings = [(1u16, family.to_string()), (2, "Regular".into()), (6, family.replace(' ', "") + "-Regular")];
+    let mut name = Vec::new();
+    be16(&mut name, 0);
+    be16(&mut name, strings.len() as u16);
+    be16(&mut name, 6 + 12 * strings.len() as u16);
+    let mut storage = Vec::new();
+    for (id, s) in &strings {
+        let utf16: Vec<u8> = s.encode_utf16().flat_map(u16::to_be_bytes).collect();
+        for x in [3u16, 1, 0x409, *id, utf16.len() as u16, storage.len() as u16] {
+            be16(&mut name, x);
+        }
+        storage.extend(utf16);
+    }
+    name.extend(storage);
+    let mut post = 0x0003_0000u32.to_be_bytes().to_vec();
+    post.extend_from_slice(&[0; 28]);
+    let tables: [(&[u8; 4], Vec<u8>); 9] = [
+        (b"cmap", cmap),
+        (b"glyf", glyf),
+        (b"head", head),
+        (b"hhea", hhea),
+        (b"hmtx", hmtx),
+        (b"loca", loca),
+        (b"maxp", maxp),
+        (b"name", name),
+        (b"post", post),
+    ];
+    let mut font = 0x0001_0000u32.to_be_bytes().to_vec();
+    for x in [tables.len() as u16, 128, 3, 16] {
+        be16(&mut font, x);
+    }
+    let mut offset = 12 + 16 * tables.len();
+    for (tag, data) in &tables {
+        font.extend_from_slice(*tag);
+        font.extend_from_slice(&0u32.to_be_bytes());
+        font.extend_from_slice(&(offset as u32).to_be_bytes());
+        font.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        offset += data.len().next_multiple_of(4);
+    }
+    for (_, data) in &tables {
+        font.extend_from_slice(data);
+        font.resize(font.len().next_multiple_of(4), 0);
+    }
+    font
+}
+
+/// The world position of a text's top-right corner (where right-aligned text is anchored).
+fn top_right(s: &Session, t: NodeId) -> (f64, f64) {
+    let doc = s.doc().unwrap();
+    let p = doc.world_transform(t) * figcraft_geom::kurbo::Point::new(doc.node(t).unwrap().width, 0.0);
+    (p.x, p.y)
+}
+
+fn assert_near(a: (f64, f64), b: (f64, f64), why: &str) {
+    assert!((a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6, "{why}: {a:?} != {b:?}");
+}
+
+#[test]
+fn right_aligned_auto_width_text_grows_and_shrinks_to_the_left() {
+    let font = test_mono_font();
+    for (src, rotation) in [("ANCHOR TEST\nabc", 0.0), ("abc", 0.0), ("ANCHOR TEST\nabc", 90.0)] {
+        let mut s = Session::new();
+        let t = text(&mut s, src, json!({"fontSize": 40, "fontFamily": font, "textAlign": "right", "textAutoResize": "widthAndHeight"}));
+        s.execute("node.set", &json!({"id": t, "props": {"x": 200, "y": 50, "rotation": rotation}})).unwrap();
+        let anchor = top_right(&s, t);
+        let w0 = size(&s, t).0;
+        let widest = src.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+        assert!((w0 - 20.0 * widest as f64).abs() < 1e-6, "{src:?}: the test font measures 20 px a character, not {w0}");
+        begin(&mut s, t, Some(src.chars().count()), false).unwrap();
+        for c in "defghijklmnopqrstuvwxyz".chars() {
+            crate::textedit::insert(&mut s, &c.to_string()).unwrap();
+            assert_near(top_right(&s, t), anchor, &format!("{src:?} at {rotation}°: typing {c}"));
+        }
+        assert!(size(&s, t).0 > w0 + 1e-6, "{src:?} at {rotation}°: typing grows the text");
+        for _ in 0..23 {
+            key(&mut s, "Backspace", false, false, false).unwrap();
+            assert_near(top_right(&s, t), anchor, &format!("{src:?} at {rotation}°: deleting"));
+        }
+        assert!((size(&s, t).0 - w0).abs() < 1e-6, "back to the starting width");
+    }
+}
+
+#[test]
+fn right_aligned_auto_width_growth_undoes_to_its_old_place() {
+    let font = test_mono_font();
+    let mut s = Session::new();
+    let t = text(&mut s, "abc", json!({"fontSize": 40, "fontFamily": font, "textAlign": "right", "textAutoResize": "widthAndHeight"}));
+    let before = (s.doc().unwrap().node(t).unwrap().transform, size(&s, t));
+    let anchor = top_right(&s, t);
+    s.execute("node.set", &json!({"id": t, "props": {"characters": "abcdefghijklmnop"}})).unwrap();
+    assert_near(top_right(&s, t), anchor, "set characters");
+    let after = (s.doc().unwrap().node(t).unwrap().transform, size(&s, t));
+    assert!(after.1.0 > before.1.0 + 1e-6, "the text grew");
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!((s.doc().unwrap().node(t).unwrap().transform, size(&s, t)), before, "undo");
+    s.execute("edit.redo", &json!({})).unwrap();
+    assert_eq!((s.doc().unwrap().node(t).unwrap().transform, size(&s, t)), after, "redo");
+}
+
+#[test]
+fn auto_layout_places_right_aligned_auto_width_text() {
+    let font = test_mono_font();
+    let mut s = Session::new();
+    let f = id(s.execute("frame.create", &json!({"x": 0, "y": 0, "width": 200, "height": 100})).unwrap());
+    s.execute("node.set", &json!({"id": f, "props": {"layout": "horizontal", "padding": 10, "gap": 0}})).unwrap();
+    let t = id(s
+        .execute(
+            "text.create",
+            &json!({"text": "abc", "x": 0, "y": 0, "parent": f, "props": {"fontSize": 40, "fontFamily": font, "textAlign": "right", "textAutoResize": "widthAndHeight"}}),
+        )
+        .unwrap());
+    s.execute("node.set", &json!({"id": t, "props": {"characters": "abcdefghijklmnop"}})).unwrap();
+    let c = s.doc().unwrap().node(t).unwrap().transform.as_coeffs();
+    assert_eq!((c[4], c[5]), (10.0, 10.0), "the auto layout keeps it at its padding");
+}

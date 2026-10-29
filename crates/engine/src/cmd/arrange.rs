@@ -1,12 +1,12 @@
 //! Arrange: align, distribute, tidy, z-order, flips, rotations and numeric transforms.
 
-use figcraft_doc::*;
+use figcraft_doc::{Document, EffectKind, LetterSpacing, LineHeight, Node, NodeId, NodeKind, Sizing, TextAutoResize, TextStyle};
 use figcraft_geom::{Affine, Point, Rect};
 use serde_json::{Value, json};
 
 use super::edit::{roots, z_sorted};
 use super::{CommandSpec, ok};
-use crate::params::*;
+use crate::params::{boolean, get, num, num_or, req_id, req_num, req_targets, string};
 use crate::{Result, Session, bad, spec};
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -405,6 +405,11 @@ fn turn_pivot(s: &Session, ids: &[NodeId]) -> Result<Option<Point>> {
 pub fn scale_node(doc: &mut Document, id: NodeId, k: f64) -> Result<()> {
     let k = if k.is_finite() && k > 0.0 { k } else { return Ok(()) };
     let sub = doc.subtree(id);
+    // The layers below `id` scale whatever their constraints, so where they are layers of an
+    // instance their new size and place are overrides. The edit's own diff takes geometry that
+    // changed with an ancestor's size for what constraints give, so the next rebuild of the
+    // instance would put them back at their main's size (#922).
+    let in_instance: Vec<bool> = sub.iter().enumerate().map(|(depth, i)| depth > 0 && crate::components::inside_instance(doc, *i)).collect();
     let tiles = |paints: &mut Vec<figcraft_color::Paint>| {
         for p in paints {
             if let figcraft_color::PaintKind::Image(img) = &mut p.kind
@@ -416,6 +421,7 @@ pub fn scale_node(doc: &mut Document, id: NodeId, k: f64) -> Result<()> {
     };
     for (depth, i) in sub.iter().enumerate() {
         let n = doc.get_mut(*i)?;
+        let (w0, h0, t0) = (n.width, n.height, n.transform);
         tiles(&mut n.fills);
         tiles(&mut n.strokes);
         let cl = &mut n.child_layout;
@@ -510,6 +516,14 @@ pub fn scale_node(doc: &mut Document, id: NodeId, k: f64) -> Result<()> {
         if depth > 0 {
             let c = n.transform.as_coeffs();
             n.transform = Affine::new([c[0], c[1], c[2], c[3], c[4] * k, c[5] * k]);
+        }
+        if in_instance.get(depth).copied().unwrap_or(false) {
+            if n.width != w0 || n.height != h0 {
+                n.overrides.insert("size".into());
+            }
+            if n.transform != t0 {
+                n.overrides.insert("position".into());
+            }
         }
     }
     Ok(())

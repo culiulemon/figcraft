@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 
 use crate::cmd::CommandSpec;
 use crate::codegen::CodeLang;
-use crate::params::*;
+use crate::params::{get, id_of, num, string, targets};
 use crate::{EngineError, Result, Session, bad, spec};
 
 /// The component a playground for `target` shows: an instance's component, a component or a

@@ -1,6 +1,9 @@
 use super::diff::diff_groups;
 use super::instances::{Carry, apply_prop, carry_overrides, carry_prop_bindings, copy_group, field_group, follow_variant_resizing, path_map};
-use super::*;
+use super::{
+    Affine, BTreeMap, BTreeSet, DocError, Document, MAX_DEPTH, Node, NodeId, NodeKind, SLOT, Sizing, Value, default_instance_name, default_props,
+    holds_content, inside_instance, is_slot, owning_component, variant_set,
+};
 
 /// `spare`: layers the outer rebuild didn't reuse that were below `inst` (a swapped nested
 /// instance): its layers the outer main doesn't have, matched here so they keep ids and overrides.
@@ -16,31 +19,10 @@ pub(super) fn sync_instance_depth(doc: &mut Document, inst: NodeId, depth: usize
         // A missing main, or an instance inside its own main (would recurse forever).
         return;
     }
-    let mut eff_props = default_props(&comp);
-    for (k, v) in root_props {
-        if eff_props.contains_key(k) {
-            eff_props.insert(k.clone(), v.clone());
-        }
-    }
+    let eff_props = effective_props(&comp, root_props);
     // Old layers (kept alive for their overrides), by (parent, source), by source alone (when only
     // one layer mirrors it) and, only when those don't match, by name path.
-    let mut old_ids = old_layers(doc, inst);
-    old_ids.extend(spare.keys().copied());
-    old_ids.sort();
-    old_ids.dedup();
-    let mut old: BTreeMap<NodeId, std::sync::Arc<Node>> = spare;
-    let mut by_source: BTreeMap<(NodeId, NodeId), NodeId> = BTreeMap::new();
-    let mut by_src: BTreeMap<NodeId, Option<NodeId>> = BTreeMap::new();
-    for i in &old_ids {
-        let Some(n) = doc.node_arc(*i).or_else(|| old.get(i)).cloned() else { continue };
-        if let Some(s) = n.source {
-            if let Some(p) = n.parent {
-                by_source.entry((p, s)).or_insert(*i);
-            }
-            by_src.entry(s).and_modify(|e| *e = None).or_insert(Some(*i));
-        }
-        old.insert(*i, n);
-    }
+    let (mut old, by_source, by_src) = index_old_layers(doc, inst, spare);
     let mut by_path: Option<BTreeMap<String, NodeId>> = None;
     let mut main_paths: Option<BTreeMap<NodeId, String>> = None;
     // Ids for the copies: reuse the matching old layer's id (a layer the main moved to another
@@ -124,23 +106,7 @@ pub(super) fn sync_instance_depth(doc: &mut Document, inst: NodeId, depth: usize
         // Component properties: the main layer's bindings use this instance's values; layers of
         // nested instances use the nested instance's values (one level per source hop).
         let enc = enclosing.get(&parent).cloned().unwrap_or_default();
-        let mut chain: Vec<&Node> = vec![orig];
-        while chain.len() < enc.len() {
-            let Some(next) = chain.last().and_then(|c| c.source).and_then(|x| doc.node(x)) else { break };
-            chain.push(next);
-        }
-        for (j, level) in chain.iter().enumerate().rev() {
-            let Some(props) = enc.get(j).and_then(|e| inst_props.get(e)) else { continue };
-            for (field, prop) in &level.prop_refs {
-                let g = field_group(field);
-                if n.overrides.contains(g) || (j > 0 && orig.overrides.contains(g)) {
-                    continue;
-                }
-                if let Some(val) = props.get(prop) {
-                    apply_prop(doc, &mut n, field, val);
-                }
-            }
-        }
+        apply_enclosing_props(doc, &mut n, orig, &enc, &inst_props);
         if let NodeKind::Instance { component: c, props } = &n.kind {
             inst_props.insert(nid, props.clone());
             let mut e = enc;
@@ -167,6 +133,155 @@ pub(super) fn sync_instance_depth(doc: &mut Document, inst: NodeId, depth: usize
             p.children.retain(|c| *c != id);
         }
     }
+    let fresh = fresh_root(doc, &mut root, &comp, inst, component, &map);
+    if let Some(r) = doc.node_mut(inst) {
+        *r = fresh;
+    }
+    // A resized instance: children follow their constraints (auto layout re-flows later).
+    let (iw, ih) = doc.node(inst).map(|n| (n.width, n.height)).unwrap_or((comp.width, comp.height));
+    if (iw - comp.width).abs() > 1e-9 || (ih - comp.height).abs() > 1e-9 {
+        figcraft_layout::apply_constraints(doc, inst, comp.width, comp.height);
+        remeasure = map.values().copied().collect();
+    }
+    follow_geometry_overrides(doc, &src, &map, &old, &mut remeasure);
+    remeasure_text(doc, remeasure);
+    rebuild_nested(doc, nested, &old, &used, depth);
+}
+
+/// Geometry overrides of children win over constraints.
+fn follow_geometry_overrides(
+    doc: &mut Document,
+    src: &[NodeId],
+    map: &BTreeMap<NodeId, NodeId>,
+    old: &BTreeMap<NodeId, std::sync::Arc<Node>>,
+    remeasure: &mut Vec<NodeId>,
+) {
+    for s in src {
+        let Some(nid) = map.get(s).copied() else { continue };
+        let Some(o) = old.get(&nid) else { continue };
+        // A frame that kept the size its own resizing gave it: its layers (copied at their main
+        // layers' places) follow their constraints from its main layer's size.
+        if o.overrides.contains("resizing")
+            && !o.overrides.contains("size")
+            && doc.node(nid).is_some_and(|n| n.kind.is_frame_like() && n.layout.is_none())
+            && let Some((mw, mh)) = doc.node(*s).map(|m| (m.width, m.height))
+        {
+            figcraft_layout::apply_constraints(doc, nid, mw, mh);
+        }
+        if !o.overrides.contains("size") && !o.overrides.contains("position") {
+            continue;
+        }
+        remeasure.push(nid);
+        let Some((ow, oh)) = doc.node(nid).map(|n| (n.width, n.height)) else { continue };
+        if o.overrides.contains("size") {
+            // Through set_size so vector networks scale with the box.
+            figcraft_layout::set_size(doc, nid, o.width, o.height);
+            if doc.node(nid).is_some_and(|n| n.kind.is_frame_like() && n.layout.is_none()) {
+                figcraft_layout::apply_constraints(doc, nid, ow, oh);
+            }
+        }
+        if let Some(n) = doc.node_mut(nid) {
+            carry_overrides(o, n, Carry::Geometry);
+        }
+    }
+}
+
+/// Nested instances showing another main than the main's copy (swapped): rebuild from it,
+/// with the old layers below them this rebuild didn't reuse.
+fn rebuild_nested(doc: &mut Document, nested: Vec<NodeId>, old: &BTreeMap<NodeId, std::sync::Arc<Node>>, used: &BTreeSet<NodeId>, depth: usize) {
+    let unused: BTreeMap<NodeId, std::sync::Arc<Node>> =
+        old.iter().filter(|(i, _)| !used.contains(*i) && !doc.contains(**i)).map(|(i, x)| (*i, x.clone())).collect();
+    for n in nested {
+        let mut below: BTreeMap<NodeId, std::sync::Arc<Node>> = unused
+            .iter()
+            .filter(|(_, x)| {
+                let mut cur = x.parent;
+                for _ in 0..=MAX_DEPTH * 4 {
+                    match cur {
+                        Some(p) if p == n => return true,
+                        Some(p) => cur = unused.get(&p).and_then(|a| a.parent),
+                        None => return false,
+                    }
+                }
+                false
+            })
+            .map(|(i, x)| (*i, x.clone()))
+            .collect();
+        take_placing_overrides(doc, n, old, &mut below);
+        sync_instance_depth(doc, n, depth + 1, below);
+    }
+}
+
+fn apply_enclosing_props(doc: &Document, n: &mut Node, orig: &Node, enc: &[NodeId], inst_props: &BTreeMap<NodeId, BTreeMap<String, Value>>) {
+    let mut chain: Vec<&Node> = vec![orig];
+    while chain.len() < enc.len() {
+        let Some(next) = chain.last().and_then(|c| c.source).and_then(|x| doc.node(x)) else { break };
+        chain.push(next);
+    }
+    for (j, level) in chain.iter().enumerate().rev() {
+        let Some(props) = enc.get(j).and_then(|e| inst_props.get(e)) else { continue };
+        for (field, prop) in &level.prop_refs {
+            let g = field_group(field);
+            if n.overrides.contains(g) || (j > 0 && orig.overrides.contains(g)) {
+                continue;
+            }
+            if let Some(val) = props.get(prop) {
+                apply_prop(doc, n, field, val);
+            }
+        }
+    }
+}
+
+/// Text whose characters or style differ from the main re-measures.
+fn remeasure_text(doc: &mut Document, remeasure: Vec<NodeId>) {
+    for nid in remeasure {
+        if let Some(n) = doc.node(nid)
+            && let Some((w, h)) = figcraft_text::auto_size(n)
+            && ((w - n.width).abs() > 1e-6 || (h - n.height).abs() > 1e-6)
+        {
+            figcraft_layout::set_size(doc, nid, w, h);
+        }
+    }
+}
+
+/// The component's property defaults with the instance's values for the ones it has.
+fn effective_props(comp: &Node, root_props: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    let mut eff_props = default_props(comp);
+    for (k, v) in root_props {
+        if eff_props.contains_key(k) {
+            eff_props.insert(k.clone(), v.clone());
+        }
+    }
+    eff_props
+}
+
+type OldIndex = (BTreeMap<NodeId, std::sync::Arc<Node>>, BTreeMap<(NodeId, NodeId), NodeId>, BTreeMap<NodeId, Option<NodeId>>);
+
+/// The old layers of `inst` (and `spare`) by id, by (parent, source) and by source alone (`None`
+/// when several layers mirror it).
+fn index_old_layers(doc: &Document, inst: NodeId, spare: BTreeMap<NodeId, std::sync::Arc<Node>>) -> OldIndex {
+    let mut old_ids = old_layers(doc, inst);
+    old_ids.extend(spare.keys().copied());
+    old_ids.sort();
+    old_ids.dedup();
+    let mut old = spare;
+    let mut by_source: BTreeMap<(NodeId, NodeId), NodeId> = BTreeMap::new();
+    let mut by_src: BTreeMap<NodeId, Option<NodeId>> = BTreeMap::new();
+    for i in &old_ids {
+        let Some(n) = doc.node_arc(*i).or_else(|| old.get(i)).cloned() else { continue };
+        if let Some(s) = n.source {
+            if let Some(p) = n.parent {
+                by_source.entry((p, s)).or_insert(*i);
+            }
+            by_src.entry(s).and_modify(|e| *e = None).or_insert(Some(*i));
+        }
+        old.insert(*i, n);
+    }
+    (old, by_source, by_src)
+}
+
+/// The rebuilt root of instance `inst` of `comp`.
+fn fresh_root(doc: &Document, root: &mut Node, comp: &Node, inst: NodeId, component: NodeId, map: &BTreeMap<NodeId, NodeId>) -> Node {
     // Root: follows the main except its own placement, name, size and overrides.
     let order: Vec<NodeId> = comp.children.iter().filter_map(|c| map.get(c).copied()).filter(|c| doc.contains(*c)).collect();
     let mut fresh = comp.clone();
@@ -175,7 +290,7 @@ pub(super) fn sync_instance_depth(doc: &mut Document, inst: NodeId, depth: usize
     fresh.children = order;
     fresh.transform = root.transform;
     fresh.kind = root.kind.clone();
-    carry_prop_bindings(&root, &mut fresh);
+    carry_prop_bindings(root, &mut fresh);
     // A nested instance keeps mirroring its layer of the outer main.
     let nested_copy = inside_instance(doc, inst);
     fresh.source = if nested_copy { root.source } else { Some(component) };
@@ -212,81 +327,12 @@ pub(super) fn sync_instance_depth(doc: &mut Document, inst: NodeId, depth: usize
     fresh.name = if renamed { root.name.clone() } else { default_instance_name(doc, component) };
     // Switched to another variant: its own overrides stay where both variants agreed.
     if let Some(prev) = root.source.and_then(|p| doc.node(p)).filter(|p| sibling_variants(doc, p.id, component)) {
-        let differs = diff_groups(prev, &comp);
+        let differs = diff_groups(prev, comp);
         root.overrides.retain(|g| g == "name" || !differs.contains(&g.as_str()));
         follow_variant_resizing(&mut fresh.child_layout, &prev.child_layout, &comp.child_layout);
     }
-    carry_overrides(&root, &mut fresh, Carry::Root);
-    if let Some(r) = doc.node_mut(inst) {
-        *r = fresh;
-    }
-    // A resized instance: children follow their constraints (auto layout re-flows later).
-    let (iw, ih) = doc.node(inst).map(|n| (n.width, n.height)).unwrap_or((comp.width, comp.height));
-    if (iw - comp.width).abs() > 1e-9 || (ih - comp.height).abs() > 1e-9 {
-        figcraft_layout::apply_constraints(doc, inst, comp.width, comp.height);
-        remeasure = map.values().copied().collect();
-    }
-    // Geometry overrides of children win over constraints.
-    for s in &src {
-        let Some(nid) = map.get(s).copied() else { continue };
-        let Some(o) = old.get(&nid) else { continue };
-        // A frame that kept the size its own resizing gave it: its layers (copied at their main
-        // layers' places) follow their constraints from its main layer's size.
-        if o.overrides.contains("resizing")
-            && !o.overrides.contains("size")
-            && doc.node(nid).is_some_and(|n| n.kind.is_frame_like() && n.layout.is_none())
-            && let Some((mw, mh)) = doc.node(*s).map(|m| (m.width, m.height))
-        {
-            figcraft_layout::apply_constraints(doc, nid, mw, mh);
-        }
-        if !o.overrides.contains("size") && !o.overrides.contains("position") {
-            continue;
-        }
-        remeasure.push(nid);
-        let Some((ow, oh)) = doc.node(nid).map(|n| (n.width, n.height)) else { continue };
-        if o.overrides.contains("size") {
-            // Through set_size so vector networks scale with the box.
-            figcraft_layout::set_size(doc, nid, o.width, o.height);
-            if doc.node(nid).is_some_and(|n| n.kind.is_frame_like() && n.layout.is_none()) {
-                figcraft_layout::apply_constraints(doc, nid, ow, oh);
-            }
-        }
-        if let Some(n) = doc.node_mut(nid) {
-            carry_overrides(o, n, Carry::Geometry);
-        }
-    }
-    // Text whose characters or style differ from the main re-measures.
-    for nid in remeasure {
-        if let Some(n) = doc.node(nid)
-            && let Some((w, h)) = figcraft_text::auto_size(n)
-            && ((w - n.width).abs() > 1e-6 || (h - n.height).abs() > 1e-6)
-        {
-            figcraft_layout::set_size(doc, nid, w, h);
-        }
-    }
-    // Nested instances showing another main than the main's copy (swapped): rebuild from it,
-    // with the old layers below them this rebuild didn't reuse.
-    let unused: BTreeMap<NodeId, std::sync::Arc<Node>> =
-        old.iter().filter(|(i, _)| !used.contains(*i) && !doc.contains(**i)).map(|(i, x)| (*i, x.clone())).collect();
-    for n in nested {
-        let mut below: BTreeMap<NodeId, std::sync::Arc<Node>> = unused
-            .iter()
-            .filter(|(_, x)| {
-                let mut cur = x.parent;
-                for _ in 0..=MAX_DEPTH * 4 {
-                    match cur {
-                        Some(p) if p == n => return true,
-                        Some(p) => cur = unused.get(&p).and_then(|a| a.parent),
-                        None => return false,
-                    }
-                }
-                false
-            })
-            .map(|(i, x)| (*i, x.clone()))
-            .collect();
-        take_placing_overrides(doc, n, &old, &mut below);
-        sync_instance_depth(doc, n, depth + 1, below);
-    }
+    carry_overrides(root, &mut fresh, Carry::Root);
+    fresh
 }
 
 /// Before swapped nested instance `n` is rebuilt from its new main: each of its old layers (the

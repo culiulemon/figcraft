@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use figcraft_doc::*;
+use figcraft_doc::{Document, ImportedComponent, ImportedRecord, LibraryManifest, NodeId, NodeKind, PublishedLibrary, VariableValue};
 use serde_json::Value;
 
 use crate::cmd::component::{main_of, swap_instance};
@@ -41,6 +41,35 @@ fn b_main(doc: &Document, a_main: NodeId, a_root: NodeId, b_root: NodeId) -> Opt
     }
 }
 
+/// Local style id → the library's style id, matched by name and type (the rest go to `out.unmatched`).
+fn match_styles(doc: &Document, recs: &[ImportedRecord], m: &LibraryManifest, out: &mut Swapped) -> BTreeMap<String, String> {
+    let mut keys = BTreeMap::new();
+    for r in recs {
+        let Some(st) = doc.style(&r.local) else { continue };
+        let kind = st.kind.type_name();
+        match m.styles.iter().find(|x| x.published && x.name == st.name && x.kind == kind) {
+            Some(x) => {
+                keys.insert(r.local.clone(), x.id.clone());
+            }
+            None => out.unmatched.push(format!("style {}", st.name)),
+        }
+    }
+    keys
+}
+
+/// (local component root, the library's component id) by name; the rest go to `out.unmatched`.
+fn match_components(doc: &Document, records: &[ImportedComponent], m: &LibraryManifest, out: &mut Swapped) -> Vec<(NodeId, NodeId)> {
+    let mut pairs = Vec::new();
+    for r in records {
+        let name = doc.node(r.root).map(|n| n.name.clone()).unwrap_or_default();
+        match m.components.iter().find(|a| a.published && a.name == name) {
+            Some(a) => pairs.push((r.root, a.id)),
+            None => out.unmatched.push(format!("component {name}")),
+        }
+    }
+    pairs
+}
+
 /// Swap the copies of library `from` in `doc` to library `to` by names (see the module docs).
 pub fn swap_library(doc: &mut Document, from: &str, to: &PublishedLibrary) -> Result<Swapped> {
     let m = &to.manifest;
@@ -64,14 +93,7 @@ pub fn swap_library(doc: &mut Document, from: &str, to: &PublishedLibrary) -> Re
         })
         .collect();
     let records: Vec<ImportedComponent> = doc.libraries.components.iter().filter(|r| r.library == from && shown.contains(&r.root)).cloned().collect();
-    let mut pairs = Vec::new();
-    for r in &records {
-        let name = doc.node(r.root).map(|n| n.name.clone()).unwrap_or_default();
-        match m.components.iter().find(|a| a.published && a.name == name) {
-            Some(a) => pairs.push((r.root, a.id)),
-            None => out.unmatched.push(format!("component {name}")),
-        }
-    }
+    let pairs = match_components(doc, &records, m, &mut out);
     let keys: Vec<NodeId> = pairs.iter().map(|(_, k)| *k).collect();
     let map = if keys.is_empty() { BTreeMap::new() } else { import(doc, to, &keys, false)? };
     // A's mains (each variant) and roots → B's.
@@ -121,17 +143,7 @@ pub fn swap_library(doc: &mut Document, from: &str, to: &PublishedLibrary) -> Re
     // Styles the document's own layers link to: by name and type.
     let linked: BTreeSet<String> = doc.nodes().filter(|n| outside(doc, n.id)).flat_map(|n| style_links(n).cloned()).collect();
     let style_recs: Vec<ImportedRecord> = doc.libraries.styles.iter().filter(|r| r.library == from && linked.contains(&r.local)).cloned().collect();
-    let mut style_keys: BTreeMap<String, String> = BTreeMap::new();
-    for r in &style_recs {
-        let Some(st) = doc.style(&r.local) else { continue };
-        let kind = st.kind.type_name();
-        match m.styles.iter().find(|x| x.published && x.name == st.name && x.kind == kind) {
-            Some(x) => {
-                style_keys.insert(r.local.clone(), x.id.clone());
-            }
-            None => out.unmatched.push(format!("style {}", st.name)),
-        }
-    }
+    let style_keys = match_styles(doc, &style_recs, m, &mut out);
     let imported = import_styles(doc, to, &style_keys.values().cloned().collect(), false);
     let styles: BTreeMap<String, String> = style_keys.iter().filter_map(|(a, k)| imported.get(k).map(|b| (a.clone(), b.clone()))).collect();
     out.styles = styles.len();

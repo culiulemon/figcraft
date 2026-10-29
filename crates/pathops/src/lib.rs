@@ -10,6 +10,8 @@ pub mod brush;
 #[cfg(test)]
 mod brush_tests;
 #[cfg(test)]
+mod dot_dash_tests;
+#[cfg(test)]
 mod ops_tests;
 mod points;
 #[cfg(test)]
@@ -309,7 +311,9 @@ pub fn stroke_center(path: &BezPath, width: f64, props: &StrokeProps) -> BezPath
         .with_end_cap(kcap(props.cap_end));
     // Each subpath restarts the pattern, so it can add up to one more pattern's worth of dashes.
     let subpaths = path.elements().iter().filter(|e| matches!(e, PathEl::MoveTo(_))).count() as f64;
-    if let Some(pat) = width::dash_pattern(props).filter(|p| width::dashes_fit(path.perimeter(1.0) + subpaths * p.iter().sum::<f64>(), p)) {
+    let round = [props.cap_start, props.cap_end].into_iter().any(|c| matches!(kcap(c), Cap::Round));
+    let pattern = width::dash_pattern(props).map(|p| p.into_iter().map(|d| if round && d == 0.0 { 1e-3 } else { d }).collect::<Vec<_>>());
+    if let Some(pat) = pattern.filter(|p| width::dashes_fit(path.perimeter(1.0) + subpaths * p.iter().sum::<f64>(), p)) {
         style = style.with_dashes(0.0, pat);
     }
     kurbo::stroke(path.iter(), &style, &kurbo::StrokeOpts::default(), 0.05)

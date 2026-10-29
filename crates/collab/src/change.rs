@@ -245,6 +245,10 @@ pub enum Entry {
     /// [`DevSnapshot`](figcraft_doc::DevSnapshot)).
     DevSnapshot(NodeId),
     /// An image by content hash (value: `{width, height, bytes}` with the encoded bytes in base64).
+    /// A key with the shape of a content hash (64 hex chars) must be exactly the lowercase sha256
+    /// hex `figcraft_format::image_hash` produces for the bytes; every key must be a plain
+    /// archive member name ([`figcraft_doc::ImageData::is_valid_key`]), and dimensions and byte
+    /// size are bounded as the entry applies (`image_of` in `docprops.rs`).
     Image(String),
     /// A voter's ballot in a board's vote (value: the layer ids voted on).
     Ballot(String),
@@ -306,6 +310,13 @@ impl DocProp {
             DocProp::VariableOrder => Err(Family::Variables),
             _ => return None,
         })
+    }
+}
+
+impl Change {
+    /// Whether this puts or removes an image entry.
+    pub(crate) fn is_image(&self) -> bool {
+        matches!(self, Change::Put { entry: Entry::Image(_), .. } | Change::Remove { entry: Entry::Image(_) })
     }
 }
 

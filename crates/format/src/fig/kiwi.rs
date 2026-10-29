@@ -400,7 +400,7 @@ impl<'s> Decoder<'s, '_> {
 /// An encoder for the same format: the `.fig` export writes its schema and message with it (and
 /// test fixtures are built with it). Values are checked against the schema; it never panics.
 pub mod encode {
-    use super::*;
+    use super::{BUILTINS, Field, Kind, KiwiError, Kv, MAX_DEPTH, Schema, Type, err};
 
     #[derive(Default)]
     pub struct Writer(pub Vec<u8>);

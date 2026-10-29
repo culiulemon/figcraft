@@ -22,6 +22,7 @@ use figcraft_geom::Affine;
 use figcraft_geom::kurbo::Shape as _;
 use tiny_skia::Pixmap;
 
+use crate::backdrop::EffectFrame;
 use crate::fx;
 use crate::shadow::{Outline, spread_alpha};
 
@@ -593,8 +594,8 @@ pub fn pane(g: &Glass, shape: &Outline, w: u32, h: u32, xf: Affine, scale: f64) 
 
 /// The glass of a `w` × `h` layer whose `shape` maps through `xf` (local → layer pixels), from
 /// `back`, its backdrop padded by `pad` pixels each way, at `scale` device pixels per unit.
-#[allow(clippy::too_many_arguments)]
-pub fn glass(g: &Glass, shape: &Outline, back: &Pixmap, pad: u32, w: u32, h: u32, xf: Affine, scale: f64) -> Option<Pixmap> {
+pub fn glass(g: &Glass, frame: EffectFrame<'_>) -> Option<Pixmap> {
+    let EffectFrame { shape, back, pad, size: (w, h), xf, scale } = frame;
     let g = g.sanitized();
     let depth = (g.depth * scale).clamp(1.0, 1024.0);
     let band = (depth * (0.15 + 0.35 * g.splay)).max(1.0);

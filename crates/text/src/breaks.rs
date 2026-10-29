@@ -76,6 +76,14 @@ pub(crate) fn is_space(c: char) -> bool {
     class(c) == Class::Space
 }
 
+/// Whether a line may break between `a` and the `b` after it when the text offers no break
+/// opportunity and has to break inside a word (Thai, Lao, Khmer and Burmese write no spaces):
+/// never before a letter's trailing mark, which belongs to the letter before it, and never after a
+/// leading vowel, which is written before the consonant it is read with (#1219).
+pub(crate) fn safe_emergency_break(a: char, b: char) -> bool {
+    !is_trailing_mark(b) && !matches!(a, '\u{0E40}'..='\u{0E44}' | '\u{0EC0}'..='\u{0EC4}')
+}
+
 /// For each char of `text`, whether it starts a grapheme cluster (a user-perceived character:
 /// an emoji sequence, a letter with its combining marks).
 pub(crate) fn grapheme_starts(text: &str) -> Vec<bool> {
@@ -136,5 +144,16 @@ mod tests {
         assert!(!break_between('1', '\u{2007}'));
         assert!(!break_between('日', '\u{2007}') && !break_between('\u{2007}', '日'), "nor beside ideographs");
         assert!(!is_space('\u{2007}'));
+    }
+
+    #[test]
+    fn emergency_breaks_keep_marks_and_leading_vowels_with_their_letter() {
+        // #1219: Thai and Lao write no spaces, so these are where a line has to be forced to break.
+        assert!(!safe_emergency_break('\u{0E01}', '\u{0E49}'), "never before a tone mark");
+        assert!(!safe_emergency_break('\u{0E01}', '\u{0E33}'), "nor before SARA AM");
+        assert!(!safe_emergency_break('\u{0E40}', '\u{0E2B}'), "never after a leading vowel");
+        assert!(!safe_emergency_break('\u{0EC0}', '\u{0EAB}'), "nor in Lao");
+        assert!(safe_emergency_break('\u{0E01}', '\u{0E02}'), "between two letters is fine");
+        assert!(safe_emergency_break('\u{0E2B}', '\u{0E40}'), "before a leading vowel is fine");
     }
 }

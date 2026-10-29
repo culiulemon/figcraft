@@ -38,6 +38,8 @@ mod a11y_tests;
 #[cfg(test)]
 mod async_dialog_tests;
 #[cfg(test)]
+mod blend_preview_tests;
+#[cfg(test)]
 mod branch_ui_tests;
 #[cfg(test)]
 mod canvas_double_click_tests;
@@ -187,7 +189,11 @@ mod shortcut_keys_tests;
 #[cfg(test)]
 mod shortcuts_tests;
 #[cfg(test)]
+mod stroke_row_tests;
+#[cfg(test)]
 mod style_folder_rename_tests;
+#[cfg(test)]
+mod style_props_tests;
 #[cfg(test)]
 mod text_enter_tests;
 #[cfg(test)]

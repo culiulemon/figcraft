@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    Affine, BTreeMap, BTreeSet, Document, EngineError, ImageData, Node, NodeId, NodeKind, Result, Session, Value, bad, delete, id, json, num, ok,
+    req_targets, roots, string, targets, z_sorted,
+};
 
 /// The copied form of the selection.
 pub fn copy_to_clipboard(s: &mut Session, cmd: &str, ids: &[NodeId]) -> Result<()> {
@@ -109,6 +112,8 @@ pub(super) fn paste_design_layers(s: &mut Session, p: &Value) -> Result<Value> {
     let props = s.clipboard.props.take();
     let paint = s.clipboard.paint.take();
     let stroke = s.clipboard.stroke.take();
+    let paint_images = std::mem::take(&mut s.clipboard.paint_images);
+    let paint_source_doc = s.clipboard.paint_source_doc;
     let effect = s.clipboard.effect.take();
     // No open file has id 0. So paste treats this copy as a copy from a different file.
     let layers_generation = s.clipboard.layers_generation.wrapping_add(1);
@@ -118,6 +123,8 @@ pub(super) fn paste_design_layers(s: &mut Session, p: &Value) -> Result<Value> {
         props,
         paint,
         stroke,
+        paint_images,
+        paint_source_doc,
         effect,
         bounds,
         source_doc: 0,
@@ -291,9 +298,18 @@ pub(super) fn copy_props_of(doc: &Document, id: NodeId) -> Value {
     let Some(n) = doc.node(id) else { return Value::Null };
     let mut v = json!({
         "fills": n.fills, "strokes": n.strokes, "strokeWeight": n.stroke.weight, "strokeAlign": n.stroke.align,
-        "effects": n.effects, "opacity": n.opacity, "blend": n.blend, "cornerRadius": n.corners.radii,
-        "cornerSmoothing": n.corners.smoothing,
+        "strokeSides": n.stroke.sides, "startCap": n.stroke.cap_start, "endCap": n.stroke.cap_end,
+        "strokeJoin": n.stroke.join, "miterLimit": n.stroke.miter_limit, "dashes": n.stroke.dashes,
+        "widthProfile": super::super::props::width_points_json(n.stroke.width_profile.as_ref()), "brush": n.stroke.brush,
+        "effects": n.effects, "opacity": n.opacity, "blend": n.blend,
     });
+    // A vector rounds each anchor on its own (`vector.edit.cornerRadius` keeps the radii in the
+    // network's vertices, its layer corners stay empty): there is no style radius to carry, and
+    // pasting the empty one would flatten every anchor's radius.
+    if !matches!(n.kind, NodeKind::Vector { .. }) {
+        v["cornerRadius"] = json!(n.corners.radii);
+        v["cornerSmoothing"] = json!(n.corners.smoothing);
+    }
     if let NodeKind::Text(t) = &n.kind {
         v["fontFamily"] = json!(t.style.font_family);
         v["fontStyle"] = json!(t.style.font_style);

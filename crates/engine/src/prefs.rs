@@ -1,4 +1,4 @@
-use super::*;
+use super::{Arc, BTreeMap, Deserialize, Document, NodeId, Serialize, Value, cmd, live, online, plugins};
 
 /// The smallest and largest interface size, relative to the system's display scale (1.0 is the
 /// system's own size).
@@ -82,8 +82,10 @@ pub struct Prefs {
     /// The Getting started tips on the home screen were closed (Help ▸ Getting started shows them
     /// again).
     pub getting_started_dismissed: bool,
-    /// A prototype's Open link goes to a website without first telling the viewer that it leaves
-    /// the prototype (the notice's "Don't show this again"; `proto.linkNotice` shows it again).
+    /// A prototype's Open link — to a website or to the mail app — that the viewer's own click,
+    /// press, drag or key fired opens without first telling them that it leaves the prototype
+    /// (the notice's "Don't show this again"; `proto.linkNotice` shows it again). A link a delay
+    /// or the pointer passing over a layer fired still shows the notice (#1096).
     pub link_notice_skipped: bool,
     /// How each home screen section shows its files, by section id (`"recents"`): `"grid"` (cards
     /// with the picture each file carries) or `"list"` (a table). Missing: the grid.
@@ -164,6 +166,10 @@ pub struct Clipboard {
     pub paint: Option<(bool, figcraft_color::Paint)>,
     /// The stroke settings (`weight`, alignment, sides…) copied with a stroke's paint.
     pub stroke: Option<figcraft_doc::StrokeProps>,
+    /// The image data the copied paint names, carried so a paste into another file has it.
+    pub paint_images: std::collections::BTreeMap<String, figcraft_doc::ImageData>,
+    /// The file the copied paint came from: a pattern's node id only means anything there.
+    pub paint_source_doc: u64,
     /// A copied effect row (`effect.copy`).
     pub effect: Option<figcraft_doc::Effect>,
     /// The page-space bounds of the copied selection.

@@ -5,7 +5,7 @@
 //! commands.
 
 use egui::{Align2, CornerRadius, Id, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
-use figcraft_doc::*;
+use figcraft_doc::{AutoLayout, CellAlign, ContentAlign, CrossAlign, Document, LayoutMode, MainAlign, Node, NodeId, NodeKind, Sizing};
 use serde_json::json;
 
 use crate::FigApp;

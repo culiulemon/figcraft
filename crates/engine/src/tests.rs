@@ -616,13 +616,11 @@ fn document_colors_are_counted_per_page() {
     assert!(v["colors"].as_array().unwrap().is_empty());
 }
 
+/// `guide.add`, `guide.move` and `guide.remove` edit the current page's guides by index.
 #[test]
 fn guides_add_move_remove() {
     let mut s = sess();
-    let guides = |s: &Session| match &s.doc().unwrap().node(s.page().unwrap()).unwrap().kind {
-        NodeKind::Page { guides, .. } => guides.clone(),
-        _ => vec![],
-    };
+    let guides = |s: &Session| s.doc().unwrap().node(s.page().unwrap()).unwrap().guides.clone();
     let r = s.execute("guide.add", &json!({"vertical": true, "offset": 120})).unwrap();
     assert_eq!(r["index"], json!(0));
     s.execute("guide.add", &json!({"vertical": false, "offset": 40.5})).unwrap();

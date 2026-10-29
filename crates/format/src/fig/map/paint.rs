@@ -1,6 +1,6 @@
 use super::layer::cap_name;
 use super::variables::alias;
-use super::*;
+use super::{Affine, Kv, Mapper, NO_STYLE, Obj, Point, Value, View, copy_num, copy_str, guid, json, matrix, num, rows, vec2};
 
 fn filter_number(value: &Kv) -> Option<f64> {
     let number = match value {

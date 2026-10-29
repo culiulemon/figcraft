@@ -3,12 +3,15 @@
 use std::sync::Arc;
 
 use base64::Engine as _;
-use figcraft_doc::*;
+use figcraft_doc::{
+    BOARD_PAGE, Document, ExportFormat, ExportSetting, ExportSize, FileKind, LineHeight, Node, NodeId, NodeKind, PrintSettings, StyleKind, TextStyle,
+    VdCompat,
+};
 use figcraft_format::Version;
 use serde_json::{Value, json};
 
 use super::{CommandSpec, ok};
-use crate::params::*;
+use crate::params::{bool_of, boolean, get, id, num, num_or, req_index, req_string, string, targets};
 use crate::{DocState, EngineError, Result, Session, bad, spec};
 
 mod export;
@@ -428,6 +431,9 @@ mod rest_import_tests;
 
 #[cfg(test)]
 mod staging_write_tests;
+
+#[cfg(test)]
+mod thumbnail_tests;
 
 #[cfg(test)]
 mod zip_cap_tests;

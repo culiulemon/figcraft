@@ -271,7 +271,10 @@ fn on_path(cx: &mut Ctx, t: &usvg::Text, world: Affine, parent: NodeId) -> bool 
     local.apply_affine(Affine::translate((-bb.x0, -bb.y0)));
     td.path = Some(Box::new(figcraft_doc::TextPath { start: f64::from(tp.start_offset()) / len, ..figcraft_doc::TextPath::new(&local) }));
     let transform = world * Affine::translate((bb.x0, bb.y0));
-    add_layer(cx, t, &[line], td, transform, (bb.width().max(1.0), bb.height().max(1.0)), world, 1.0, parent);
+    add_layer(
+        cx,
+        TextLayer { source: t, block: &[line], data: td, transform, size: (bb.width().max(1.0), bb.height().max(1.0)), world, scale: 1.0, parent },
+    );
     true
 }
 
@@ -293,23 +296,24 @@ fn layer(cx: &mut Ctx, t: &usvg::Text, block: &[Line], m: Affine, s: f64, world:
     let (w, h) = (lay.width.ceil().max(1.0), lay.height.max(1.0));
     let baseline = lay.lines.first().map_or(0.0, |l| l.baseline);
     let transform = m * Affine::translate((s * first.x - anchor_k(first.anchor) * w, s * first.y - baseline));
-    add_layer(cx, t, block, td, transform, (w, h), world, s, parent);
+    add_layer(cx, TextLayer { source: t, block, data: td, transform, size: (w, h), world, scale: s, parent });
+}
+
+struct TextLayer<'text, 'block, 'span> {
+    source: &'text usvg::Text,
+    block: &'block [Line<'span>],
+    data: TextData,
+    transform: Affine,
+    size: (f64, f64),
+    world: Affine,
+    scale: f64,
+    parent: NodeId,
 }
 
 /// Add text layer `td` of `block` at `transform` with box `(w, h)`, with the spans' fills and the
 /// first span's stroke (`world`: the SVG text's space; `s`: the scale folded into font sizes).
-#[allow(clippy::too_many_arguments)]
-fn add_layer(
-    cx: &mut Ctx,
-    t: &usvg::Text,
-    block: &[Line],
-    mut td: TextData,
-    transform: Affine,
-    (w, h): (f64, f64),
-    world: Affine,
-    s: f64,
-    parent: NodeId,
-) {
+fn add_layer(cx: &mut Ctx, layer: TextLayer<'_, '_, '_>) {
+    let TextLayer { source: t, block, data: mut td, transform, size: (w, h), world, scale: s, parent } = layer;
     let Some(first) = block.first() else { return };
     let spans: Vec<&usvg::TextSpan> = block.iter().flat_map(|l| l.spans.iter().map(|sp| sp.2)).collect();
     if spans.iter().all(|sp| !sp.is_visible()) {

@@ -25,6 +25,12 @@ pub enum Outgoing {
 /// Why a viewer's batch is refused.
 pub const VIEW_ONLY: &str = "you can only view this file (your link is view-only)";
 
+/// A new style, variable, collection or comment may not take an id in a space at or above this
+/// that isn't its creator's. Client ids start above every space in the document after a restart,
+/// so no member can use them up: at least this many always remain. Lower spaces stay open, for
+/// entries imported from other files' sessions.
+pub const NO_SESSION_SPACE: u32 = 1 << 31;
+
 /// What changed a server's lasting state, in order: what a store appends to its log between
 /// snapshots ([`Server::journaling`]) and replays over the last snapshot after a restart
 /// ([`Server::replay`]). Presence and who is connected aren't in it.
@@ -77,6 +83,10 @@ pub struct Server {
     signals: BTreeSet<u32>,
     /// Who spotlights now (a newcomer is told).
     spotlight: Option<u32>,
+    /// Saved history this server restored or replayed left image entries out (or may give a
+    /// resuming client other bytes under a key it holds): every resuming client catches up with
+    /// the snapshot, not the log.
+    resync: bool,
 }
 
 /// The most client ids a session remembers for reconnecting (the oldest disconnected ones go
@@ -127,6 +137,7 @@ impl Server {
             journal: None,
             signals: BTreeSet::new(),
             spotlight: None,
+            resync: false,
         }
     }
 
@@ -148,16 +159,28 @@ impl Server {
     /// reconnect with their ids). A log that doesn't lead up to the sequence number is dropped
     /// (clients then catch up with a snapshot).
     pub fn restore(state: SessionState, token: impl Into<String>, limits: Limits) -> Result<Server, Error> {
-        let replica = Replica::from_snapshot(&state.snapshot)?;
+        let (replica, left_out) = Replica::from_snapshot_leaving_out(&state.snapshot)?;
         let mut server = Server::new(replica.document().clone(), token, limits);
         server.state = replica;
         server.session = state.session;
         server.seq = state.seq;
-        server.next_client = server.next_client.max(state.next_client);
+        // A counter stuck at the top (saved while an out-of-range id in the document blocked
+        // every join) carries on above the ids actually handed out.
+        let saved = match state.next_client {
+            u32::MAX => state.issued.keys().chain(state.log.iter().map(|a| &a.author)).max().map_or(0, |c| c.saturating_add(1)),
+            n => n,
+        };
+        server.next_client = server.next_client.max(saved);
         server.issued = state.issued.into_iter().filter(|(id, _)| *id < server.next_client).collect();
         server.deleted = state.deleted;
         server.removed = state.removed;
         let contiguous = state.log.windows(2).all(|w| matches!(w, [a, b] if a.seq + 1 == b.seq));
+        // History saved before the image checks may hold image entries they refuse. The snapshot
+        // opens without them, and a saved log putting images may give a resuming client other
+        // bytes under a key it holds, which this state can't check: either way resuming clients
+        // catch up with the snapshot.
+        let puts_images = state.log.iter().flat_map(|a| &a.changes).any(Change::is_image);
+        server.resync = left_out > 0 || puts_images;
         if contiguous && state.log.last().is_none_or(|a| a.seq == state.seq) {
             for a in state.log {
                 server.remember(a);
@@ -198,9 +221,15 @@ impl Server {
                 Ok(())
             }
             Journal::Accepted(acc) if acc.seq <= self.seq => Ok(()),
-            Journal::Accepted(acc) => {
+            Journal::Accepted(mut acc) => {
                 if acc.seq != self.seq + 1 {
                     return Err(Error::Protocol(format!("batch {} after {}", acc.seq, self.seq)));
+                }
+                // A log written before the image checks may hold an image entry they refuse: the
+                // batch replays without it, so the edits after it aren't dropped with the rest of
+                // the log, and resuming clients catch up with the snapshot.
+                if acc.changes.iter().any(Change::is_image) && self.state.clone().apply_kept(&mut acc.changes, Change::is_image)? > 0 {
+                    self.resync = true;
                 }
                 self.accept(acc.author, self.seq, &acc.changes)?;
                 self.issued.entry(acc.author).or_default().note(acc.batch_id, false);
@@ -284,7 +313,9 @@ impl Server {
         // The log holds every batch after `floor`.
         let floor = self.log.front().map_or(self.seq, |a| a.seq.saturating_sub(1));
         let catch_up = match resume {
-            Some(r) if r.seq <= self.seq && r.seq >= floor => CatchUp::Delta(self.log.iter().filter(|a| a.seq > r.seq).cloned().collect()),
+            Some(r) if !self.resync && r.seq <= self.seq && r.seq >= floor => {
+                CatchUp::Delta(self.log.iter().filter(|a| a.seq > r.seq).cloned().collect())
+            }
             _ => CatchUp::Snapshot(self.state.snapshot().map_err(|e| refuse(&e.to_string()))?),
         };
         let (id, secret) = match resume {
@@ -481,9 +512,9 @@ impl Server {
 
     /// The document-level entries (styles, variables, collections, comments) a batch adds or
     /// removes, each with whether it is there afterwards. A new one is refused when its id lies in
-    /// the space of another client this session gave an id to (unless it was removed before: undo
-    /// puts entries back); ids from before the session (space 0, earlier sessions, other files)
-    /// are fine.
+    /// the space of another client this session gave an id to, or in a space at or above
+    /// [`NO_SESSION_SPACE`] (unless it was removed before: undo puts entries back); ids from
+    /// before the session (space 0, earlier sessions, other files) are fine.
     fn check_entries(&self, from: u32, changes: &[Change], after: &Document) -> Result<Vec<(Entry, bool)>, Error> {
         let before = self.state.document();
         let mut touched: BTreeSet<Entry> = BTreeSet::new();
@@ -510,7 +541,7 @@ impl Server {
             }
             if now
                 && !self.removed.contains(&entry)
-                && let Some(space) = entry.id_space().filter(|s| *s != from && self.issued.contains_key(s))
+                && let Some(space) = entry.id_space().filter(|s| *s != from && (self.issued.contains_key(s) || *s >= NO_SESSION_SPACE))
             {
                 return Err(Error::Invalid(format!("new {} isn't in client {from}'s id space (it is client {space}'s)", entry.describe())));
             }

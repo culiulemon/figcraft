@@ -49,6 +49,10 @@ zbus = { version = "5", default-features = false, features = ["async-io", "block
 # unsafe, which the workspace forbids). Pinned exactly: review the diff before bumping.
 [target.'cfg(target_os = "macos")'.dependencies]
 fmv-macos-events = "=0.1.0"
+# A macOS app menu whose Quit (⌘Q) asks the app first (sends the root window a close request, the
+# same guarded path as the close button); winit's default Quit ends the process through
+# `terminate:`, losing unsaved changes without a word (issue #857).
+craft-menu = { workspace = true }
 
 [dev-dependencies]
 wat = { workspace = true }

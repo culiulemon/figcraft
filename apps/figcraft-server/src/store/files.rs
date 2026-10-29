@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    Access, Action, AdminReply, BLOCKED, Change, Entry, FILES, FileInfo, FileRow, HostInfo, Instant, IpAddr, KEY_ONLY, LINKS, LOG, LOG_HEADER,
+    MAX_BLOCKED, MAX_OWNED, MAX_REPORTS, META, Meta, NewLink, OpenFile, OwnedFile, REPORTS, Replica, ReportInfo, SNAPSHOT, SWEEP_EVERY, Server,
+    Store, clean_name, clean_reason, disk, fs, hash, ip_blocks, ip_key, new_link, now, same_secret, token, write_json,
+};
 
 impl Store {
     /// Keep a document (its snapshot) as a new file with an edit link and a view link.
@@ -222,7 +226,7 @@ impl Store {
     pub fn break_log(&mut self, file: &str) {
         let path = self.dir(file).join(LOG);
         if let Some(log) = self.files.get_mut(file).and_then(|e| e.log.as_mut())
-            && let Ok(f) = File::open(path)
+            && let Ok(f) = std::fs::File::open(path)
         {
             log.file = f;
         }

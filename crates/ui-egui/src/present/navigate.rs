@@ -1,5 +1,5 @@
 use super::scroll::{apply_scroll, clamp_scroll, fit_viewport, page_settings, raise_fixed, viewport};
-use super::*;
+use super::{Anim, Arc, Document, Easing, NodeId, Presenter, Scroller, Snapshot, Transition, Trigger, Value, Visit, json};
 
 impl Presenter {
     /// Close the top overlay; it animates out with its opening transition reversed.

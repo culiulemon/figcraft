@@ -4,7 +4,7 @@ use super::axes::round_axis;
 use super::picker::{FontPick, font_picker};
 #[cfg(test)]
 use super::spacing::{parse_letter_spacing, parse_line_height};
-use super::*;
+use super::{Align2, Arc, Color32, CornerRadius, FIELD_H, Icon, Id, Rect, Sense, Stroke, StrokeKind, Tokens, Ui, icons, pos2, regular, tr, vec2};
 
 pub(super) fn caption(ui: &mut Ui, s: &str) {
     let t = Tokens::get(ui.ctx());
@@ -147,6 +147,9 @@ pub(super) fn paint_lead(p: &egui::Painter, r: Rect, g: LeadGlyph, col: Color32)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::panels::typography::{target_styles, uniform};
+    use figcraft_doc::{Document, LetterSpacing, LineHeight, Node, NodeKind, TextData, TextStyle};
+    use serde_json::json;
 
     #[test]
     fn small_caps_sample_draws_only_letters_the_ui_font_has() {

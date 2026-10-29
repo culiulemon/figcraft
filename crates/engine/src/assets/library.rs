@@ -15,7 +15,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use figcraft_doc::proto::Action;
-use figcraft_doc::*;
+use figcraft_doc::{
+    Collection, CollectionId, Document, ImportedComponent, ImportedRecord, ImportedStyle, LibraryAsset, LibraryCollection, LibraryLink,
+    LibraryManifest, LibraryStyle, LibraryVariable, Node, NodeId, NodeKind, PropDef, PublishedLibrary, Style, StyleKind, Variable, VariableId,
+    VariableValue, Variables, node_images, paint_images, used_images,
+};
 use serde_json::Value;
 
 use crate::components::inside_instance;

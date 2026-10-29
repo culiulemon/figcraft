@@ -1,5 +1,5 @@
 use super::instances::PROP_BINDING;
-use super::*;
+use super::{Document, Node, NodeId, NodeKind, PropDef, Sizing, TextAutoResize, TextData, inside_instance, owning_component, variant_set};
 
 /// The property groups whose value layer `n` takes from the same variables as its main layer
 /// `src` (they differ only where the two resolve in different variable modes).

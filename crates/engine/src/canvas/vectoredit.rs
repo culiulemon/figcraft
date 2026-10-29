@@ -24,14 +24,14 @@ mod width_sides_tests;
 #[cfg(test)]
 mod width_tests;
 
-use figcraft_doc::*;
+use figcraft_doc::{Corners, Document, HandleMirroring, NodeId, NodeKind, StrokeAlign, StrokeCap, StrokeJoin, VectorNetwork, Vertex, WindingRule};
 use figcraft_geom::{Affine, Point, Rect, Vec2};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::cmd::CommandSpec;
 use crate::cmd::props::enum_of;
-use crate::params::*;
+use crate::params::{boolean, f64_of, get, id, num, num_or, req_num, string, targets};
 use crate::{EngineError, Result, Session, bad, spec};
 
 pub(crate) use pointer::VGesture;

@@ -1,6 +1,11 @@
 use super::instance::preferred_arg;
 use super::variants::{fit_set, wrap_in_set};
-use super::*;
+use super::{
+    BTreeMap, Document, NodeId, NodeKind, PROP_BINDING, PropDef, Result, SLOT, Session, Value, VariableType, VariableValue, bad, boolean,
+    default_variant, find_variant, get, id, id_of, inside_instance, instances_of, json, main_of, ok, owning_component, prop_default_value,
+    req_string, req_targets, set_boolean_default, slot_edited, slots_of, string, takes_value, targets, variant_conflicts, variant_name,
+    variant_options, variant_props, variant_set,
+};
 
 /// Whether instance `id` has a component property `name` that a `kind` variable can drive (a
 /// boolean property takes a boolean variable, a text or variant property a string one).

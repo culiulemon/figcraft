@@ -8,7 +8,10 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use figcraft_color::PaintKind;
-use figcraft_doc::*;
+use figcraft_doc::{
+    CollectionId, Document, EffectKind, LetterSpacing, LineHeight, ModeId, Node, NodeId, NodeKind, Style, StyleId, StyleKind, TextStyle, VariableId,
+    VariableType, VariableValue, Variables,
+};
 
 use crate::cmd::lists::{BoundList, list_binding, stop_binding};
 

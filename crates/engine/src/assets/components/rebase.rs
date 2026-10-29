@@ -1,6 +1,6 @@
 use super::diff::{diff_groups, variable_groups};
 use super::instances::{field_group, path_map};
-use super::*;
+use super::{BTreeMap, BTreeSet, Document, MAX_DEPTH, Node, NodeId, NodeKind, default_instance_name, holds_content};
 
 /// Bounded source and parent lookups while a rebase reads an unchanged document.
 pub(super) struct RebaseSources<'a> {

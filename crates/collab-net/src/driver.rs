@@ -2,9 +2,10 @@
 //! target: a [`Driver`] reacts to socket events and to the clock the way the native guest's
 //! threads do — hello on open (resuming as the same client after a drop), presence held until the
 //! welcome and changes made for an earlier connection dropped (the sync client sends again what
-//! the server didn't get), presence throttled to about 30 a second (latest wins), a ping when quiet, a connection that goes silent counted as
-//! dropped, and reconnects with growing pauses after a live connection drops. The browser layer
-//! (`web.rs`) feeds it the WebSocket's events and wakes it at [`Driver::deadline`].
+//! the server didn't get), presence throttled to about 30 a second (latest wins), a ping every
+//! keep-alive interval, a connection that goes silent counted as dropped, and reconnects with
+//! growing pauses after a live connection drops. The browser layer (`web.rs`) feeds it the
+//! WebSocket's events and wakes it at [`Driver::deadline`].
 //!
 //! A join by code ([`GuestConfig::code`]) first asks the server which file the code opens on a
 //! connection of its own, then joins that file as with a link; a server that doesn't know the
@@ -36,13 +37,15 @@ struct Conn {
     opened: bool,
     welcomed: bool,
     seen: Seen,
-    last_sent: Instant,
+    /// The last ping (or the connection's start): one goes out every keep-alive interval, whatever
+    /// else is sent, since presence gets no answer and only what the host sends counts as heard.
+    last_ping: Instant,
     last_heard: Instant,
 }
 
 impl Conn {
     fn new(now: Instant) -> Self {
-        Self { started: now, opened: false, welcomed: false, seen: Seen::default(), last_sent: now, last_heard: now }
+        Self { started: now, opened: false, welcomed: false, seen: Seen::default(), last_ping: now, last_heard: now }
     }
 }
 
@@ -106,7 +109,7 @@ impl<S: Socket> Driver<S> {
             Some(code) => ClientMsg::Resolve(Resolve { protocol: PROTOCOL, client_version: message::client_version(), code: code.clone() }),
             None => hello(&self.cfg, &self.resume),
         };
-        if !self.write(&hello, now) {
+        if !self.write(&hello) {
             self.end(Outcome::Retry("the connection dropped".into()), now);
         }
     }
@@ -173,7 +176,7 @@ impl<S: Socket> Driver<S> {
             return;
         }
         if let Some(p) = self.throttle.offer(p, now)
-            && !self.write(&ClientMsg::Presence(p), now)
+            && !self.write(&ClientMsg::Presence(p))
         {
             self.end(Outcome::Retry("the connection dropped".into()), now);
         }
@@ -186,7 +189,7 @@ impl<S: Socket> Driver<S> {
         if !self.conn.as_ref().is_some_and(|c| c.welcomed) {
             return;
         }
-        if !self.write(&msg, now) {
+        if !self.write(&msg) {
             self.end(Outcome::Retry("the connection dropped".into()), now);
         }
     }
@@ -204,7 +207,7 @@ impl<S: Socket> Driver<S> {
         let l = &self.cfg.limits;
         let conn = self.conn.as_ref().map(|c| {
             if c.opened {
-                [Some(c.last_sent + l.keepalive), Some(c.last_heard + l.idle_timeout), if c.welcomed { self.throttle.due() } else { None }]
+                [Some(c.last_ping + l.keepalive), Some(c.last_heard + l.idle_timeout), if c.welcomed { self.throttle.due() } else { None }]
             } else {
                 [Some(c.started + self.cfg.connect_timeout), None, None]
             }
@@ -223,7 +226,7 @@ impl<S: Socket> Driver<S> {
         }
         let l = self.cfg.limits;
         let Some(c) = self.conn.as_ref() else { return };
-        let (opened, started, last_heard, last_sent) = (c.opened, c.started, c.last_heard, c.last_sent);
+        let (opened, started, last_heard, last_ping) = (c.opened, c.started, c.last_heard, c.last_ping);
         if !opened {
             if now >= started + self.cfg.connect_timeout {
                 self.end(Outcome::Retry(format!("no answer from {}", self.cfg.invite.server.display())), now);
@@ -233,21 +236,23 @@ impl<S: Socket> Driver<S> {
         if now >= last_heard + l.idle_timeout {
             return self.end(Outcome::Retry("the host stopped answering".into()), now);
         }
-        let ok = match self.throttle.take_due(now) {
-            Some(p) => self.write(&ClientMsg::Presence(p), now),
-            None if now >= last_sent + l.keepalive => self.write(&ClientMsg::Ping, now),
-            None => true,
-        };
+        let ok = self.throttle.take_due(now).is_none_or(|p| self.write(&ClientMsg::Presence(p)));
+        let ok = ok && (now < last_ping + l.keepalive || self.ping(now));
         if !ok {
             self.end(Outcome::Retry("the connection dropped".into()), now);
         }
     }
 
-    /// Send one message; false when it couldn't go.
-    fn write(&mut self, msg: &ClientMsg, now: Instant) -> bool {
+    /// Send a ping; false when it couldn't go.
+    fn ping(&mut self, now: Instant) -> bool {
         if let Some(c) = self.conn.as_mut() {
-            c.last_sent = now;
+            c.last_ping = now;
         }
+        self.write(&ClientMsg::Ping)
+    }
+
+    /// Send one message; false when it couldn't go.
+    fn write(&mut self, msg: &ClientMsg) -> bool {
         message::encode(msg).is_ok_and(|b| self.sock.send(&b))
     }
 

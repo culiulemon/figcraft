@@ -62,6 +62,7 @@ code.
 - No `unwrap()`, `expect()`, `panic!`, `unreachable!`, `todo!`, `unimplemented!` in shipped code
   (workspace clippy lints deny them; tests may use them). Return `Result`/`Option`; use `.get()` for
   data-derived indexes; slice strings only at char boundaries; check floats are finite; cap sizes.
+- New workspace crates must include `[lints] workspace = true` in `Cargo.toml` to inherit `[workspace.lints]`. Production crate roots must declare the required crate-level lint attributes before modules or other crate items; crate-level `//!` documentation may precede them.
 - `figcraft_engine::guard` turns a panicking command into `EngineError::Internal` and the document
   is rolled back; the desktop app also guards each UI frame and writes recovery copies. These are
   safety nets, not substitutes for `Result`.

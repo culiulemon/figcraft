@@ -2,7 +2,11 @@
 
 use egui::{Align2, Color32, CornerRadius, Id, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
 use figcraft_color::{BlendMode, Paint, PaintKind};
-use figcraft_doc::*;
+use figcraft_doc::{
+    Blur, BlurType, BoolOp, Brush, Document, Effect, EffectKind, ExportFormat, ExportSetting, Glass, GridAlign, GridKind, LayoutGrid,
+    MAX_BLUR_RADIUS, MaskType, Node, NodeId, NodeKind, Noise, NoiseMode, Shadow, StrokeAlign, StrokeCap, StrokeJoin, StrokeProps, Texture,
+    VariableType, WidthPoint, WidthPreset, WidthProfile,
+};
 use figcraft_engine::cmd::lists::{moved_index, removed_index};
 use serde_json::{Value, json};
 
@@ -27,6 +31,8 @@ use inspect::inspect;
 pub(crate) use inspect::{inspect_section, prop_row};
 #[cfg(test)]
 pub(crate) use menu::menu_row_width;
+#[cfg(test)]
+pub(crate) use menu::preview_blend;
 pub use menu::{blend_menu, context_popup, menu_check, menu_item, menu_item_beside_checks, menu_item_with, menu_popup, menu_row};
 pub(crate) use menu::{block, menu_style, row, row_rect};
 use paints::{appearance, paints, variable_modes};

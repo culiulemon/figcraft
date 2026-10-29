@@ -61,6 +61,18 @@ impl Default for SvgOptions {
     }
 }
 
+struct NodePaint<'a> {
+    node: &'a Node,
+    xf: Affine,
+    depth: usize,
+    paint_clip: String,
+    kid_clip: Option<String>,
+    inherited: Option<String>,
+    outline: Option<(BezPath, figcraft_render::FillRule)>,
+    grains: String,
+    size: (f64, f64),
+}
+
 struct W<'a> {
     doc: &'a Document,
     /// The exported layers, in z-order (what backdrops see).
@@ -458,6 +470,12 @@ impl W<'_> {
             NodeKind::Group | NodeKind::Page { .. } => None,
             _ => figcraft_render::node_outline(self.doc, n),
         };
+        self.render_node(NodePaint { node: n, xf, depth, paint_clip, kid_clip, inherited, outline, grains, size: (w, h) });
+        self.body.push_str("</g>");
+    }
+
+    fn render_node(&mut self, paint: NodePaint<'_>) {
+        let NodePaint { node: n, xf, depth, paint_clip, kid_clip, inherited, outline, grains, size: (w, h) } = paint;
         let closed = figcraft_doc::geometry::is_closed(n) || matches!(n.kind, NodeKind::BooleanOp { .. } | NodeKind::Text(_));
         let live_text = if self.opts.outline_text { None } else { self.text_element(n, xf) };
         let run_paths = if live_text.is_none() { text_run_paths(n) } else { None };
@@ -486,92 +504,117 @@ impl W<'_> {
         }
         // Inner shadows paint over the fills, under the children and strokes.
         if let Some(o) = &outline {
-            for e in n.effects.iter().filter(|e| e.visible) {
-                if let EffectKind::InnerShadow(s) = &e.kind {
-                    self.inner_shadow(o, s, xf);
-                }
-            }
+            self.inner_shadows(n, o, xf);
         }
         if !matches!(n.kind, NodeKind::BooleanOp { .. }) && !n.children.is_empty() {
-            let mut kid_clip = kid_clip;
-            if n.clip
-                && n.kind.is_frame_like()
-                && let Some((p, _)) = &outline
-            {
-                // Its own clip, within the clips around it.
-                let cid = self.id("clip");
-                let mut cp = p.clone();
-                cp.apply_affine(xf);
-                let _ = write!(self.defs, "<clipPath id=\"{cid}\"{}><path d=\"{}\"/></clipPath>", clip_attr(&kid_clip), path_d(&cp));
-                kid_clip = Some(cid);
-            }
-            self.clip = kid_clip;
-            let kids = n.children.clone();
-            for run in self.doc.paint_runs(n) {
-                let Some(&c) = kids.get(run.start) else { continue };
-                if self.doc.node(c).is_some_and(|cn| cn.is_mask && cn.visible) {
-                    let kind = self.doc.node(c).map(|mn| mn.mask_type).unwrap_or_default();
-                    if kind == figcraft_doc::MaskType::Vector {
-                        // A vector mask is a clip path: its outline.
-                        let cid = self.id("clip");
-                        let outline =
-                            self.doc.node(c).and_then(|mn| Some((xf * mn.transform, figcraft_render::subtree_outline(self.doc, mn, depth + 1)?)));
-                        let (shape, cr) = match &outline {
-                            Some((mxf, (mp, rule))) => (
-                                format!(" transform=\"{}\" d=\"{}\"", matrix(*mxf), path_d(mp)),
-                                if *rule == figcraft_render::FillRule::EvenOdd { " clip-rule=\"evenodd\"" } else { "" },
-                            ),
-                            None => (" d=\"\"".to_string(), ""),
-                        };
-                        let _ = write!(self.defs, "<clipPath id=\"{cid}\"><path{shape}{cr}/></clipPath>");
-                        let _ = write!(self.body, "<g clip-path=\"url(#{cid})\">");
-                    } else {
-                        // The layer as drawn: its alpha or luminance masks.
-                        let mid = self.id("mask");
-                        let saved = std::mem::take(&mut self.body);
-                        let outer = self.mask.replace(c);
-                        let clip = self.clip.take();
-                        self.node(c, xf, depth + 1);
-                        self.clip = clip;
-                        self.mask = outer;
-                        let mask_body = std::mem::replace(&mut self.body, saved);
-                        let alpha = if kind == figcraft_doc::MaskType::Alpha { " style=\"mask-type:alpha\"" } else { "" };
-                        let _ = write!(self.defs, "<mask id=\"{mid}\" maskUnits=\"userSpaceOnUse\"{alpha}>{mask_body}</mask>");
-                        let _ = write!(self.body, "<g mask=\"url(#{mid})\">");
-                    }
-                    for k in kids.get(run.start + 1..run.end).unwrap_or(&[]) {
-                        self.node(*k, xf, depth + 1);
-                    }
-                    self.body.push_str("</g>");
-                } else {
-                    self.node(c, xf, depth + 1);
-                }
-            }
-            self.clip = inherited;
+            self.children(n, xf, depth, outline.as_ref(), kid_clip, inherited);
         }
         if n.has_visible_stroke()
             && let Some(simple) = self.opts.simplify_stroke.then(|| self.simple_stroke(n, xf)).flatten()
         {
             self.body.push_str(&clipped(&paint_clip, simple));
         } else if n.has_visible_stroke() {
-            let geom = match &n.kind {
-                NodeKind::BooleanOp { .. } | NodeKind::Text(_) => outline.as_ref().map(|(p, _)| p.clone()),
-                _ => figcraft_doc::geometry::stroke_geometry(n),
+            self.stroke_paths(n, xf, outline.as_ref(), closed, &paint_clip);
+        }
+        self.body.push_str(&grains);
+    }
+
+    /// Paints the children of `n`, each mask layer wrapping the layers it covers.
+    fn children(
+        &mut self,
+        n: &Node,
+        xf: Affine,
+        depth: usize,
+        outline: Option<&(BezPath, figcraft_render::FillRule)>,
+        mut kid_clip: Option<String>,
+        inherited: Option<String>,
+    ) {
+        if n.clip
+            && n.kind.is_frame_like()
+            && let Some((p, _)) = &outline
+        {
+            // Its own clip, within the clips around it.
+            let cid = self.id("clip");
+            let mut cp = p.clone();
+            cp.apply_affine(xf);
+            let _ = write!(self.defs, "<clipPath id=\"{cid}\"{}><path d=\"{}\"/></clipPath>", clip_attr(&kid_clip), path_d(&cp));
+            kid_clip = Some(cid);
+        }
+        self.clip = kid_clip;
+        let kids = n.children.clone();
+        for run in self.doc.paint_runs(n) {
+            let Some(&c) = kids.get(run.start) else { continue };
+            if self.doc.node(c).is_some_and(|cn| cn.is_mask && cn.visible) {
+                let kind = self.doc.node(c).map(|mn| mn.mask_type).unwrap_or_default();
+                self.open_mask(c, kind, xf, depth);
+                for k in kids.get(run.start + 1..run.end).unwrap_or(&[]) {
+                    self.node(*k, xf, depth + 1);
+                }
+                self.body.push_str("</g>");
+            } else {
+                self.node(c, xf, depth + 1);
+            }
+        }
+        self.clip = inherited;
+    }
+
+    /// The inner shadows of `n` over its `outline`.
+    fn inner_shadows(&mut self, n: &Node, outline: &Outline, xf: Affine) {
+        for e in n.effects.iter().filter(|e| e.visible) {
+            if let EffectKind::InnerShadow(s) = &e.kind {
+                self.inner_shadow(outline, s, xf);
+            }
+        }
+    }
+
+    /// Opens the `<g>` that the mask layer `c` clips or masks the layers after it with.
+    fn open_mask(&mut self, c: NodeId, kind: figcraft_doc::MaskType, xf: Affine, depth: usize) {
+        if kind == figcraft_doc::MaskType::Vector {
+            // A vector mask is a clip path: its outline.
+            let cid = self.id("clip");
+            let outline = self.doc.node(c).and_then(|mn| Some((xf * mn.transform, figcraft_render::subtree_outline(self.doc, mn, depth + 1)?)));
+            let (shape, cr) = match &outline {
+                Some((mxf, (mp, rule))) => (
+                    format!(" transform=\"{}\" d=\"{}\"", matrix(*mxf), path_d(mp)),
+                    if *rule == figcraft_render::FillRule::EvenOdd { " clip-rule=\"evenodd\"" } else { "" },
+                ),
+                None => (" d=\"\"".to_string(), ""),
             };
-            if let Some(g) = geom {
-                let area = figcraft_render::draw::stroke_area(n, &g, closed);
-                let even = n.stroke.sides.is_some() || (n.stroke.dashes.is_empty() && closed && n.stroke.align != figcraft_doc::StrokeAlign::Center);
-                let fr = if even { " fill-rule=\"evenodd\"" } else { "" };
-                for p in &n.strokes {
-                    if let Some(a) = self.paint_attr(p, w, h) {
-                        let el = format!("<path transform=\"{}\" d=\"{}\" {a}{fr}/>", matrix(xf), path_d(&area));
-                        self.body.push_str(&clipped(&paint_clip, el));
-                    }
+            let _ = write!(self.defs, "<clipPath id=\"{cid}\"><path{shape}{cr}/></clipPath>");
+            let _ = write!(self.body, "<g clip-path=\"url(#{cid})\">");
+        } else {
+            // The layer as drawn: its alpha or luminance masks.
+            let mid = self.id("mask");
+            let saved = std::mem::take(&mut self.body);
+            let outer = self.mask.replace(c);
+            let clip = self.clip.take();
+            self.node(c, xf, depth + 1);
+            self.clip = clip;
+            self.mask = outer;
+            let mask_body = std::mem::replace(&mut self.body, saved);
+            let alpha = if kind == figcraft_doc::MaskType::Alpha { " style=\"mask-type:alpha\"" } else { "" };
+            let _ = write!(self.defs, "<mask id=\"{mid}\" maskUnits=\"userSpaceOnUse\"{alpha}>{mask_body}</mask>");
+            let _ = write!(self.body, "<g mask=\"url(#{mid})\">");
+        }
+    }
+
+    /// The visible strokes of `n` as filled outline paths.
+    fn stroke_paths(&mut self, n: &Node, xf: Affine, outline: Option<&(BezPath, figcraft_render::FillRule)>, closed: bool, paint_clip: &str) {
+        let geom = match &n.kind {
+            NodeKind::BooleanOp { .. } | NodeKind::Text(_) => outline.map(|(p, _)| p.clone()),
+            _ => figcraft_doc::geometry::stroke_geometry(n),
+        };
+        if let Some(g) = geom {
+            let area = figcraft_render::draw::stroke_area(n, &g, closed);
+            let even = n.stroke.sides.is_some() || (n.stroke.dashes.is_empty() && closed && n.stroke.align != figcraft_doc::StrokeAlign::Center);
+            let fr = if even { " fill-rule=\"evenodd\"" } else { "" };
+            for p in &n.strokes {
+                if let Some(a) = self.paint_attr(p, n.width, n.height) {
+                    let el = format!("<path transform=\"{}\" d=\"{}\" {a}{fr}/>", matrix(xf), path_d(&area));
+                    self.body.push_str(&clipped(paint_clip, el));
                 }
             }
         }
-        self.body.push_str(&grains);
-        self.body.push_str("</g>");
     }
 
     /// `name` as an `id` not used yet in this file (spaces as underscores; repeats get `_2`…).

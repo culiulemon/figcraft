@@ -39,6 +39,19 @@ fn status(s: &mut Session, ids: &[NodeId], st: &str) {
 }
 
 #[test]
+fn a_dev_mode_click_on_a_selected_layer_selects_just_it() {
+    let mut s = Session::new();
+    let a = idv(&ex(&mut s, "shape.rectangle", json!({"x": 0, "y": 0, "width": 40, "height": 40})));
+    let b = idv(&ex(&mut s, "shape.rectangle", json!({"x": 80, "y": 0, "width": 40, "height": 40})));
+    s.tool.dev_mode = true;
+    ex(&mut s, "select.set", json!({"ids": [a, b]}));
+    // Dev Mode starts no move gesture, so the click narrows the selection at the press itself.
+    s.pointer(&ev(PointerKind::Down, 20.0, 20.0)).unwrap();
+    s.pointer(&ev(PointerKind::Up, 20.0, 20.0)).unwrap();
+    assert_eq!(s.selection(), vec![a], "a click on one of several selected layers selects it");
+}
+
+#[test]
 fn the_dev_mode_canvas_selects_and_pans_but_never_edits() {
     let mut s = Session::new();
     let f = frame(&mut s, 0.0, "Screen");

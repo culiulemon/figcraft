@@ -198,12 +198,26 @@ fn connection_limit_rejects_excess_clients_and_reuses_finished_slots() {
     let mut clients = Vec::new();
     for _ in 0..MAX_CONNECTIONS {
         let (client, server) = pair();
-        spawn_connection(server, pending.clone(), ctx.clone(), &mut workers, Duration::from_secs(5));
+        spawn_connection(
+            server,
+            pending.clone(),
+            ctx.clone(),
+            Arc::new(figcraft_engine::events::EventLog::default()),
+            &mut workers,
+            Duration::from_secs(5),
+        );
         clients.push(client);
     }
     assert_eq!(workers.len(), MAX_CONNECTIONS);
     let (mut extra, server) = pair();
-    spawn_connection(server, pending.clone(), ctx.clone(), &mut workers, Duration::from_secs(5));
+    spawn_connection(
+        server,
+        pending.clone(),
+        ctx.clone(),
+        Arc::new(figcraft_engine::events::EventLog::default()),
+        &mut workers,
+        Duration::from_secs(5),
+    );
     assert_eq!(extra.read(&mut [0]).unwrap(), 0);
     assert_eq!(workers.len(), MAX_CONNECTIONS);
     for client in clients {
@@ -215,7 +229,7 @@ fn connection_limit_rejects_excess_clients_and_reuses_finished_slots() {
         std::thread::sleep(Duration::from_millis(1));
     }
     let (mut client, server) = pair();
-    spawn_connection(server, pending, ctx, &mut workers, Duration::from_secs(5));
+    spawn_connection(server, pending, ctx, Arc::new(figcraft_engine::events::EventLog::default()), &mut workers, Duration::from_secs(5));
     assert_eq!(workers.len(), 1);
     client.write_all(b"invalid\n").unwrap();
     assert_eq!(reply(&mut BufReader::new(client.try_clone().unwrap()))["ok"], false);
@@ -247,6 +261,39 @@ fn a_client_that_stops_reading_cannot_hold_a_worker() {
     let err = finished.recv_timeout(Duration::from_secs(5)).unwrap().unwrap_err();
     assert!(matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
     worker.join().unwrap().unwrap();
+}
+
+#[test]
+fn events_poll_is_answered_without_the_ui_queue() {
+    let (mut client, server) = pair();
+    let pending = queue();
+    let q = pending.clone();
+    let log = Arc::new(figcraft_engine::events::EventLog::default());
+    log.push("comment.added", "Doc", None, json!({"commentId": 7}));
+    let l = log.clone();
+    let worker = std::thread::spawn(move || serve_with_events(server, q, context(), l, Duration::from_secs(5)));
+    client.write_all(b"{\"id\":1,\"method\":\"events.poll\",\"params\":{\"after\":0,\"timeoutMs\":0}}\n").unwrap();
+    let mut reader = BufReader::new(client);
+    let r = reply(&mut reader);
+    assert_eq!(r["id"], 1);
+    assert_eq!(r["result"]["events"].as_array().unwrap().len(), 1);
+    assert_eq!(r["result"]["events"][0]["kind"], "comment.added");
+    assert_eq!(r["result"]["events"][0]["data"]["commentId"], 7);
+    assert_eq!(r["result"]["cursor"], 1);
+    assert!(pending.lock().unwrap().is_empty());
+    reader.get_ref().shutdown(Shutdown::Write).unwrap();
+    worker.join().unwrap().unwrap();
+}
+
+#[test]
+fn a_comment_added_in_the_session_is_pollable() {
+    let mut session = figcraft_engine::Session::new();
+    let log = session.events.clone();
+    let id = session.execute("comment.add", &json!({"x": 10, "y": 20, "text": "Fix the padding"})).unwrap()["id"].clone();
+    let r = event_poll(&log, &json!({"after": 0, "timeoutMs": 0})).unwrap();
+    assert_eq!(r["events"].as_array().unwrap().len(), 1);
+    assert_eq!(r["events"][0]["kind"], "comment.added");
+    assert_eq!(r["events"][0]["data"]["commentId"], id);
 }
 
 #[test]
@@ -341,4 +388,41 @@ fn timed_out_requests_release_a_full_deferred_ui_queue() {
     for worker in workers {
         worker.join().unwrap().unwrap();
     }
+}
+
+#[test]
+fn events_poll_rejects_an_unknown_topic_without_the_ui_queue() {
+    let (client, server) = pair();
+    let pending = queue();
+    let q = pending.clone();
+    let log = Arc::new(figcraft_engine::events::EventLog::default());
+    let l = log.clone();
+    let worker = std::thread::spawn(move || serve_with_events(server, q, context(), l, Duration::from_secs(5)));
+    let mut reader = BufReader::new(client);
+    reader.get_mut().write_all(b"{\"id\":1,\"method\":\"events.poll\",\"params\":{\"topics\":[\"nope\"],\"timeoutMs\":0}}\n").unwrap();
+    let r = reply(&mut reader);
+    assert_eq!(r["id"], 1);
+    assert_eq!(r["ok"], false);
+    assert!(r["error"].as_str().is_some_and(|e| e.contains("unknown topic")), "{r}");
+    assert!(pending.lock().unwrap().is_empty());
+    reader.get_ref().shutdown(Shutdown::Write).unwrap();
+    worker.join().unwrap().unwrap();
+}
+
+#[test]
+fn events_poll_reports_reset_for_a_cursor_ahead_of_the_log() {
+    let (client, server) = pair();
+    let log = Arc::new(figcraft_engine::events::EventLog::default());
+    log.push("comment.added", "Doc", None, json!({"commentId": 1}));
+    let q = queue();
+    let l = log.clone();
+    let worker = std::thread::spawn(move || serve_with_events(server, q, context(), l, Duration::from_secs(5)));
+    let mut reader = BufReader::new(client);
+    reader.get_mut().write_all(b"{\"id\":1,\"method\":\"events.poll\",\"params\":{\"after\":2,\"timeoutMs\":0}}\n").unwrap();
+    let r = reply(&mut reader);
+    assert_eq!(r["result"]["reset"], true, "{r}");
+    assert!(r["result"]["events"].as_array().unwrap().is_empty(), "{r}");
+    assert_eq!(r["result"]["cursor"], 1);
+    reader.get_ref().shutdown(Shutdown::Write).unwrap();
+    worker.join().unwrap().unwrap();
 }

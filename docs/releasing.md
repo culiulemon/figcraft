@@ -195,7 +195,7 @@ tar -xzf figcraft-<v>-freebsd-x86_64.tar.gz --strip-components 1 -C /usr/local
 ### Web
 
 `packaging/web/package.sh` runs `trunk build --release` in `apps/figcraft-web` (`Trunk.toml`:
-`public_url = "./"`, output `dist/web`), fails if a `.wasm` exceeds 24 MiB, and zips the site
+`public_url = "./"`, output `dist/web`), fails if a `.wasm` exceeds 25 MiB minus 512 KiB, and zips the site
 with sample `_headers`/`.htaccess` and the hosting guide. The app uses WebGPU with a WebGL2
 fallback; `?webgl` forces WebGL2. 0.1.0: wasm 17.7 MiB raw, 6.7 MiB gzip, 4.4 MiB Brotli.
 

@@ -1,5 +1,10 @@
 use super::props::{Owner, add_prop_for, delete_prop, prop_defs};
-use super::*;
+use super::{
+    BTreeMap, BTreeSet, Document, EngineError, NodeId, NodeKind, OVERRIDE_GROUPS, PROP_BINDING, PropDef, Result, SLOT, Session, Value, bad, boolean,
+    copy_group, create_instance_at, default_props, get, id_of, inside_instance, is_slot, json, keep_text_overrides, main_of, ok, owning_component,
+    owning_instance, rebase_instance, req_id, req_num, req_targets, root_instance, slot_edited, slot_name, slots_of, string, targets, unlink_layers,
+    variant_options,
+};
 
 pub(super) fn detach(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "component.detach";

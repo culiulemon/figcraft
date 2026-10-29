@@ -10,14 +10,14 @@
 //! keeps JSX's braces: `size={size}` → `size="Large"`, `{label}` → `{"Buy"}`), and
 //! `{prop ? "a" : "b"}` picks one of two strings. Any other `{…}` stays as written.
 
-use figcraft_doc::*;
+use figcraft_doc::{CodeLink, Document, NodeId, NodeKind};
 use serde_json::{Value, json};
 
 use crate::cmd::CommandSpec;
 use crate::codegen::{CodeLang, Ctx};
 use crate::component_codegen::{Component, Param, ParamKind, describe, instance_values, js_string, main_of, value_expr};
 use crate::components::{slots_of, variant_set};
-use crate::params::*;
+use crate::params::{get, id_of, targets};
 use crate::{EngineError, Result, Session, bad, spec};
 
 /// Longest template (chars).

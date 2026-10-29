@@ -11,7 +11,7 @@
 //!   (preferred ones first), select it, reset it to the main's default content.
 
 use egui::{Id, Sense, Ui, vec2};
-use figcraft_doc::*;
+use figcraft_doc::{Document, Node, NodeId, NodeKind, PropDef, VariableType};
 use figcraft_engine::cmd::component::{can_add_variant, can_combine_variants};
 use figcraft_engine::components::{
     PROP_BINDING, default_variant, inside_instance, owning_component, owning_instance, slot_def, slot_edited, slots_of, variant_conflicts,

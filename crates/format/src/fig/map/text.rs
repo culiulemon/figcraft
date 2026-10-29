@@ -1,5 +1,5 @@
 use super::paint::{paint, style_link};
-use super::*;
+use super::{Kv, Mapper, Obj, Value, View, copy_num, copy_str, json, network, num};
 
 /// The value from the last override layer holding a valid one for an optional text setting; invalid instance rows fall through.
 fn text_num(v: &View, key: &str) -> Option<f64> {
