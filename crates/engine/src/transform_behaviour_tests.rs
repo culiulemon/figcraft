@@ -695,6 +695,25 @@ fn smart_guides_snap_to_edges_centres_and_equal_spacing() {
 }
 
 #[test]
+fn a_frames_border_snaps_to_the_layers_inside_it() {
+    // Documented: snapping applies to a frame's own layers too — resizing its border snaps to the
+    // edges of the layers in it, as it does to any other layer.
+    let mut s = Session::new();
+    let f = id(&ex(&mut s, "frame.create", json!({"x": 0, "y": 0, "width": 200, "height": 200})));
+    rect(&mut s, 150.0, 10.0, 20.0, 20.0, Some(f));
+    rect(&mut s, 30.0, 100.0, 20.0, 20.0, Some(f));
+    ex(&mut s, "select.set", json!({"ids": [f]}));
+    // The right border dragged to 173 lands on the first layer's right edge (170).
+    drag(&mut s, Point::new(200.0, 120.0), Point::new(173.0, 120.0), NONE);
+    assert_eq!(size(&s, f), (170.0, 200.0));
+    ex(&mut s, "edit.undo", json!({}));
+    // The left border dragged to 28 lands on the second layer's left edge (30).
+    ex(&mut s, "select.set", json!({"ids": [f]}));
+    drag(&mut s, Point::new(0.0, 120.0), Point::new(28.0, 120.0), NONE);
+    assert_eq!(bounds(&s, f).x0, 30.0);
+}
+
+#[test]
 fn corner_cursors_stay_diagonal_whatever_the_proportions() {
     let mut s = session();
     let mod180 = |a: f64, b: f64| near((a - b).rem_euclid(180.0).min((b - a).rem_euclid(180.0)), 0.0);

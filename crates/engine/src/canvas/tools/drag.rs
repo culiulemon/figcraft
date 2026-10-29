@@ -439,7 +439,15 @@ impl Session {
         let page = self.page()?;
         let snap = self.ds().map(|d| d.view.snap_objects).unwrap_or(true) && !ev.cmd && !ev.ctrl;
         let ids: Vec<NodeId> = r.nodes.iter().map(|n| n.0).collect();
-        let targets = if snap { Some(Targets::gather(self.doc()?, page, &ids)) } else { None };
+        let targets = if snap {
+            let doc = self.doc()?;
+            let mut targets = Targets::gather(doc, page, &ids);
+            // A frame's border snaps to the layers it holds, not only to its siblings.
+            targets.add_contents(doc, &ids);
+            Some(targets)
+        } else {
+            None
+        };
         let mut p = ev.p();
         let mut guides = Vec::new();
         if let Some(t) = &targets {

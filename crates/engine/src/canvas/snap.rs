@@ -138,6 +138,26 @@ impl Targets {
         self.boxes.push(r);
     }
 
+    /// Add what the resized layers hold as targets: a frame's (or section's) border snaps to the
+    /// edges of the layers inside it. Groups and boolean groups are left out: their layers resize
+    /// with them, so there is nothing fixed in them to snap to.
+    pub fn add_contents(&mut self, doc: &Document, moving: &[NodeId]) {
+        let to = self.space.inverse();
+        for m in moving {
+            let Some(owner) = doc.node(*m) else { continue };
+            if !owner.kind.is_container() || owner.kind.bounds_follow_children() {
+                continue;
+            }
+            for d in doc.subtree(*m).into_iter().filter(|d| *d != *m) {
+                let Some(n) = doc.node(d).filter(|n| n.visible) else { continue };
+                let b = transform_rect_bbox(to * doc.world_transform(d), n.local_rect());
+                if b.is_finite() {
+                    self.add_box(b);
+                }
+            }
+        }
+    }
+
     /// A point to snap onto (a vector point, a segment midpoint): lines through it on both axes,
     /// and a marker when a moving point lands on it.
     pub fn add_point(&mut self, p: Point) {
