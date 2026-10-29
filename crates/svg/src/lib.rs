@@ -494,11 +494,32 @@ impl W<'_> {
         } else if let Some((path, rule)) = &outline
             && closed
         {
-            let fr = if *rule == figcraft_render::FillRule::EvenOdd { " fill-rule=\"evenodd\"" } else { "" };
-            for p in &n.fills {
-                if let Some(a) = self.paint_attr(p, w, h) {
-                    let el = format!("<path transform=\"{}\" d=\"{}\" {a}{fr}/>", matrix(xf), path_d(path));
-                    self.body.push_str(&clipped(&paint_clip, el));
+            if let NodeKind::Vector { network } = &n.kind
+                && network.regions.iter().any(|r| r.fills.is_some() || r.paint_space.is_some())
+            {
+                let rounded = network.rounded();
+                let net = rounded.as_ref().unwrap_or(network);
+                for (i, region) in net.regions.iter().enumerate() {
+                    let paints = region.fills.as_deref().unwrap_or(&n.fills);
+                    let fr = if region.winding == figcraft_doc::WindingRule::EvenOdd { " fill-rule=\"evenodd\"" } else { "" };
+                    if let Some(mut region_path) = net.region_path(i) {
+                        let (pw, ph, frame) = region.paint_frame(w, h);
+                        region_path.apply_affine(frame.inverse());
+                        for p in paints {
+                            if let Some(a) = self.paint_attr(p, pw, ph) {
+                                let el = format!("<path transform=\"{}\" d=\"{}\" {a}{fr}/>", matrix(xf * frame), path_d(&region_path));
+                                self.body.push_str(&clipped(&paint_clip, el));
+                            }
+                        }
+                    }
+                }
+            } else {
+                let fr = if *rule == figcraft_render::FillRule::EvenOdd { " fill-rule=\"evenodd\"" } else { "" };
+                for p in &n.fills {
+                    if let Some(a) = self.paint_attr(p, w, h) {
+                        let el = format!("<path transform=\"{}\" d=\"{}\" {a}{fr}/>", matrix(xf), path_d(path));
+                        self.body.push_str(&clipped(&paint_clip, el));
+                    }
                 }
             }
         }
@@ -826,8 +847,9 @@ impl W<'_> {
         let whole = has(&|k| matches!(k, EffectKind::Texture(_)))
             || has(&|k| matches!(k, EffectKind::LayerBlur(b) if b.is_progressive()))
             || (has(&|k| matches!(k, EffectKind::Noise(_))) && has(&|k| matches!(k, EffectKind::LayerBlur(_))))
-            // A group's inner shadows are cast by its layers' pixels, over them.
-            || (matches!(n.kind, NodeKind::Group) && has(&|k| matches!(k, EffectKind::InnerShadow(_))));
+            // A group's inner shadows are cast by its layers' pixels, over them; an image fill's by
+            // its alpha.
+            || (has(&|k| matches!(k, EffectKind::InnerShadow(_))) && figcraft_render::shadow::inner_from_pixels(self.doc, n));
         if !whole {
             return false;
         }
@@ -1140,6 +1162,8 @@ mod depth_tests;
 mod effects_tests;
 #[cfg(test)]
 mod group_effects_tests;
+#[cfg(test)]
+mod image_shadow_tests;
 #[cfg(test)]
 mod mask_export_tests;
 #[cfg(test)]

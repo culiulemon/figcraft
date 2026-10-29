@@ -178,7 +178,20 @@ impl Session {
     }
 
     pub(super) fn drag(&mut self, ev: &PointerEvent) -> Result<()> {
-        let g = std::mem::take(&mut self.tool.gesture);
+        let mut g = std::mem::take(&mut self.tool.gesture);
+        // Alt makes a move a copy whenever it goes down, before the drag or during it, and letting
+        // go of it moves the original again; a copy snaps to the layers it came from too.
+        if let Gesture::Move { targets, duplicate, .. } = &mut g
+            && *duplicate != ev.alt
+        {
+            *duplicate = ev.alt;
+            if let Some(b) = targets.moving {
+                if ev.alt { targets.add_box(b) } else { targets.remove_box(b) }
+            }
+            if let Some(it) = self.ds_mut().ok().and_then(|ds| ds.interaction.as_mut()) {
+                it.label = if ev.alt { "Duplicate" } else { "Move" }.into();
+            }
+        }
         let res = match &g {
             Gesture::None => return self.hover(ev),
             Gesture::Marquee { start, additive, base, within } => {
@@ -533,15 +546,8 @@ impl Session {
                         }
                         let Some(data) = doc.images.get(&img.image) else { continue };
                         let (iw, ih) = (f64::from(data.width), f64::from(data.height));
-                        let crop = if img.scale_mode == ImageScaleMode::Crop {
-                            img.effective_crop(iw, ih, w, h)
-                        } else {
-                            let (rw, rh) = img.rotated_size(iw.max(1.0), ih.max(1.0));
-                            let s = if img.scale_mode == ImageScaleMode::Fit { (w / rw).min(h / rh) } else { (w / rw).max(h / rh) };
-                            [w / (rw * s), 0.0, 0.0, h / (rh * s), (rw * s - w) / (2.0 * rw * s), (rh * s - h) / (2.0 * rh * s)]
-                        };
                         // A degenerate (zero-scale) layer has no inverse: its image keeps its placement.
-                        let crop = (Affine::new(crop) * to_old).as_coeffs();
+                        let crop = (Affine::new(img.placement_crop(iw, ih, w, h)) * to_old).as_coeffs();
                         if !crop.iter().all(|c| c.is_finite()) {
                             continue;
                         }

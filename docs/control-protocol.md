@@ -65,6 +65,13 @@ window, with its tabs, panels and canvas: `engine.execute` acts on the file it s
 last in front (the one the user clicked last, or the last `window.new` / `window.focus`). An
 unknown id is an error.
 
+**Documents.** `engine.execute`, `document.inspect`, `node.get` and `ui.render` take an optional
+`document`: an open file's `id` (from `doc.list`, or `document.inspect`'s `id`) or its path. The
+request acts on that file without bringing its tab to the front; the tab in front comes back
+afterwards unless the command opened or switched to another file itself. A file that isn't open is
+an error, and so is a `document` naming a file behind the tab in front on any other method
+(`ui.screenshot`, `ui.input`, `ui.key`… act on what the window shows).
+
 ## Confining file access
 
 ```sh
@@ -99,7 +106,13 @@ Run any command (the same ids as the menus, shortcuts, Actions palette, CLI and 
 calls never open dialogs: dialog requests are dropped. Returns the command's result (creation
 commands return `{"id": N}`). Paints (`fills`, `strokes`, `paint`) take a colour, the full paint
 JSON or the gradient shorthand `{"type":"linearGradient","stops":["#hex","#hex"],"from"?,"to"?}`
-(as in `docs/mcp.md`).
+(as in `docs/mcp.md`). A parameter the command's doc (`engine.commands`) doesn't list is an error
+naming it and the ones it takes, never ignored; `ids` and `id` are always taken.
+
+`agent` (a string, next to `command`) runs the command for an AI agent of that name, as the MCP
+server does with its client's name: comments it makes are signed "<agent> (agent)" ("AI agent" for
+an empty name), marked `"agent": true`, and keep their own read state. Without it the command acts
+as the user (the name from Preferences).
 
 ```json
 {"id":1,"method":"engine.execute","params":{"command":"shape.rectangle","params":{"x":10,"y":10,"width":100,"height":50}}}
@@ -107,6 +120,10 @@ JSON or the gradient shorthand `{"type":"linearGradient","stops":["#hex","#hex"]
 {"id":2,"method":"engine.execute","params":{"command":"node.set","params":{"ids":[2],"props":{"fill":"#FF6B6B","cornerRadius":8}}}}
 {"id":3,"method":"engine.execute","params":{"command":"command.batch","params":{"label":"Tidy","commands":[{"command":"align.left","params":{"ids":[2,3]}},{"command":"distribute.vertical","params":{"ids":[2,3]}}]}}}
 ```
+
+With `"onError": "continue"` in its params, `command.batch` rolls back only the steps that fail,
+runs the rest and returns one `{step, command, ok, result}` or `{step, command, ok, error}` object
+per step; the request succeeds even when some steps fail (see [MCP server](mcp.md)).
 
 Inside `command.batch`, a step can name itself with `"as"` and later steps use its result:
 `{"$ref": "name"}` in a step's params stands for the `id` in that step's result, and `{"$step": n}`

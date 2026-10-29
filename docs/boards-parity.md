@@ -1,6 +1,6 @@
 # Boards parity
 
-> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-24 · **Change:** minor (templates and tables; facilitation: a shared timer and voting sessions; the dot grid, dragging a connector's end to re-attach it, curved connectors, elbows that go around what they join) · **Target:** the incumbent's whiteboard product (behaviour from its public help centre)
+> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-29 · **Change:** minor (the connector tool shows the connector it will make while dragging, ends snapping to attach points (#1387); templates and tables; facilitation: a shared timer and voting sessions; the dot grid, dragging a connector's end to re-attach it, curved connectors, elbows that go around what they join) · **Target:** the incumbent's whiteboard product (behaviour from its public help centre)
 
 **Breadth ~47%, ready ~29% (estimated, erring low).** A board is a FigCraft file of its own kind
 (`file.newBoard`) with a dot grid on the page, sticky notes, shapes with text, connectors that
@@ -27,14 +27,14 @@ all end with the same geometry.
 | Feature | Status | Notes |
 |---|---|---|
 | Board files: File ▸ New board, the home screen's New board card, a light page | done | `file.newBoard`; the kind shows in `inspect_document`, tabs and file rows (a note mark; design files a pen nib) |
-| Board toolbar at the bottom | done | Move/Hand, Marker/Highlighter/Eraser, Sticky (colour flyout), Shapes (flyout), Connector, Text, Section, Stamp (flyout), Comment, Resources, Actions, the Design panel's button |
+| Board toolbar at the bottom | done | Move/Hand, Marker/Highlighter/Eraser, Sticky (colour flyout), Shapes (flyout), Connector, Text, Section, Stamp (flyout), Comment, Actions, then the templates and the Design panel's buttons — on the same 32 pt grid as a design file's (no Resources button, as there) |
 | Design panel hidden by default; a contextual bar above the selection | done | colour, shape, text size (S/M/L/XL), connector straight/elbow/curved and its arrow; the Design panel opens with its button or View ▸ Design panel |
 | Prototyping and Dev Mode refuse on boards | done | `proto.*`, `dev.*`, `view.prototype`, `view.devMode` say why |
 | Sticky notes | done | a square frame (200 wide, growing taller through auto layout), 8 soft colours, a soft shadow, the note's text size shrinking as it grows (24 → 11, by characters and lines), the author's name at the bottom; a click places one and starts typing; Enter or a double-click edits; Shift+Cmd/Ctrl+Enter adds the next one beside it |
 | Sticky options: hide the author, change size presets, sticky stacks | partial | `board.sticky {author: false}`; no size presets or stacks |
 | Shapes with text | done | rectangle, rounded rectangle, ellipse, diamond, triangle, speech bubble, chevron; text centred and wrapping inside the outline; shape type and text size from the contextual bar |
 | Shape auto-fit to its text, more shapes (cylinder, cross, star…), shape libraries | missing | |
-| Connectors | done | from a layer's side (the facing one, or one named) to another layer or a free point, straight, elbow or curved, arrowheads (the stroke's caps), a label in the middle of the route by length (double-click to add); re-routed when either end moves or resizes; a deleted end stays where it was |
+| Connectors | done | from a layer's side (the facing one, or one named) to another layer or a free point, straight, elbow or curved, arrowheads (the stroke's caps), a label in the middle of the route by length (double-click to add); while one is dragged out it shows as it will be made (route, line and arrowhead), the object under the pointer outlined with its four attach points (side middles), the one the end goes to ringed, and within 10 px of one the end keeps that side; re-routed when either end moves or resizes; a deleted end stays where it was |
 | Curved connectors, elbows around objects, dragging an end to re-attach | done | `board.setStyle {style: curved}` (and the contextual bar): one curve leaving and arriving along the sides; an elbow whose short way would cross what it joins goes around their boxes, 24 units clear; a selected connector shows its two ends as handles, and dragging one onto an object attaches it there (the object is outlined while dragging), onto empty canvas leaves it free (`board.reattach {id, end, target, side?}`, one undo step) |
 | Connector waypoints placed by hand | missing | routes are computed from the ends; no bend points of your own |
 | Quick-create handles (drag out a connected copy) | missing | |
@@ -63,6 +63,7 @@ all end with the same geometry.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | M12, #1387 (connector tool): while a connector is dragged out with the connector tool, the canvas shows the connector itself as it will be made (its straight, elbow or curved route, line, weight and arrowhead, built by the same code as `board.connector`), not a thin line; the object under the pointer is outlined with its four attach points (the middles of its sides), the one the end goes to ringed; within 10 px of one the end keeps that side (`fromSide`/`toSide`, and `side` when re-attaching). Hovering with the tool shows the attach points too. Escape drops the preview; releasing makes the connector in one undo step. Tests: `board_connector_tests`. Numbers unchanged |
 | 2026-10-24 | minor | M12: the dot grid on board pages (a render pass under the layers), dragging a selected connector's end onto another object or empty canvas (`board.reattach`), curved connectors, and elbows that go around the objects they join. Breadth ~35% → ~37%, ready ~20% → ~21%, ~30–60 h → ~28–56 h |
 | 2026-10-24 | minor | Facilitation (M12): a shared timer and voting sessions. Breadth ~35% → ~40%, ready ~20% → ~24%, ~30–60 h → ~26–54 h |
 | 2026-10-24 | minor | Templates (retrospective, brainstorm, weekly planner, flow chart, kanban board) from a toolbar picker or `board.template`, and tables (`board.table`, `board.tableEdit`): breadth ~35% → ~40%, ready ~20% → ~24%, remaining 30–60 h → 26–54 h |

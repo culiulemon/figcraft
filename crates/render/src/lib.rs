@@ -80,8 +80,9 @@ pub struct Options {
     /// Draw only this layer of the page, where it is (Dev Mode's focus view).
     pub solo: Option<NodeId>,
     /// A preview (the canvas): when zoomed out, approximate what's too small on screen to see in
-    /// detail, see [`lod`]. Off for everything that must be exact (exports, thumbnails); no
-    /// effect in outline mode.
+    /// detail, see [`lod`]; at any zoom, draw a large image shown smaller than its pixels from a
+    /// smaller copy (see [`images::shown`]). Off for everything that must be exact (exports,
+    /// thumbnails); no effect in outline mode.
     pub lod: bool,
     /// A stable id for the document (the canvas passes the document's address), letting isolated
     /// layers that didn't change be kept between renders (see [`layers`]). `0` draws every render
@@ -228,6 +229,7 @@ fn render_one(doc: &Document, page: NodeId, view: &View, opts: &Options) -> Opti
         outlined: &opts.outlined,
         skip: &opts.skip,
         lod,
+        preview: opts.lod,
         magnified_image_pixels: opts.magnified_image_pixels,
         under: None,
         time: 0.0,
@@ -265,6 +267,7 @@ fn nodes_into(doc: &Document, ids: &[NodeId], view: &View, pix: &mut Pixmap, tim
         outlined: &[],
         skip: &[],
         lod: false,
+        preview: false,
         magnified_image_pixels: false,
         under: None,
         time,
@@ -517,7 +520,11 @@ mod image_budget_tests;
 #[cfg(test)]
 mod image_profile_tests;
 #[cfg(test)]
+mod image_shadow_tests;
+#[cfg(test)]
 mod jpeg_sampling_tests;
+#[cfg(test)]
+mod large_image_tests;
 #[cfg(test)]
 mod layers_tests;
 #[cfg(test)]

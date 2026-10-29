@@ -261,6 +261,13 @@ fn the_scan_reads_font_files_without_an_extension() {
     assert!(system_font_dirs().iter().any(|d| d.ends_with("Adobe/CoreSync/plugins/livetype")), "Adobe Fonts' folder is scanned");
 }
 
+/// Fonts downloaded into the suite's font store (by any Craft app) are scanned with the system's.
+#[test]
+fn the_suite_font_store_is_scanned() {
+    let store = craft_font_catalog::font_store_dir(&craft_font_catalog::FontEnv::from_process());
+    assert!(store.is_none_or(|dir| system_font_dirs().contains(&dir)));
+}
+
 /// A rescan offers new families and the styles installed since, and never a file twice.
 #[test]
 fn a_rescan_offers_fonts_installed_since() {
@@ -340,8 +347,8 @@ fn font_bytes_load_into_the_db() {
     }
 }
 
-/// Apple's system font answers to the names designs use for it (SF Pro, SF UI Text, …), unless a
-/// font of that name is installed.
+/// Apple's system font answers to the names designs and CSS use for it (SF Pro, SF UI Text,
+/// system-ui, …), unless a font of that name is installed.
 #[test]
 fn apple_system_font_names_find_the_system_font() {
     let mut db = FontDb::default();
@@ -352,7 +359,11 @@ fn apple_system_font_names_find_the_system_font() {
     for name in ["SF Pro", "SF Pro Text", "SF Pro Display", "SF UI Text", "SF UI Display", ".SF NS Text", "San Francisco"] {
         assert!(db.has_family(name), "{name}");
     }
+    for name in ["system-ui", "-apple-system", "BlinkMacSystemFont", ".AppleSystemUIFont"] {
+        assert_eq!(db.key(name), "system font", "{name}");
+    }
     assert!(!db.has_family("SF Mono"));
+    assert!(!db.has_family("ui-monospace"));
     db.pending.insert("sf pro".into(), ("SF Pro".into(), Vec::new()));
     assert_eq!(db.key("SF Pro"), "sf pro", "an installed SF Pro is itself");
     assert_eq!(db.key("SF UI Text"), "system font");

@@ -55,9 +55,14 @@ impl Headless {
     }
 
     fn execute(&mut self, cmd: &str, params: &Value) -> Result<Value, String> {
+        self.execute_as(None, cmd, params)
+    }
+
+    /// A command for `agent` (an AI agent's name, `engine.execute {agent}`) or for the user.
+    fn execute_as(&mut self, agent: Option<&str>, cmd: &str, params: &Value) -> Result<Value, String> {
         // What happened in a live session since the last call (latest presence only).
         self.session.live_poll();
-        let r = self.session.execute(cmd, params).map_err(|e| e.to_string());
+        let r = self.session.execute_as(agent, cmd, params).map_err(|e| e.to_string());
         self.session.live_sync();
         // No UI: dialogs and panels requested by commands are dropped.
         self.session.ui_requests.clear();
@@ -234,8 +239,8 @@ impl Headless {
     }
 }
 
-impl Backend for Headless {
-    fn call(&mut self, method: &str, p: Value) -> Result<Value, String> {
+impl Headless {
+    fn dispatch(&mut self, method: &str, p: Value) -> Result<Value, String> {
         match method {
             "engine.execute" => {
                 let cmd = p.get("command").and_then(Value::as_str).ok_or("`command` required")?.to_string();
@@ -243,7 +248,7 @@ impl Backend for Headless {
                     None | Some(Value::Null) => json!({}),
                     Some(v) => v.clone(),
                 };
-                self.execute(&cmd, &params)
+                self.execute_as(p.get("agent").and_then(Value::as_str), &cmd, &params)
             }
             "engine.commands" => Ok(Value::Array(
                 figcraft_engine::all_commands().iter().map(|c| json!({"id": c.id, "label": c.label, "params": c.params, "menu": c.menu(), "shortcut": c.shortcut(), "undoable": c.history})).collect(),
@@ -295,6 +300,18 @@ impl Backend for Headless {
             "app.quit" => Ok(json!({"ok": true})),
             other => Err(format!("unknown method `{other}`")),
         }
+    }
+}
+
+impl Backend for Headless {
+    /// With `document` (an `id` from `doc.list`, or an open file's path) the call acts on that
+    /// file, and the file in front stays in front.
+    fn call(&mut self, method: &str, p: Value) -> Result<Value, String> {
+        let Some(target) = p.get("document").filter(|d| !d.is_null()) else { return self.dispatch(method, p) };
+        let forward = self.session.bring_forward(target).map_err(|e| e.to_string())?;
+        let r = self.dispatch(method, p);
+        self.session.put_back(forward);
+        r
     }
 
     fn has_ui(&self) -> bool {

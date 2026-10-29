@@ -874,6 +874,10 @@ fn system_font_dirs() -> Vec<std::path::PathBuf> {
         v.push("/usr/local/share/fonts".into());
         v.extend(unix_user_font_dirs(std::env::var_os("HOME"), std::env::var_os("XDG_DATA_HOME")));
     }
+    // Fonts any Craft app downloaded into the suite's font store (a download being installed is a
+    // `.part` file, which the walk skips).
+    #[cfg(not(target_arch = "wasm32"))]
+    v.extend(craft_font_catalog::font_store_dir(&craft_font_catalog::FontEnv::from_process()));
     v
 }
 
@@ -1069,12 +1073,12 @@ fn public_family(family: &str) -> Option<String> {
 
 /// The family Apple's system fonts are installed under, for the names designs use for them
 /// (lowercase): SF Pro and SF UI are the variable `SFNS.ttf` ("System Font"), its text and display
-/// cuts its optical sizes.
-fn apple_alias(key: &str) -> Option<&'static str> {
+/// cuts its optical sizes, as are the names CSS gives the system font (`system-ui`,
+/// `-apple-system`, `BlinkMacSystemFont`, `.AppleSystemUIFont`).
+pub fn apple_alias(key: &str) -> Option<&'static str> {
     Some(match key.trim_start_matches('.') {
-        "sf pro" | "sf pro text" | "sf pro display" | "sf ui text" | "sf ui display" | "sf ns" | "sf ns text" | "sf ns display" | "san francisco" => {
-            "system font"
-        }
+        "sf pro" | "sf pro text" | "sf pro display" | "sf ui text" | "sf ui display" | "sf ns" | "sf ns text" | "sf ns display" | "san francisco"
+        | "system-ui" | "-apple-system" | "blinkmacsystemfont" | "applesystemuifont" => "system font",
         "sf compact text" | "sf compact display" => "sf compact",
         _ => return None,
     })

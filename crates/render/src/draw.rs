@@ -30,6 +30,9 @@ pub struct Ctx<'a, 'd> {
     pub skip: &'a [NodeId],
     /// Approximate what's too small to see in detail (canvas previews; see [`crate::lod`]).
     pub lod: bool,
+    /// A canvas preview at any zoom ([`crate::Options::lod`]): large images shown smaller than
+    /// their pixels draw from smaller copies (see [`crate::images::shown`]).
+    pub preview: bool,
     pub magnified_image_pixels: bool,
     /// The surfaces under the one being drawn into, when it is an isolated layer (for backdrops).
     pub under: Option<&'a Under<'a>>,
@@ -139,7 +142,7 @@ fn pixels_when_magnified(prep: Prepared, device_scale: f64) -> Prepared {
 fn fill_with(pix: &mut Pixmap, path: &tiny_skia::Path, paints: &[Paint], w: f64, h: f64, xf: Affine, rule: FillRule, ctx: &Ctx, mask: Option<&Mask>) {
     let scale = xf.determinant().abs().sqrt();
     for p in paints {
-        let Some(prep) = prepare_at(p, w, h, scale, ctx.doc, ctx.time) else { continue };
+        let Some(prep) = prepare_at(p, w, h, scale, ctx.doc, ctx.time, ctx.preview) else { continue };
         let prep = if ctx.magnified_image_pixels && matches!(p.kind, PaintKind::Image(_)) { pixels_when_magnified(prep, scale) } else { prep };
         let paint = tiny_skia::Paint { shader: prep.shader(), anti_alias: true, blend_mode: ts_blend(p.blend), ..Default::default() };
         if p.blend == BlendMode::PlusDarker {
@@ -335,6 +338,27 @@ fn node_outline_at(doc: &Document, n: &Node, depth: usize) -> Option<(BezPath, F
             Some((p, FillRule::Winding))
         }
         NodeKind::Vector { network } => {
+            if network.regions.iter().any(|r| r.fills.is_some() || r.paint_space.is_some()) {
+                let rounded = network.rounded();
+                let net = rounded.as_ref().unwrap_or(network);
+                let mut areas = BezPath::new();
+                for (i, region) in net.regions.iter().enumerate() {
+                    let paints = region.fills.as_deref().unwrap_or(&n.fills);
+                    if !paints.iter().any(|p| p.visible) {
+                        continue;
+                    }
+                    let Some(path) = net.region_path(i) else { continue };
+                    let even_odd = region.winding == figcraft_doc::WindingRule::EvenOdd;
+                    if let Ok(normalized) = figcraft_pathops::simplify_with_rule(&path, even_odd) {
+                        areas.extend(normalized.elements().iter().copied());
+                    } else {
+                        // Invalid geometry still gets the renderer's best-effort path.
+                        areas.extend(path.elements().iter().copied());
+                    }
+                }
+                let silhouette = figcraft_pathops::simplify(&areas).unwrap_or(areas);
+                return Some((silhouette, FillRule::Winding));
+            }
             let rule =
                 if network.regions.iter().any(|r| r.winding == figcraft_doc::WindingRule::EvenOdd) { FillRule::EvenOdd } else { FillRule::Winding };
             Some((network.fill_path(), rule))
@@ -468,9 +492,13 @@ pub fn effect_margin(n: &Node) -> f64 {
             EffectKind::BackgroundBlur { .. } | EffectKind::Glass(_) => e.backdrop_radius() * 2.0,
             EffectKind::DropShadow(s) => s.radius * 2.0 + s.spread.abs() * figcraft_doc::SPREAD_MITER_LIMIT + s.offset.0.abs() + s.offset.1.abs(),
             EffectKind::Texture(t) => t.radius.abs(),
-            // A group's inner shadows are cast from around its pixels: a layer cut off at the
-            // view would cast one from the cut.
-            EffectKind::InnerShadow(s) if matches!(n.kind, NodeKind::Group) => s.radius * 2.0 + s.spread.abs() + s.offset.0.abs() + s.offset.1.abs(),
+            // Inner shadows cast from around a layer's pixels (groups, image fills with alpha; any
+            // image counts here): a layer cut off at the view would cast one from the cut.
+            EffectKind::InnerShadow(s)
+                if matches!(n.kind, NodeKind::Group) || n.fills.iter().any(|f| matches!(f.kind, PaintKind::Image(_) | PaintKind::Pattern(_))) =>
+            {
+                s.radius * 2.0 + s.spread.abs() + s.offset.0.abs() + s.offset.1.abs()
+            }
             _ => 0.0,
         })
         .filter(|m| m.is_finite())
@@ -644,12 +672,16 @@ fn draw_layer(ctx: &Ctx, pix: &mut Pixmap, n: &Node, parent_xf: Affine, depth: u
     }
     let op = n.opacity.clamp(0.0, 1.0);
     {
-        // Inner shadows paint over the fills, under the children and strokes.
+        // Inner shadows paint over the fills, under the children and strokes: cast from around the
+        // outline, or around the fills' pixels where images paint their own alpha.
         let inner = |l: &mut Pixmap| {
+            let fills = shadow::inner_from_pixels(ctx.doc, n).then(|| l.clone());
             for e in n.effects.iter().filter(|e| e.visible) {
                 if let EffectKind::InnerShadow(s) = &e.kind
-                    && let Some(sh) = &shape
-                    && let Some(inner) = shadow::inner_shadow(sh, lw, lh, lxf, ctx.scale, s)
+                    && let Some(inner) = match &fills {
+                        Some(f) => shadow::inner_shadow_of(f, ctx.scale, s),
+                        None => shape.as_ref().and_then(|sh| shadow::inner_shadow(sh, lw, lh, lxf, ctx.scale, s)),
+                    }
                 {
                     l.draw_pixmap(0, 0, inner.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
                 }
@@ -775,6 +807,31 @@ fn draw_outline(ctx: &Ctx, pix: &mut Pixmap, n: &Node, xf: Affine, depth: usize)
 /// What paints over a node's fills, under its children and strokes (its inner shadows).
 type OverFills<'a> = Option<&'a dyn Fn(&mut Pixmap)>;
 
+/// A vector's network when any of its regions has paints or a paint frame of its own.
+fn region_painted(n: &Node) -> Option<&figcraft_doc::VectorNetwork> {
+    match &n.kind {
+        NodeKind::Vector { network } if network.regions.iter().any(|r| r.fills.is_some() || r.paint_space.is_some()) => Some(network),
+        _ => None,
+    }
+}
+
+/// Each region of a vector with region paints, filled with its own paints (or the layer's) in its
+/// own paint frame.
+fn fill_vector_regions(ctx: &Ctx, pix: &mut Pixmap, n: &Node, network: &figcraft_doc::VectorNetwork, xf: Affine) {
+    let rounded = network.rounded();
+    let net = rounded.as_ref().unwrap_or(network);
+    for (i, region) in net.regions.iter().enumerate() {
+        let paints = region.fills.as_deref().unwrap_or(&n.fills);
+        if let Some(mut path) = net.region_path(i) {
+            let (pw, ph, frame) = region.paint_frame(n.width, n.height);
+            path.apply_affine(frame.inverse());
+            let Some(tp) = ts_path(&path) else { continue };
+            let rule = if region.winding == figcraft_doc::WindingRule::EvenOdd { FillRule::EvenOdd } else { FillRule::Winding };
+            fill_with(pix, &tp, paints, pw, ph, xf * frame, rule, ctx, None);
+        }
+    }
+}
+
 /// Fills, `over_fills`, children (clipped), strokes and text of a node, without opacity/effects.
 fn draw_content(ctx: &Ctx, pix: &mut Pixmap, n: &Node, xf: Affine, depth: usize, over_fills: OverFills) {
     let doc = ctx.doc;
@@ -856,14 +913,18 @@ fn draw_content(ctx: &Ctx, pix: &mut Pixmap, n: &Node, xf: Affine, depth: usize,
             let closed = figcraft_doc::geometry::is_closed(n) || matches!(n.kind, NodeKind::BooleanOp { .. });
             let splatted = ctx.lod && closed && lod::splat_fills(pix, n, xf);
             let clips = n.clip && n.kind.is_frame_like() && !n.children.is_empty();
+            let styled_network = region_painted(n);
             // The outline fills, clips children to rounded corners and strokes booleans.
-            let outline = if splatted && !(clips && n.corners.uniform() != Some(0.0)) { None } else { node_outline(doc, n) };
-            if !splatted
-                && let Some((path, rule)) = &outline
-                && closed
-                && let Some(tp) = ts_path(path)
-            {
-                fill_with(pix, &tp, &n.fills, w, h, xf, *rule, ctx, None);
+            let outline =
+                if styled_network.is_some() || (splatted && !(clips && n.corners.uniform() != Some(0.0))) { None } else { node_outline(doc, n) };
+            if !splatted && closed {
+                if let Some(network) = styled_network {
+                    fill_vector_regions(ctx, pix, n, network, xf);
+                } else if let Some((path, rule)) = &outline
+                    && let Some(tp) = ts_path(path)
+                {
+                    fill_with(pix, &tp, &n.fills, w, h, xf, *rule, ctx, None);
+                }
             }
             if let Some(f) = over_fills {
                 f(pix);

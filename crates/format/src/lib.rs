@@ -18,12 +18,17 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod fig;
+pub mod jpeg;
 pub mod library;
+pub mod penpot;
 pub mod rest;
 pub mod sketch;
 pub mod thumbnail;
 
+pub use density::{pixel_density, placed_size};
 pub use library::{is_valid_library_id, read_library, read_library_within};
+
+mod density;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, Write};
@@ -982,6 +987,8 @@ mod guides_tests;
 mod image_budget_tests;
 #[cfg(test)]
 mod image_tests;
+#[cfg(test)]
+mod jpeg_tests;
 #[cfg(test)]
 mod large_tests;
 #[cfg(test)]

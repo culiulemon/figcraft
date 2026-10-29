@@ -64,7 +64,7 @@ page 1 "Screens": 380 nodes, 4 top-level
   …
 ```
 
-### `export <file> -o <out> [--format png|jpg|svg|webp|pdf|xml|fig] [--scale N] [--page NAME] [--node ID|NAME] [--bleed LENGTH] [--crop-marks] [--bleed-marks] [--cmyk] [--vd-compat bestEffort|exact|ignore]`
+### `export <file> -o <out> [--format png|jpg|svg|webp|pdf|xml|fig|penpot] [--scale N] [--page NAME] [--node ID|NAME] [--bleed LENGTH] [--crop-marks] [--bleed-marks] [--cmyk] [--vd-compat bestEffort|exact|ignore]`
 
 - `<out>` is a directory: one file per top-level frame of the page (default the first page), named
   after the frame (`Home.png`, `Settings.png`…); with no frames, one file per top-level layer.
@@ -86,6 +86,13 @@ page 1 "Screens": 380 nodes, 4 top-level
   approximated), `exact` (left out) or `ignore` (no notes: overlapping layer opacity is dropped,
   even-odd fills keep `fillType="evenOdd"`, diamond gradients are left out). See
   `docs/file-format-parity.md`.
+- `--format penpot` (or an `<out>` ending in `.penpot`) writes the whole file as a Penpot 2.x
+  archive (`manifest.json` plus one JSON per file, page and shape) that Penpot imports into a team:
+  pages, boards, groups, rectangles, ellipses, paths, booleans and text, fills, strokes, shadows and
+  blurs, flex and grid layout, components and variants, design tokens and prototype interactions.
+  Layers opened from a `.penpot` keep their Penpot ids, and unchanged text, layouts, interactions
+  and tokens are written back from the original. What Penpot cannot represent is printed as
+  `note:` lines.
 - The format comes from `--format`, else `<out>`'s extension, else png. `--scale` (default 1, max 64)
   applies to raster formats.
 - SVG/PDF/XML exports with visible descendants more than 256 levels below an exported root fail with
@@ -117,7 +124,8 @@ By extension. Inputs: `.figcraft`, `.json` (FigCraft or REST API file JSON), `.f
 shapes, text, gradients, masks and effects; `info` lists what it left out as `note:` lines), `.png/.jpg/.webp/.gif/.tif/.bmp`
 (an image layer). Outputs: `.figcraft`, `.json` (FigCraft JSON, pretty-printed), `.svg`,
 `.png/.jpg/.webp` (the current page rendered at 1x with its background), `.pdf` (the current page's
-frames, one page each), `.fig` (the whole file, experimental, as `export --format fig`).
+frames, one page each), `.fig` (the whole file, experimental, as `export --format fig`), `.penpot`
+(the whole file as a Penpot 2.x archive, as `export --format penpot`).
 
 ### `render <file> -o <out.png> [--scale N] [--page NAME]`
 
@@ -133,7 +141,9 @@ Runs commands in a headless session (a new document, or `--in`), printing one JS
 ```
 
 The whole script is **one undo step**, and it is **all-or-nothing**, exactly like running the same
-commands through `command.batch` (the MCP tool `batch`, the control channel, plugins). A step named
+commands through `command.batch` (the MCP tool `batch`, the control channel, plugins). A step key
+other than `command`, `params` and `as`, or a parameter the command's doc (`figcraft-cli commands`)
+doesn't list, fails the script with an error naming it (`ids` and `id` are always taken). A step named
 with `"as"` can be used by later steps: `{"$ref": "name"}` in a step's params is the `id` in that
 step's result (`{"$step": n}` does the same by zero-based position), and `"field"` takes another key
 or a slash path such as `ids/0`. So a step can target a layer an earlier step of the same script
@@ -150,6 +160,10 @@ created ([Step references](mcp.md#step-references) has the rules):
 
 The result lines are printed once the script is through, so none of them reports work a later step
 took back.
+
+To keep going past a failed command, make a step a `command.batch` with `"onError": "continue"`
+([MCP server](mcp.md) has the rules). The script itself stays all-or-nothing: if a
+later top-level step fails, that batch's edits are rolled back with everything else.
 
 A failing step prints one line with `"ok": false`, the error and `"rolledBack": true`, writes
 nothing (`--out` is not saved, and the session's documents go back to how the script found them),
