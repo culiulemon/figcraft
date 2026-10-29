@@ -446,8 +446,11 @@ impl Session {
         let targets = if snap {
             let doc = self.doc()?;
             let mut targets = Targets::gather(doc, page, &ids);
-            // A frame's border snaps to the layers it holds, not only to its siblings.
-            targets.add_contents(doc, &ids);
+            // A frame's border snaps to the layers it holds, not only to its siblings. The Scale
+            // tool scales them with the frame, so there is nothing inside it to snap to.
+            if !scale_tool {
+                targets.add_contents(doc, &ids);
+            }
             Some(targets)
         } else {
             None
