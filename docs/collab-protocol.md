@@ -151,7 +151,18 @@ As built:
   colour profile, image presets, annotation categories and library data (whole values); styles,
   comment threads, variable collections and variables (one entry per id plus the order of ids;
   the whole list when ids aren't unique); dev-mode snapshots (per layer); images (per content
-  hash, the encoded bytes as base64); a board's timer and vote (whole values, `DocProp::Timer` and
+  hash, the encoded bytes as base64; as an entry applies the claim is checked: every key is
+  1–128 ASCII letters, digits, `-` or `_` (a saved file names the image `images/<key>`), a key
+  with the shape of a content hash (64 hex chars) must be exactly the lowercase sha256 hex of
+  those bytes (as the app writes them); a side is at most 65 535 px and the decoded bytes at
+  most 256 MiB (`ImageData::MAX_BYTES`, what the importers read), base64 that can't decode is
+  refused, a key that already holds an image can't be given other bytes, and an image a layer or
+  style still shows can't be removed; a snapshot or a server log written before these checks
+  opens without the image entries they refuse — judged against the state they apply to, so a
+  logged replacement or removal is left out too — rather than failing, and a file published to a
+  server is kept without them; a restarted server that left image entries out, or whose saved log
+  puts images, catches every resuming client up with its snapshot instead of that log); a
+  board's timer and vote (whole values, `DocProp::Timer` and
   `DocProp::Vote`) and the vote's ballots (`Entry::Ballot(voter)`, one per voter, so people voting
   at once write different entries). The timer travels as its end time (or, paused, the time left),
   never as ticks: each client counts down on its own clock. The page order is the pages'

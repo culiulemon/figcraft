@@ -1,5 +1,8 @@
 use super::handles::{PENCIL_STROKE, selected_end_at};
-use super::*;
+use super::{
+    Affine, Document, Gesture, Guide, Node, NodeId, NodeKind, PenPath, Point, PointerEvent, Result, Session, StrokeAlign, ToolId, Vec2,
+    VectorNetwork, at_45_degrees, frame_at, json, pen_handles,
+};
 
 /// Pen pressure along drawn samples as width profile points `[t, scale]`: `t` by length, at most
 /// 32 points, medium pressure (0.5) at the stroke weight, from a tenth to twice it. `None` when no

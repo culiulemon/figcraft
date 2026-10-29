@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::cmd::lists::{BoundList, list_binding, rebind_edited_paint};
 use crate::cmd::styles::rebind_paint_alpha;
-use crate::params::*;
+use crate::params::{get, paint_of, parse, req_string, targets};
 use crate::{CommandSpec, Result, Session, bad, spec};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

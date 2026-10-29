@@ -101,6 +101,11 @@ fn shows(code: &str, web: bool) -> bool {
     if code.split('-').next() == Some("ka") {
         return figcraft_text::face_with_char('ა', &["Noto Sans Georgian"]).is_some();
     }
+    if code.split('-').next() == Some("ar") {
+        // Web cannot borrow the desktop's Arabic faces. Its current font budget excludes
+        // Arabic; keep the catalog out until an embedded Arabic fallback is supplied.
+        return figcraft_text::face_with_char('ع', &["Noto Sans Arabic"]).is_some();
+    }
     let need = language(code);
     need == 0 || samples(need, 0).iter().all(|(c, _)| figcraft_text::face_with_char(*c, &["BIZ UDPGothic", "Noto Sans CJK SC"]).is_some())
 }
@@ -184,6 +189,14 @@ mod tests {
         assert_eq!(shows("ka", true), face);
         assert_eq!(shows("ka-GE", true), face);
         assert!(shows("en", true) && shows("tr", true));
+    }
+
+    #[test]
+    fn the_web_offers_arabic_only_with_its_face() {
+        assert!(shows("ar", false));
+        let face = figcraft_text::face_with_char('ع', &["Noto Sans Arabic"]).is_some();
+        assert_eq!(shows("ar", true), face);
+        assert_eq!(shows("ar-SA", true), face);
     }
 
     /// The UI language's script leads the fallback order; the others follow.

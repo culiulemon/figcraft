@@ -1,4 +1,4 @@
-use super::*;
+use super::{Affine, BTreeMap, Cursor, Document, Handle, NodeId, NodeKind, Point, ShapeHandle, ShapeHint, roots};
 
 /// The frame whose name label (see [`ToolState::labels`]) is under `p` on `page`: the topmost
 /// one drawn, if it can be selected (still there, on the page, visible and unlocked).

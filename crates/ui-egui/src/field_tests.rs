@@ -968,6 +968,25 @@ fn a_prepared_field_save_cannot_commit_into_a_same_pass_replacement_document() {
     }
 }
 
+/// The save shortcut's key events (and, routing by tab, a click on the tab at `tab_at`), with the modifiers held.
+fn save_events(route: &str, save_as: bool, tab_at: egui::Pos2) -> (Vec<Event>, Modifiers) {
+    let mut modifiers = if cfg!(target_os = "macos") { Modifiers::COMMAND } else { Modifiers::COMMAND.plus(Modifiers::CTRL) };
+    if save_as {
+        modifiers = modifiers.plus(Modifiers::SHIFT);
+    }
+    let mut events = vec![
+        Event::Key { key: Key::S, physical_key: Some(Key::S), pressed: true, repeat: false, modifiers },
+        Event::Key { key: Key::S, physical_key: Some(Key::S), pressed: false, repeat: false, modifiers },
+    ];
+    if route == "tab" {
+        events.push(Event::PointerMoved(tab_at));
+        for pressed in [true, false] {
+            events.push(Event::PointerButton { pos: tab_at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+        }
+    }
+    (events, modifiers)
+}
+
 /// One route/save-as/discard combination of the same-pass replacement test: a save prepared for A
 /// must not commit A's cached X editor into B when routing presents B before the fields draw,
 /// even though both panels use the same widget ID.
@@ -1031,21 +1050,9 @@ fn prepared_save_cannot_enter_a_replacement(route: &str, save_as: bool, discard:
     } else {
         None
     };
-    let mut modifiers = if cfg!(target_os = "macos") { Modifiers::COMMAND } else { Modifiers::COMMAND.plus(Modifiers::CTRL) };
-    if save_as {
-        modifiers = modifiers.plus(Modifiers::SHIFT);
-    }
-    let mut events = vec![
-        Event::Key { key: Key::S, physical_key: Some(Key::S), pressed: true, repeat: false, modifiers },
-        Event::Key { key: Key::S, physical_key: Some(Key::S), pressed: false, repeat: false, modifiers },
-    ];
-    if route == "tab" {
-        events.push(Event::PointerMoved(tab_at));
-        for pressed in [true, false] {
-            events.push(Event::PointerButton { pos: tab_at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
-        }
-    }
+    let (events, modifiers) = save_events(route, save_as, tab_at);
     if discard {
+        let mut events = events;
         events.insert(0, Event::ModifiersChanged(modifiers));
         u.frame_raw_with_discard(egui::RawInput { events, ..Default::default() });
     } else {

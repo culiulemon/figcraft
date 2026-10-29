@@ -64,6 +64,16 @@ fn is_code(shown: &str) -> bool {
     shown.len() == 11 && matches!(code::parse(shown), Ok(code::Code::Online(_)))
 }
 
+/// The links file keeps hashes only, never the codes or the token they wrap.
+fn only_hashes_on_disk(dir: &std::path::Path, file: &str, wrapped: &str, edit: &str, view: &str) {
+    let links = std::fs::read_to_string(dir.join("files").join(file).join("links.json")).unwrap();
+    for secret in [edit, view, &edit.replace('-', ""), &view.replace('-', "")] {
+        assert!(!links.contains(secret), "{links}");
+    }
+    assert!(!links.contains(wrapped.rsplit('=').next().unwrap()), "the wrapped token isn't the token");
+    assert_eq!(links.matches("\"code\"").count(), 2);
+}
+
 #[test]
 fn a_file_shared_online_is_joined_by_its_codes() {
     let dir = TempDir::new("codes-share");
@@ -90,12 +100,7 @@ fn a_file_shared_online_is_joined_by_its_codes() {
     let before_stop = ids(dir.path());
     assert_eq!(before_stop.len(), 4);
     // On disk: hashes only, of the codes as of the links' tokens.
-    let links = std::fs::read_to_string(dir.path().join("files").join(&p.file).join("links.json")).unwrap();
-    for secret in [edit.as_str(), view.as_str(), &edit.replace('-', ""), &view.replace('-', "")] {
-        assert!(!links.contains(secret), "{links}");
-    }
-    assert!(!links.contains(p.edit.rsplit('=').next().unwrap()), "the wrapped token isn't the token");
-    assert_eq!(links.matches("\"code\"").count(), 2);
+    only_hashes_on_disk(dir.path(), &p.file, &p.edit, &edit, &view);
     // Someone types the edit code, the way people type.
     let mut b = app("Bo", &url);
     assert_eq!(ex(&mut b, "collab.join", json!({"code": edit.to_lowercase().replace('-', " ")}))["status"], "connecting");

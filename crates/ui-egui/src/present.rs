@@ -299,10 +299,14 @@ pub struct Presenter {
     clock: f64,
     /// The layer the Inspect panel shows (the last one under the pointer).
     inspected: Option<NodeId>,
-    urls: Vec<String>,
-    /// A link to a website waiting for the viewer to open it ([`link_notice`]), and whether "Don't
-    /// show this again" is ticked.
-    link_notice: Option<(String, bool)>,
+    /// The links the last frame's actions opened, and whether the viewer's own click, press, drag
+    /// or key fired each; the frame-end queues them behind the notice, but for one the viewer
+    /// fired while choosing to skip the notice (#1096).
+    urls: Vec<(String, bool)>,
+    /// A link waiting for the viewer to open it ([`link_notice`]), and whether "Don't show this
+    /// again" is ticked; `None` when the notice doesn't offer it (the viewer didn't fire the link,
+    /// so skipping the notice wouldn't cover it, or they skip it already).
+    link_notice: Option<(String, Option<bool>)>,
     /// The editor's document as last copied (the player copies it again when it changes).
     source: Option<Arc<Document>>,
     /// Scrolling by dragging: what it scrolls and its offset when the drag began.

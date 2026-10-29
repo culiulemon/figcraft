@@ -1,12 +1,12 @@
 //! Creating nodes.
 
 use figcraft_color::{ImageScaleMode, Paint};
-use figcraft_doc::*;
+use figcraft_doc::{Document, Node, NodeId, NodeKind, StrokeCap, TextAutoResize, TextData, VectorNetwork};
 use figcraft_geom::Point;
 use serde_json::{Value, json};
 
 use super::{CommandSpec, ok};
-use crate::params::*;
+use crate::params::{boolean, f64_of, get, id, num, num_or, opt_id, req_targets, string};
 use crate::{Result, Session, bad, spec};
 
 /// Frame presets shown by the Frame tool (category, name, width, height).

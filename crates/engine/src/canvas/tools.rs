@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use figcraft_color::{ImageScaleMode, PaintKind};
 use figcraft_doc::geometry::select_target;
-use figcraft_doc::*;
+use figcraft_doc::{Document, LayoutMode, Node, NodeId, NodeKind, Sizing, StrokeAlign, StrokeCap, TextAutoResize, TextData, TextPath, VectorNetwork};
 use figcraft_geom::{Affine, Point, Rect, Vec2};
 use serde::Serialize;
 use serde_json::json;

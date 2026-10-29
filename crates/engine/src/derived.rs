@@ -1,4 +1,4 @@
-use super::*;
+use super::{Arc, BTreeSet, Document, Node, NodeId, board, cmd, components, measure, style_vars};
 
 /// Nodes whose `Arc` differs from `before` (new or edited).
 pub fn changed_nodes(doc: &Document, before: &Document) -> Vec<NodeId> {
@@ -10,9 +10,28 @@ pub fn changed_nodes(doc: &Document, before: &Document) -> Vec<NodeId> {
         .collect()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: normalising panics, standing for a bug in it (a command's edit is rolled back).
+    pub(crate) static PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests: panic when [`PANIC`] is set, as a bug in normalising would.
+#[cfg(test)]
+fn test_panic() {
+    if PANIC.with(std::cell::Cell::get) {
+        panic!("normalize: test panic");
+    }
+}
+
+/// Shipped builds: nothing (the test hook compiles away).
+#[cfg(not(test))]
+fn test_panic() {}
+
 /// Keep derived state consistent after edits: text boxes resize to their content, groups wrap
 /// their children, instances follow their main components, auto layout re-flows.
 pub fn normalize(doc: &mut Document, before: &Document) {
+    test_panic();
     // Only what was touched since the last normalisation (edited, added or removed).
     let mut touched: BTreeSet<NodeId> = doc.take_dirty();
     // A variable or style edit changes no layer directly, but bound and linked layers must follow it.

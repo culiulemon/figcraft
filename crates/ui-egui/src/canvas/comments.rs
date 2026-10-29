@@ -602,6 +602,7 @@ enum Act {
     Close,
     Run(&'static str, Value),
     CopyLink,
+    CopyForAi,
     MarkUnread,
     Edit(usize, String),
 }
@@ -897,6 +898,10 @@ pub fn thread(app: &mut FigApp, ctx: &egui::Context, id: u64, anchor: Pos2, boun
                             act = Some(Act::CopyLink);
                             ui.close();
                         }
+                        if crate::right::menu_item(ui, tr("Copy for AI"), "") {
+                            act = Some(Act::CopyForAi);
+                            ui.close();
+                        }
                         if crate::right::menu_item(ui, if c.resolved { tr("Mark as unresolved") } else { tr("Mark as resolved") }, "") {
                             act = Some(Act::Run("comment.resolve", json!({"id": id, "resolved": !c.resolved})));
                             ui.close();
@@ -938,6 +943,7 @@ pub fn thread(app: &mut FigApp, ctx: &egui::Context, id: u64, anchor: Pos2, boun
                 app.toast(tr("Link copied"));
             }
         }
+        Some(Act::CopyForAi) => copy_for_ai(app, Some(id)),
         // It closes: an open thread reads itself again.
         Some(Act::MarkUnread) => {
             if app.run("comment.markRead", json!({"id": id, "read": false})).is_some() {
@@ -1003,6 +1009,26 @@ pub fn keys(app: &mut FigApp, ctx: &egui::Context) {
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, key)) {
             step(app, ctx, dir);
         }
+    }
+}
+
+/// Copy the panel's current list (or one thread) as a task brief for an AI agent.
+pub(crate) fn copy_for_ai(app: &mut FigApp, id: Option<u64>) {
+    let params = match id {
+        Some(id) => json!({"ids": [id]}),
+        None => {
+            let cu = &app.ui.comments;
+            json!({"page": "all", "filter": cu.filter.id(), "sort": cu.sort.id(), "query": cu.search})
+        }
+    };
+    let Some(r) = app.run("comment.prompt", params) else { return };
+    if r.get("count").and_then(Value::as_u64).unwrap_or(0) == 0 {
+        app.toast(tr("No comments to copy"));
+        return;
+    }
+    if let Some(text) = r.get("text").and_then(Value::as_str) {
+        app.clipboard_set_text(text);
+        app.toast(tr("Copied comments for AI"));
     }
 }
 

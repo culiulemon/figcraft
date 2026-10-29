@@ -324,6 +324,7 @@ Or in a project's `.mcp.json`:
 | `key {key, shift, alt, cmd}` | A shortcut or key as if typed on the canvas (every default shortcut, tool keys, Escape, Delete, arrows, number keys for opacity, arrows that pan the view when nothing is selected; while editing text, the text shortcuts and then text editing keys). Keys are names like `A`, `0`, `Enter`, `ArrowLeft`, `=`, `/`, or egui's (`Plus`, `Questionmark`); `cmd` is Cmd on macOS and Ctrl elsewhere. |
 | `type_text {text, id?}` | Type into the text being edited, or replace the contents of text layer `id`. |
 | `inspect_ui {}` | Tool, view and status (and panels, timings and the app's `windows` when attached). |
+| `wait_for_changes {after?, timeoutMs?, topics?, limit?}` | Wait for new comment events in the attached app; returns pending events at once, else waits up to `timeoutMs` (default 20 s, max 25 s). Pass the returned `cursor` back to keep watching. Headless returns immediately. |
 
 ### Starter templates
 
@@ -1145,6 +1146,27 @@ and opens it in the app, and `comment.next {id?, dir?, …list params}` steps to
 thread of a list the same way. `comment.zoom {ids}` zooms in on a group of pins. Comment ids made in
 a live session are large numbers (their creator's id space): pass them back as given.
 
+An agent can read every open thread as one resource (`figcraft://comments`) or call
+`comment.list`; `comment.prompt {ids?, page? (default "all"), filter? (default open), sort?,
+query?, includeResolved?}` returns `{count, truncated, text, comments}`, where `text` is a Markdown
+task brief with the document, each thread's page, frame, anchor, point, messages, replies and link,
+and the instructions to fix, reply and resolve. `comments` is bounded metadata for at most 200 of
+the selected threads (id, page, frame, anchor, status, link, author, preview and reply count), not
+the full threads: use `comment.list` for those. The Comments panel's **Copy for AI** action uses
+it. The `fix_comments` prompt runs the review loop: inspect the anchored layer, make the
+smallest change (one `batch` per thread), reply with what changed, verify with a screenshot, then
+resolve. Reply before resolving: `comment.reply` reopens a thread, so resolving first and replying
+after leaves it open again. `auto_resolve: "no"` makes the agent reply and leave the thread for the
+user. Comments are the feedback queue for any MCP client.
+
+While attached, `wait_for_changes` long-polls the app's event log: `comment.added`, `comment.replied`,
+`comment.edited`, `comment.reacted`, `comment.resolved`, `comment.moved` and `comment.deleted` carry
+`{command, commentId, reply}`. Read the thread with `comment.list` after an event. A `batch` that
+rolls back reports none of its steps' events. The log keeps the newest 1024 events; `reset: true`
+means the cursor is ahead (the app restarted), and `dropped` counts events older than the retained
+window. Headless returns immediately; the control method behind it is `events.poll` (see
+[control-protocol.md](control-protocol.md)).
+
 ### Version history
 
 Named snapshots of the document, kept in the `.figcraft` file (they persist once the file is saved;
@@ -1874,6 +1896,7 @@ tool, malformed JSON, wrong parameter types) are JSON-RPC errors. Nothing crashe
 |---|---|
 | `figcraft://document` | The active document (like `inspect_document` at depth 8). |
 | `figcraft://commands` | The command catalog. |
+| `figcraft://comments` | Every open comment thread on every page, as JSON. |
 | `figcraft://node/{id}` (template) | One layer with children to depth 2. |
 | `figcraft://command/{id}` (template) | One command's docs, e.g. `figcraft://command/layout.add`. |
 
@@ -1885,6 +1908,8 @@ tool, malformed JSON, wrong parameter types) are JSON-RPC errors. Nothing crashe
 | `design_system` | `name`, `primary` |
 | `landing_page` | `product` (required), `width` (default 1440), `accent` |
 | `prototype_flow` | `screens` (comma-separated), `transition` |
+| `fix_comments` | `page` (default "all"), `auto_resolve` (default "yes"), `author` (default "AI") |
+| `watch_comments` | `minutes` (default 5) |
 
 Each returns a step-by-step plan naming the exact tools and commands to use and how to verify.
 

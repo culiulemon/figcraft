@@ -1,7 +1,7 @@
 //! Where something dropped at a page point lands: the frame under the point (or the page) and, in
 //! an auto layout frame, the child slot by pointer position plus the insertion line to draw.
 
-use figcraft_doc::*;
+use figcraft_doc::{Document, LayoutMode, NodeId, NodeKind};
 use figcraft_geom::Point;
 use serde::Serialize;
 

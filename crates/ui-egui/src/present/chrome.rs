@@ -1,7 +1,10 @@
 use super::layout::{Chrome, FULL, Place};
 use super::player::player;
 use super::scroll::page_settings;
-use super::*;
+use super::{
+    Align2, Color32, CornerRadius, Document, Easing, FigApp, HashSet, Icon, Id, NodeId, Pos2, PresentScale, Presenter, PrototypeSettings, Rect,
+    Sense, Stroke, Tokens, Transition, Ui, icons, json, pos2, regular, tr, vec2, widgets,
+};
 
 /// What the player's top bar asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -236,15 +239,23 @@ fn poll_pads(app: &mut FigApp, p: &mut Presenter, ctx: &egui::Context) {
     crate::repaint_in(ctx, PAD_POLL_SECS);
 }
 
-/// After a player's frame: the links it opens and the widget clicks it took. A link to a website
-/// waits in [`link_notice`] unless the viewer chose to skip the notice; a second link to a website
-/// that fires while the notice shows is dropped.
+/// After a player's frame: the links it opens and the widget clicks it took. Every link waits in
+/// [`link_notice`] — to a website or to the mail app (#1096). Skipping the notice opens at once
+/// only a link the viewer's own click, press, drag or key fired, one per frame, and never while a
+/// notice shows: a delay or the pointer passing over a layer never opens anything unasked. A
+/// further link that fires while the notice shows is dropped, whatever fired it.
 fn finish(app: &mut FigApp, p: &mut Presenter) {
-    for u in p.urls.drain(..) {
-        if app.session.prefs.link_notice_skipped || !goes_to_a_website(&u) {
+    let skipped = app.session.prefs.link_notice_skipped;
+    let mut opened = false;
+    for (u, asked) in p.urls.drain(..) {
+        if skipped && asked && !opened && p.link_notice.is_none() {
             app.services.open_url(&u);
+            opened = true;
         } else if p.link_notice.is_none() {
-            p.link_notice = Some((u, false));
+            p.link_notice = Some((u, (asked && !skipped).then_some(false)));
+            // A press under way ends here: its release would otherwise reach the prototype
+            // behind the notice, which takes no input while it shows.
+            p.press = None;
         }
     }
     if let Some(e) = p.click_widgets(&app.session) {
@@ -252,24 +263,32 @@ fn finish(app: &mut FigApp, p: &mut Presenter) {
     }
 }
 
-/// Whether `url` is an `http` or `https` link (a `mailto:` link opens the mail app instead).
+/// Whether `url` is an `http` or `https` link (of the openable URLs, the others are `mailto:`;
+/// [`figcraft_engine::doc_urls`]).
 fn goes_to_a_website(url: &str) -> bool {
     url.trim().split_once(':').is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
 }
 
-/// The notice before a link leaves the prototype for a website: the link, "Don't show this
-/// again" (saved with the preferences when Open link is pressed), Open link and Cancel. Escape or
-/// the close button cancels.
+/// The notice before a link leaves the prototype — for a website, or for the mail app: the link,
+/// "Don't show this again" for a link the viewer fired (saved with the preferences when Open link
+/// is pressed), Open link and Cancel. Escape or the close button cancels.
 fn link_notice(app: &mut FigApp, p: &mut Presenter, ctx: &egui::Context, id: Id) {
     let Some((url, skip)) = p.link_notice.as_mut() else { return };
     let t = Tokens::get(ctx);
     let (mut open, mut go, mut cancel) = (true, false, false);
     crate::dialogs::window(tr("Leaving the prototype"), ctx).id(id).open(&mut open).show(ctx, |ui| {
         ui.set_width(340.0);
-        widgets::label(ui, tr("This link opens a website outside the prototype:"), t.text);
+        let what = if goes_to_a_website(url) {
+            tr("This link opens a website outside the prototype:")
+        } else {
+            tr("This link opens your mail app to write a message:")
+        };
+        widgets::label(ui, what, t.text);
         ui.add(egui::Label::new(egui::RichText::new(url.as_str()).font(regular(11.0)).color(t.text_secondary)).wrap());
         ui.add_space(8.0);
-        if widgets::checkbox(ui, *skip, tr("Don't show this again")) {
+        if let Some(skip) = skip.as_mut()
+            && widgets::checkbox(ui, *skip, tr("Don't show this again"))
+        {
             *skip = !*skip;
         }
         ui.add_space(12.0);
@@ -281,7 +300,7 @@ fn link_notice(app: &mut FigApp, p: &mut Presenter, ctx: &egui::Context, id: Id)
     cancel |= !open || ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
     if go {
         let Some((url, skip)) = p.link_notice.take() else { return };
-        if skip {
+        if skip == Some(true) {
             app.run("proto.linkNotice", json!({"show": false}));
             app.services.save_prefs(&app.session.prefs);
         }

@@ -47,6 +47,7 @@ mod text_style_tests;
 
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::sync::Arc;
 
 use figcraft_doc::Document;
 
@@ -59,7 +60,7 @@ use kiwi::{Kv, Schema};
 const MAX_CANVAS: u64 = 256 * 1024 * 1024;
 const MAX_CHUNK: u64 = 512 * 1024 * 1024;
 /// Largest image member read.
-const MAX_IMAGE: u64 = 256 * 1024 * 1024;
+const MAX_IMAGE: u64 = figcraft_doc::ImageData::MAX_BYTES;
 /// Most chunks read from `canvas.fig`.
 const MAX_CHUNKS: usize = 16;
 /// Most layers imported from a `.fig` file: one per [`PACKED_BYTES_PER_LAYER`] bytes of its
@@ -109,9 +110,9 @@ pub fn import(bytes: &[u8], name: &str) -> Result<(Document, Vec<String>), Forma
     let file_name = archive.file_name.as_deref().filter(|n| !n.trim().is_empty()).unwrap_or(name);
     let (json, mut warnings, networks) = map::to_rest(&msg, file_name, max_nodes);
     // The message goes before the layers are built, so the images it carries are copied out first.
-    let embedded: BTreeMap<String, Vec<u8>> = embedded_images(&msg).into_iter().map(|(hash, bytes)| (hash, bytes.to_vec())).collect();
+    let embedded = embedded_copies(&msg);
     drop(msg);
-    let images = |r: &str| archive.image(r).or_else(|| embedded.get(r).cloned());
+    let images = |r: &str| archive.image(r).or_else(|| embedded.get(r).map(|b| b.to_vec()));
     let (doc, more) = crate::rest::import_with_networks(&json, &images, networks, max_nodes)?;
     // Both stages stop at the same cap and say so in the same words: one note (#981).
     for w in more.into_iter().filter_map(map::adapt_warning) {
@@ -151,17 +152,17 @@ fn corrupt(msg: impl Into<String>) -> FormatError {
 /// Image bytes that travel inside the message, by image hash (lowercase hex): a paint's
 /// `image.dataBlob` indexes the message's `blobs`. Copies written by plugins and other tools embed
 /// their images this way, and a bare canvas (what the clipboard carries) has no `images/`. The
-/// walk is iterative (no recursion on nested data) and skips blobs larger than [`MAX_IMAGE`]. The
-/// bytes stay borrowed from the message.
-fn embedded_images<'m>(msg: &'m Kv) -> BTreeMap<String, &'m [u8]> {
+/// walk is iterative (no recursion on nested data) and skips blobs larger than [`MAX_IMAGE`].
+/// Returns the index of each hash's blob.
+fn embedded_images(msg: &Kv) -> BTreeMap<String, usize> {
     let blobs = msg.get("blobs").map(Kv::list).unwrap_or_default();
     let mut found = BTreeMap::new();
     let mut pending = vec![msg];
     while let Some(value) = pending.pop() {
         match value {
             Kv::Object(fields) => {
-                if let Some((hash, bytes)) = value.get("image").and_then(|image| embedded_image(image, blobs)) {
-                    found.entry(hash).or_insert(bytes);
+                if let Some((hash, index)) = value.get("image").and_then(|image| embedded_image(image, blobs)) {
+                    found.entry(hash).or_insert(index);
                 }
                 pending.extend(fields.iter().filter(|(name, _)| *name != "blobs").map(|(_, field)| field));
             }
@@ -172,15 +173,35 @@ fn embedded_images<'m>(msg: &'m Kv) -> BTreeMap<String, &'m [u8]> {
     found
 }
 
-/// The hash and bytes of an `Image` value whose `dataBlob` points at a usable blob.
-fn embedded_image<'k>(image: &Kv, blobs: &'k [Kv]) -> Option<(String, &'k [u8])> {
+/// The images that travel inside the message ([`embedded_images`]), copied out of it once per
+/// blob: every hash naming the same blob shares its copy. A file can point any number of hashes
+/// at one large blob, and a copy for each would multiply it (#1059).
+fn embedded_copies(msg: &Kv) -> BTreeMap<String, Arc<[u8]>> {
+    let blobs = msg.get("blobs").map(Kv::list).unwrap_or_default();
+    let mut copies: BTreeMap<usize, Arc<[u8]>> = BTreeMap::new();
+    let mut out = BTreeMap::new();
+    for (hash, index) in embedded_images(msg) {
+        let Some(bytes) = blob(blobs, index) else { continue };
+        out.insert(hash, Arc::clone(copies.entry(index).or_insert_with(|| Arc::from(bytes))));
+    }
+    out
+}
+
+/// The hash and blob index of an `Image` value whose `dataBlob` points at a usable blob.
+fn embedded_image(image: &Kv, blobs: &[Kv]) -> Option<(String, usize)> {
     let hash = image.get("hash").and_then(Kv::bytes).filter(|h| !h.is_empty() && h.len() <= 64)?;
     let Some(Kv::Uint(index)) = image.get("dataBlob") else { return None };
-    let bytes = blobs.get(usize::try_from(*index).ok()?)?.get("bytes").and_then(Kv::bytes)?;
+    let index = usize::try_from(*index).ok()?;
+    let bytes = blob(blobs, index)?;
     if bytes.is_empty() || bytes.len() as u64 > MAX_IMAGE {
         return None;
     }
-    Some((hash.iter().map(|b| format!("{b:02x}")).collect(), bytes))
+    Some((hash.iter().map(|b| format!("{b:02x}")).collect(), index))
+}
+
+/// The bytes of blob `index`.
+fn blob<'k>(blobs: &'k [Kv], index: usize) -> Option<&'k [u8]> {
+    blobs.get(index)?.get("bytes").and_then(Kv::bytes)
 }
 
 /// The parts of a `.fig` archive the import reads.

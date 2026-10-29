@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use figcraft_doc::*;
+use figcraft_doc::{Document, HandleMirroring, NodeId, NodeKind, VectorNetwork, Vertex};
 use figcraft_geom::{Affine, Point, Rect, Vec2};
 
 use super::point_snap;
@@ -510,20 +510,25 @@ impl Session {
         Ok(())
     }
 
+    /// Another edited layer under the press (or, with the paint bucket, whose area it is in).
+    fn pressed_layer(doc: &Document, ve: &VectorEdit, ev: &PointerEvent, tol: f64) -> Option<NodeId> {
+        match hit_any(doc, ve, ev.p(), tol) {
+            Some((id, _)) => Some(id),
+            None if ve.tool == VTool::Paint => {
+                let inside = |id: NodeId| network(doc, id).is_some_and(|n| n.face_at(doc.world_transform(id).inverse() * ev.p()).is_some());
+                (!inside(ve.id)).then(|| ve.others.iter().map(|o| o.id).find(|id| inside(*id))).flatten()
+            }
+            None => None,
+        }
+    }
+
     /// Returns false when the click left edit mode (the caller then runs the normal tool).
     fn vector_down(&mut self, ve: &VectorEdit, ev: &PointerEvent) -> Result<bool> {
         let doc = self.doc()?.clone();
         let tol = 6.0 / ev.zoom.max(1e-6);
         // A press on another edited layer's point, handle or segment (or, with the paint bucket,
         // area) makes it the active layer; a pen drawing a path keeps to its own layer.
-        let other = match hit_any(&doc, ve, ev.p(), tol) {
-            Some((id, _)) => Some(id),
-            None if ve.tool == VTool::Paint => {
-                let inside = |id: NodeId| network(&doc, id).is_some_and(|n| n.face_at(doc.world_transform(id).inverse() * ev.p()).is_some());
-                (!inside(ve.id)).then(|| ve.others.iter().map(|o| o.id).find(|id| inside(*id))).flatten()
-            }
-            None => None,
-        };
+        let other = Self::pressed_layer(&doc, ve, ev, tol);
         let switched;
         let ve = match other {
             Some(id) if id != ve.id && !(ve.tool == VTool::Pen && ve.anchor.is_some()) => {

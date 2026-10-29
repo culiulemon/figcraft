@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    Done, FigApp, LeftTab, MobilePanel, NodeId, PANEL_DEFAULT, RightTab, Value, comments, dev_compare, dialogs, home, i18n, import_report, json,
+    layers, live, menus, missing_fonts, plugins_ui, present, tabs, updates_ui, versions,
+};
 
 impl FigApp {
     /// Dismiss the composer after a successful switch away from the Comment tool.

@@ -21,14 +21,14 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use figcraft_doc::*;
+use figcraft_doc::{Corners, Document, Node, NodeId, NodeKind, StrokeProps, VectorNetwork, WindingRule};
 use figcraft_geom::kurbo::PathEl;
 use figcraft_geom::{Affine, BezPath, Point, Rect, Shape};
 use serde_json::{Value, json};
 
 use crate::cmd::CommandSpec;
 use crate::cmd::edit::{roots, z_sorted};
-use crate::params::*;
+use crate::params::{f64_of, get, string, targets};
 use crate::tools::{Cursor, Gesture, PointerEvent, PointerKind, ToolId};
 use crate::{EngineError, Result, Session, bad, spec};
 

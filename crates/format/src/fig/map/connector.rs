@@ -1,5 +1,5 @@
 use super::layer::{cap_name, own_text, svg_path, valid_size};
-use super::*;
+use super::{Affine, Kv, Mapper, NO_STYLE, Obj, Point, Value, View, guid, json, matrix, network, num, rows};
 
 impl<'a> Mapper<'a> {
     /// A connector's end caps, and when it has no saved outline or network a straight line

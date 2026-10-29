@@ -1,13 +1,16 @@
 //! Structure: groups, frames, masks, boolean groups, flatten, outline stroke, auto layout, pages.
 
 use figcraft_color::{Color, Paint};
-use figcraft_doc::*;
+use figcraft_doc::{
+    AutoLayout, BoolOp, Corners, Document, LayoutMode, Node, NodeId, NodeKind, Region, Segment, Sizing, StrokeAlign, StrokeJoin, StrokeProps,
+    VectorNetwork, WindingRule, proto,
+};
 use figcraft_geom::{Affine, BezPath, Rect, Shape};
 use serde_json::{Value, json};
 
 use super::edit::{roots, z_sorted};
 use super::{CommandSpec, ok};
-use crate::params::*;
+use crate::params::{f64_of, get, id_of, num_or, req_id, req_index, req_num, req_targets, string, targets};
 use crate::{EngineError, Result, Session, bad, spec};
 
 /// The layer structure commands: group, frame, mask, boolean operations, flatten, auto layout

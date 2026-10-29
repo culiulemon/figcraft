@@ -1,7 +1,10 @@
 use super::derived::{ends_now, place_route, route};
 use super::edit::set_label;
 use super::items::add;
-use super::*;
+use super::{
+    BoardItem, Connector, Document, End, LINE, LINE_WEIGHT, NodeId, NodeKind, Paint, Point, Result, Session, Side, StrokeCap, StrokeJoin, Value,
+    VectorNetwork, bad, cap_of, get, id_of, json, num, req_targets, require, routing_of, string,
+};
 
 /// One connector end from the params: a layer on this page, or a point.
 fn end_param(cmd: &str, s: &Session, p: &Value, key: &str, side_key: &str) -> Result<End> {

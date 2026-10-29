@@ -1,10 +1,10 @@
-use super::*;
+use super::{Color32, CornerRadius, Icon, Id, Rect, Sense, Stroke, Tokens, Ui, a11y, i18n, icons, pos2, pretty_shortcut, regular, vec2};
 
 /// A submenu row `label` in the menu being drawn; while it's open, `add` draws its items beside
 /// it. `key` names the submenu (its menu path, unique in its menu tree). Returns what `add`
 /// returned.
 pub(crate) fn submenu<R>(ui: &mut Ui, key: &str, label: &str, t: &Tokens, add: impl FnOnce(&mut Ui) -> Option<R>) -> Option<R> {
-    submenu_at(ui, Id::unique(("submenu", key)), key, label, 4.0, false, t, add)
+    submenu_at(ui, SubmenuOptions { area: Id::unique(("submenu", key)), key, label, gap: 4.0, constrain: false, tokens: t }, add)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -240,17 +240,17 @@ pub(super) fn plain_row_hover(ui: &Ui, resp: &egui::Response) -> bool {
 }
 
 /// A submenu row whose panel (area `area`, `gap` right of the row) shows while it's open.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn submenu_at<R>(
-    ui: &mut Ui,
-    area: Id,
-    key: &str,
-    label: &str,
-    gap: f32,
-    constrain: bool,
-    t: &Tokens,
-    add: impl FnOnce(&mut Ui) -> Option<R>,
-) -> Option<R> {
+pub(super) struct SubmenuOptions<'a> {
+    pub(super) area: Id,
+    pub(super) key: &'a str,
+    pub(super) label: &'a str,
+    pub(super) gap: f32,
+    pub(super) constrain: bool,
+    pub(super) tokens: &'a Tokens,
+}
+
+pub(super) fn submenu_at<R>(ui: &mut Ui, options: SubmenuOptions<'_>, add: impl FnOnce(&mut Ui) -> Option<R>) -> Option<R> {
+    let SubmenuOptions { area, key, label, gap, constrain, tokens: t } = options;
     let at = level_at(ui);
     let aim = aiming(ui);
     let w = ui.available_width();

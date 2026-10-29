@@ -241,7 +241,7 @@ fn main() -> eframe::Result {
     }
     let queue: Arc<Mutex<Vec<ControlRequest>>> = Arc::new(Mutex::new(Vec::new()));
     if let Some(p) = port {
-        control_server::start(p, queue.clone(), ctx_slot.clone());
+        control_server::start(p, queue.clone(), ctx_slot.clone(), fig.session.events.clone());
     }
     let icon = services::window_icon();
     // The app id is the Wayland app_id and the X11 window class on Linux: the desktop entry's name
@@ -278,6 +278,15 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             with_app(|fig| fig.services.set_egui_context(&cc.egui_ctx));
+            // winit's own Quit (⌘Q) ends the process through `terminate:` without ever asking the
+            // app, so unsaved changes are lost with no warning (issue #857). This menu's Quit
+            // sends the root window a close request instead, and the unsaved-changes question
+            // asks just as it does for the close button. Failure keeps winit's menu: the app
+            // runs, but ⌘Q ends it without asking.
+            #[cfg(target_os = "macos")]
+            if let Err(e) = craft_menu::mac::install_app_menu(&cc.egui_ctx, "FigCraft") {
+                log::warn!("app menu: kept winit's Quit, which ends the app without asking: {e}");
+            }
             Ok(Box::new(App {
                 queue,
                 ctx_slot,

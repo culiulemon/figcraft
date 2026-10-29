@@ -38,18 +38,13 @@ pub fn is_valid_library_id(id: &str) -> bool {
     (1..=MAX_ID).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// Image hashes become archive member names: only plain hex-like names are looked up.
-pub(crate) fn is_valid_hash(h: &str) -> bool {
-    (1..=128).contains(&h.len()) && h.bytes().all(|b| b.is_ascii_alphanumeric())
-}
-
 /// Write the published library's entries. `written` are the images already in `images/`.
 pub(crate) fn write<W: Write + Seek>(z: &mut zip::ZipWriter<W>, lib: &PublishedLibrary, written: &BTreeSet<&String>) -> Result<(), FormatError> {
     let stored = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     put(z, MANIFEST, json_options(), &serde_json::to_vec(&lib.manifest).map_err(io_err)?)?;
     put_json(z, SNAPSHOT, &lib.doc)?;
     for (hash, img) in &lib.doc.images {
-        if !written.contains(hash) && is_valid_hash(hash) {
+        if !written.contains(hash) && ImageData::is_valid_key(hash) {
             put(z, &format!("{IMAGES}{hash}"), stored, &img.bytes)?;
         }
     }
@@ -75,7 +70,7 @@ pub(crate) fn read<R: Read + Seek>(
     let mut budget = budget.saturating_sub(text.len() as u64).min(MAX_IMAGE_BYTES);
     let (mut doc, _) = from_json(&text)?;
     for hash in used_images(&doc) {
-        if !is_valid_hash(&hash) {
+        if !ImageData::is_valid_key(&hash) {
             continue;
         }
         if let Some(img) = own.get(&hash) {
@@ -90,9 +85,13 @@ pub(crate) fn read<R: Read + Seek>(
     }
     // Keep what the snapshot really holds; clip what people see.
     manifest.components.retain(|a| doc.node(a.id).is_some_and(|n| matches!(n.kind, NodeKind::Component { .. } | NodeKind::ComponentSet { .. })));
-    manifest.styles.retain(|s| doc.styles.iter().any(|x| x.id == s.id));
-    manifest.collections.retain(|c| doc.variables.collections.iter().any(|x| x.id == c.id));
-    manifest.variables.retain(|v| doc.variables.variables.iter().any(|x| x.id == v.id && x.collection == v.collection));
+    // Membership by set lookups: a long manifest against a large snapshot stays linear (#1078).
+    let styles: BTreeSet<&str> = doc.styles.iter().map(|x| x.id.as_str()).collect();
+    let collections: BTreeSet<&str> = doc.variables.collections.iter().map(|x| x.id.as_str()).collect();
+    let variables: BTreeSet<(&str, &str)> = doc.variables.variables.iter().map(|x| (x.id.as_str(), x.collection.as_str())).collect();
+    manifest.styles.retain(|s| styles.contains(s.id.as_str()));
+    manifest.collections.retain(|c| collections.contains(c.id.as_str()));
+    manifest.variables.retain(|v| variables.contains(&(v.id.as_str(), v.collection.as_str())));
     manifest.name = manifest.name.chars().take(MAX_NAME).collect();
     manifest.description = manifest.description.chars().take(MAX_DESCRIPTION).collect();
     Ok(Some(PublishedLibrary { manifest, doc: Arc::new(doc) }))

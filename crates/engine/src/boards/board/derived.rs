@@ -1,6 +1,9 @@
 use super::edit::set_font_size;
 use super::items::{owner_of_text, shape_padding, sticky_font_size, text_of};
-use super::*;
+use super::{
+    Affine, BTreeSet, BezPath, BoardItem, Connector, Document, End, NodeId, NodeKind, PathEl, Point, Rect, Routing, Shape, Side, Vec2, VectorNetwork,
+    is_board,
+};
 
 // ---------------------------------------------------------------------------------------------
 // Derived data (the normalize pass).

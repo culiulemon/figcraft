@@ -1,5 +1,9 @@
 use super::common::{style_fields, unsupported_decoration_look};
-use super::*;
+use super::{
+    Affine, BezPath, Bound, Exporter, Fields, Kv, ListStyle, MAX_CANVAS, MAX_CHARS, MAX_NETWORK, Node, NodeKind, Paint, StrokeAlign, StrokeCap,
+    StrokeJoin, TextAlignH, TextAlignV, TextAutoResize, TextData, TextStyle, VectorNetwork, WindingRule, arr, b, cap_name, e, finite, fl, int,
+    join_name, network, o, path_blob, s, u, xy,
+};
 
 impl<'d> Exporter<'d> {
     /// Text: its style, box settings, and characters with their styled runs. `fills`: the layer's

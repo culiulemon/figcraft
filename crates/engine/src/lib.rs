@@ -17,6 +17,7 @@ pub mod catalog;
 pub mod cmd;
 mod content;
 mod dev;
+pub mod events;
 mod extensions;
 pub mod fonts;
 pub mod guard;
@@ -143,6 +144,10 @@ pub struct Session {
     pub live: live::Lives,
     /// Commands the UI runs without waiting on a server ([`Session::start_background`]).
     pub background: background::Background,
+    /// Live agent events (comment changes), shared with the control channel's `events.poll`.
+    pub events: Arc<events::EventLog>,
+    /// Events recorded inside a group: (kind, document, path, data).
+    pending_events: Vec<(String, String, Option<String>, Value)>,
 }
 
 impl Default for Session {
@@ -254,6 +259,8 @@ mod duplicate_spacing_tests;
 #[cfg(test)]
 mod effects_tests;
 #[cfg(test)]
+mod events_tests;
+#[cfg(test)]
 mod export_behaviour_tests;
 #[cfg(test)]
 mod export_bench_tests;
@@ -346,6 +353,8 @@ mod nested_override_tests;
 #[cfg(test)]
 mod node_set_refusals_tests;
 #[cfg(test)]
+mod normalize_guard_tests;
+#[cfg(test)]
 mod online_tests;
 #[cfg(test)]
 mod open_issues_tests;
@@ -423,6 +432,8 @@ mod save_disk_changes_tests;
 mod save_format_tests;
 #[cfg(test)]
 mod scale_tool_tests;
+#[cfg(test)]
+mod scaled_instance_tests;
 #[cfg(test)]
 mod section_contents_tests;
 #[cfg(test)]

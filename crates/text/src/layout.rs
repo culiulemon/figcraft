@@ -322,9 +322,18 @@ pub(crate) fn visual_order(levels: &[u8]) -> Vec<usize> {
     order
 }
 
-/// Lay out `text` for a box of `box_width` (used when the text wraps or aligns; for auto width
-/// pass `None`). `box_height` is used for truncation only.
-pub fn layout(text: &TextData, box_width: Option<f64>, box_height: Option<f64>) -> TextLayout {
+struct ShapedText {
+    chars: Vec<char>,
+    styles: Vec<TextStyle>,
+    faces: Vec<Option<Arc<Face>>>,
+    fallbacks: Vec<Arc<Face>>,
+    items: Vec<Item>,
+    bidi: Option<Bidi>,
+    /// For each char, whether it starts a grapheme cluster.
+    cluster_start: Vec<bool>,
+}
+
+fn shape_text(text: &TextData) -> ShapedText {
     let chars: Vec<char> = text.characters.chars().collect();
     let spans = text.spans();
     let mut styles: Vec<TextStyle> = Vec::new();
@@ -365,7 +374,6 @@ pub fn layout(text: &TextData, box_width: Option<f64>, box_height: Option<f64>) 
     // Shape each span, split by paragraph, bidi run and fallback face.
     let bidi = Bidi::of(&text.characters);
     let level_at = |i: usize| bidi.as_ref().and_then(|b| b.levels.get(i)).copied().unwrap_or(0);
-    let rtl_para_at = |i: usize| bidi.as_ref().and_then(|b| b.rtl_para.get(i)).copied().unwrap_or(false);
     // A grapheme cluster (emoji sequence, letter with marks) is shaped with one face.
     let cluster_start = crate::breaks::grapheme_starts(&text.characters);
     let mut items: Vec<Item> = Vec::with_capacity(chars.len());
@@ -431,40 +439,47 @@ pub fn layout(text: &TextData, box_width: Option<f64>, box_height: Option<f64>) 
         }
     }
 
-    // List markers sit in a gutter (one more per nesting level) and wrapped lines hang at the
-    // text start; a hanging list puts the outermost gutter outside the box. Paragraph indent
-    // applies to plain paragraphs only. Right-to-left paragraphs mirror both: the gutter and the
-    // indent are on the right, the text ends where they start.
-    let lists: Vec<ParaList> = (0..text.paragraph_count()).map(|p| text.para_list(p)).collect();
-    let markers = list_markers(&lists);
-    let step = list_step(&lists, &markers, styles.first(), faces.first().cloned().flatten().as_ref());
-    let hang_list = if text.hanging_list { step } else { 0.0 };
-    // Paragraph indent applies to start-aligned text only (left, or right for a right-to-left paragraph).
-    let indent_px = if text.paragraph_indent.is_finite() { text.paragraph_indent.clamp(0.0, 10_000.0) } else { 0.0 };
-    let indent_at = |char_idx: usize| {
-        let start_aligned = if rtl_para_at(char_idx) { text.align_h == TextAlignH::Right } else { text.align_h == TextAlignH::Left };
-        if start_aligned { indent_px } else { 0.0 }
-    };
-    let list_of = |p: usize| lists.get(p).copied().unwrap_or_default();
-    // The start indent of a line of paragraph `p` (`first`: its first line, starting at char `ci`).
-    let line_indent_of = |p: usize, first: bool, ci: usize| {
-        let pl = list_of(p);
-        match pl.list {
-            ListStyle::None if first => indent_at(ci),
-            ListStyle::None => 0.0,
-            _ => step * (f64::from(pl.indent) + 1.0) - hang_list,
-        }
-    };
-    // Hanging punctuation: at the start edge of left-aligned and justified lines, at the end edge
-    // of right-aligned and justified ones (left-to-right paragraphs).
-    let hang_start = text.hanging_punctuation && matches!(text.align_h, TextAlignH::Left | TextAlignH::Justified);
-    let hang_end = text.hanging_punctuation && matches!(text.align_h, TextAlignH::Right | TextAlignH::Justified);
+    ShapedText { chars, styles, faces, fallbacks, items, bidi, cluster_start }
+}
 
-    // Line breaking.
-    let wrap = match text.auto_resize {
-        TextAutoResize::WidthAndHeight => None,
-        _ => box_width.filter(|w| w.is_finite() && *w > 0.0),
+fn line_break_after(items: &[Item], end: usize) -> bool {
+    end.checked_sub(1).and_then(|i| items.get(i)).is_some_and(|item| is_line_break(item.ch))
+}
+
+/// Where a line breaking before item `brk` may break: even an emergency break inside a word keeps a
+/// letter with its trailing mark and a leading vowel with the consonant after it (#1219). Backs up
+/// to such a boundary after `line_start`, or, when the line's first character is in one, carries it
+/// over to the next line with it.
+fn safe_break_index(items: &[Item], chars: &[char], cluster_start: &[bool], line_start: usize, brk: usize) -> usize {
+    let safe = |k: usize| -> bool {
+        let (Some(a), Some(b)) = (items.get(k.wrapping_sub(1)), items.get(k)) else { return true };
+        let at = b.char_start;
+        let Some(&before) = at.checked_sub(1).and_then(|c| chars.get(c)) else { return true };
+        // A break can only fall between two glyphs that are not the same cluster.
+        a.char_end <= at
+            && cluster_start.get(at).copied().unwrap_or(true)
+            && crate::breaks::safe_emergency_break(before, chars.get(at).copied().unwrap_or(before))
     };
+    if safe(brk) {
+        return brk;
+    }
+    // Capped: a malformed run of thousands of marks must not make layout quadratic.
+    let carry = (brk + 1..items.len().min(brk + 257))
+        .take_while(|&k| items.get(k).is_some_and(|it| it.ch != '\n' && it.ch != LINE_SEPARATOR))
+        .find(|&k| safe(k));
+    (line_start + 1..brk).rev().find(|&k| safe(k)).or(carry).unwrap_or(brk)
+}
+
+fn break_lines(
+    items: &[Item],
+    chars: &[char],
+    cluster_start: &[bool],
+    wrap: Option<f64>,
+    line_indent_of: &impl Fn(usize, bool, usize) -> f64,
+    rtl_para_at: &impl Fn(usize) -> bool,
+    hang_start: bool,
+    hang_end: bool,
+) -> Vec<(usize, usize, bool, usize)> {
     let mut lines: Vec<(usize, usize, bool, usize)> = Vec::new(); // item range, paragraph end, paragraph
     let mut line_start = 0;
     let mut i = 0;
@@ -506,7 +521,7 @@ pub fn layout(text: &TextData, box_width: Option<f64>, box_height: Option<f64>) 
             && i > line_start
             && !it.is_space()
         {
-            let brk = last_break.filter(|b| *b >= line_start).map(|b| b + 1).unwrap_or(i);
+            let brk = safe_break_index(items, chars, cluster_start, line_start, last_break.filter(|b| *b >= line_start).map(|b| b + 1).unwrap_or(i));
             lines.push((line_start, brk, false, para));
             line_start = brk;
             i = brk;
@@ -521,230 +536,49 @@ pub fn layout(text: &TextData, box_width: Option<f64>, box_height: Option<f64>) 
         }
         i += 1;
     }
-    let break_after = |e: usize| e.checked_sub(1).and_then(|i| items.get(i)).is_some_and(|it| is_line_break(it.ch));
-    if line_start < items.len() || lines.is_empty() || lines.last().is_some_and(|l| l.2 || break_after(l.1)) {
+    if line_start < items.len() || lines.is_empty() || lines.last().is_some_and(|l| l.2 || line_break_after(items, l.1)) {
         lines.push((line_start, items.len(), true, para));
     }
 
-    // Line metrics and positions.
-    let default_style = styles.first().cloned().unwrap_or_default();
-    let default_face = faces.first().cloned().flatten();
-    let mut out = TextLayout { styles: styles.clone(), ..Default::default() };
-    let mut y = 0.0;
-    let mut para_start_line = true;
-    let max_lines = if text.max_lines > 0 && text.truncates() { text.max_lines as usize } else { usize::MAX };
-    // A style's vertical metrics (ascent, descent, line height, cap height) come from its own
-    // font, never a fallback face, so lines mixing scripts keep the spacing of lines that don't.
-    let metrics = |st_idx: usize| -> [f64; 4] {
-        let st = styles.get(st_idx).unwrap_or(&default_style);
-        let size = sanitize_size(st.font_size);
-        match faces.get(st_idx).and_then(Option::as_ref).or(default_face.as_ref()) {
-            Some(f) => {
-                let k = size / f.upem;
-                [f.ascent * k, f.descent * k, whole_px(st.line_height.resolve(size, natural_ratio(f))), f.cap_height * k]
-            }
-            None => [size * 0.8, size * 0.2, whole_px(st.line_height.resolve(size, 1.2)), size * 0.7],
-        }
-    };
-    // An item's glyph with its pen position at `pen` on the line at `baseline` (none for a space
-    // the font has no glyph for).
-    let glyph_at = |it: &Item, pen: f64, baseline: f64| {
-        let size = styles.get(it.style).map(|st| sanitize_size(st.font_size)).unwrap_or(12.0) * it.scale;
-        (it.gid != 0 || !it.is_space()).then(|| Glyph {
-            face: it.face.clone(),
-            coords: it.coords.clone(),
-            gid: it.gid,
-            x: pen + it.dx,
-            y: baseline - it.dy,
-            size,
-            advance: it.adv,
-            char_start: it.char_start,
-            char_end: it.char_end,
-            style: it.style,
-            rtl: it.level % 2 == 1,
-            warp: Affine::IDENTITY,
-        })
-    };
-    let mut first_cap = 0.0;
-    for (li, (s, e, para_end, para)) in lines.iter().enumerate() {
-        if li >= max_lines {
-            out.truncated = true;
-            break;
-        }
-        // Metrics from the styles present on the line (or the style at the break for empty lines).
-        let [mut asc, mut desc, mut lh, mut cap] = [0.0_f64; 4];
-        let mut seen = usize::MAX;
-        for st in items.get(*s..*e).unwrap_or(&[]).iter().map(|it| it.style) {
-            if st != seen {
-                seen = st;
-                let m = metrics(st);
-                (asc, desc, lh, cap) = (asc.max(m[0]), desc.max(m[1]), lh.max(m[2]), cap.max(m[3]));
-            }
-        }
-        if seen == usize::MAX {
-            [asc, desc, lh, cap] = metrics(items.get(s.saturating_sub(1)).map_or(0, |it| it.style));
-        }
-        if li == 0 {
-            first_cap = cap;
-        }
-        if para_start_line && li > 0 {
-            // Between two items of a list: the list spacing.
-            let in_list = |p: usize| list_of(p).list != ListStyle::None;
-            let gap = if in_list(*para) && para.checked_sub(1).is_some_and(in_list) { text.list_spacing } else { text.paragraph_spacing };
-            y += if gap.is_finite() { gap.clamp(0.0, 10_000.0) } else { 0.0 };
-        }
-        let baseline = y + (lh - (asc + desc)) / 2.0 + asc;
-        // Trailing spaces don't count for width/alignment.
-        let mut vis_end = *e;
-        while vis_end > *s && items.get(vis_end - 1).is_some_and(|it| it.is_space() || is_line_break(it.ch)) {
-            vis_end -= 1;
-        }
-        // Letter spacing separates glyphs: none after the line's last visible one.
-        let end_spacing = vis_end.checked_sub(1).filter(|i| *i >= *s).and_then(|i| items.get(i)).map_or(0.0, |it| it.spacing);
-        let width: f64 = items.get(*s..vis_end).unwrap_or(&[]).iter().map(|it| it.adv).sum::<f64>() - end_spacing;
-        let first_char = items.get(*s).map(|it| it.char_start).unwrap_or(0);
-        let rtl_line = rtl_para_at(first_char);
-        let line_indent = line_indent_of(*para, para_start_line, first_char);
-        // Hanging punctuation at the line's edges (the visible text's first and last chars).
-        let hang_l = items.get(*s).filter(|it| hang_start && !rtl_line && vis_end > *s && opens(it.ch)).map_or(0.0, |it| it.adv);
-        let hang_r =
-            items.get(vis_end.wrapping_sub(1)).filter(|it| hang_end && !rtl_line && vis_end > *s + 1 && closes(it.ch)).map_or(0.0, |it| it.adv);
-        let gstart = out.glyphs.len();
-        // Justify: extra space per gap.
-        let gaps = items.get(*s..vis_end).unwrap_or(&[]).iter().filter(|it| it.stretches()).count();
-        let justify_extra = match (text.align_h, wrap) {
-            (TextAlignH::Justified, Some(maxw)) if !para_end && !break_after(*e) && gaps > 0 => {
-                ((maxw - line_indent + hang_l + hang_r - width) / gaps as f64).max(0.0)
-            }
-            _ => 0.0,
-        };
-        // Where the visible text ends once justified.
-        let text_end = width + justify_extra * gaps as f64;
-        // A right-to-left line's trailing spaces sit at its visual left (rule L1, below) and hang
-        // outside it, so its visible text spans [0, text_end] with the gutter and indent after it.
-        let trailing: f64 = items
-            .get(vis_end..*e)
-            .unwrap_or(&[])
-            .iter()
-            .filter(|it| !is_line_break(it.ch))
-            .map(|it| it.adv + if it.stretches() { justify_extra } else { 0.0 })
-            .sum();
-        let mut pen = if rtl_line { -trailing } else { line_indent - hang_l };
-        // List marker (before the line's text; zero-length char range so carets skip it).
-        let pl = list_of(*para);
-        if para_start_line && pl.list != ListStyle::None {
-            let marker = markers.get(*para).cloned().unwrap_or_default();
-            let st_idx = items.get(*s).map(|it| it.style).unwrap_or(0);
-            let at = items.get(*s).map(|it| it.char_start).unwrap_or(chars.len());
-            // The marker takes the paragraph style's own font (not a fallback the line's first
-            // char needed, e.g. for Hebrew), so every bullet and number of a list matches; a
-            // nested bullet the font lacks comes from a fallback font.
-            let has = |f: &Arc<Face>| marker.chars().all(|c| f.has_char(c));
-            let own = faces.get(st_idx).cloned().flatten().filter(has);
-            let marker_face = match (own, styles.get(st_idx)) {
-                (Some(f), Some(st)) => {
-                    let coords = f.coords(&f.axis_values(st));
-                    Some((f, coords))
-                }
-                _ => fallbacks
-                    .iter()
-                    .find(|f| has(f))
-                    .map(|f| (f.clone(), no_coords()))
-                    .or_else(|| items.get(*s).map(|it| (it.face.clone(), it.coords.clone())))
-                    .or_else(|| default_face.clone().map(|f| (f, no_coords()))),
-            };
-            if let (Some(st), Some((face, coords))) = (styles.get(st_idx), marker_face) {
-                let size = sanitize_size(st.font_size);
-                let k = size / face.upem;
-                let numbered = pl.list == ListStyle::Numbered;
-                // Right to left, the number reads "1." with its full stop on the left (".1").
-                let marker = if rtl_line && numbered { format!(".{}", marker.trim_end_matches('.')) } else { marker };
-                let advance = marker_advance(&face, &coords, &marker, size);
-                // Numbers end (start, right to left) half an em from the text; bullets sit at the
-                // gutter's outer edge.
-                let gutter = step * f64::from(pl.indent) - hang_list;
-                let mut mx = match (rtl_line, numbered) {
-                    (false, true) => gutter + (step - size * 0.5 - advance).max(0.0),
-                    (false, false) => gutter,
-                    (true, true) => text_end + size * 0.5,
-                    (true, false) => text_end + (step - advance).max(0.0),
-                };
-                for c in marker.chars() {
-                    let gid = face.glyph_for(c);
-                    let adv = face.advance_at(gid, &coords) * k;
-                    out.glyphs.push(Glyph {
-                        face: face.clone(),
-                        coords: coords.clone(),
-                        gid,
-                        x: mx,
-                        y: baseline,
-                        size,
-                        advance: adv,
-                        char_start: at,
-                        char_end: at,
-                        style: st_idx,
-                        rtl: false,
-                        warp: Affine::IDENTITY,
-                    });
-                    mx += adv;
-                }
-            }
-        }
-        // Right-to-left runs are placed in visual order; trailing spaces take the paragraph's
-        // direction (rule L1).
-        let line_items = items.get(*s..*e).unwrap_or(&[]);
-        let order: Vec<usize> = if bidi.is_some() {
-            let para_level = u8::from(rtl_line);
-            let levels: Vec<u8> = line_items.iter().enumerate().map(|(k, it)| if *s + k >= vis_end { para_level } else { it.level }).collect();
-            visual_order(&levels)
-        } else {
-            (0..line_items.len()).collect()
-        };
-        for it in order.iter().filter_map(|k| line_items.get(*k)) {
-            if is_line_break(it.ch) {
-                continue;
-            }
-            out.glyphs.extend(glyph_at(it, pen, baseline));
-            pen += it.adv;
-            if it.stretches() {
-                pen += justify_extra;
-            }
-        }
-        let char_start = items.get(*s).map(|it| it.char_start).unwrap_or_else(|| chars.len());
-        let char_end = items.get(e.saturating_sub(1)).map(|it| it.char_end).unwrap_or(char_start).max(char_start);
-        out.lines.push(Line {
-            glyph_start: gstart,
-            glyph_end: out.glyphs.len(),
-            char_start,
-            char_end,
-            top: y,
-            height: lh,
-            baseline,
-            width: width + line_indent - hang_l - hang_r,
-            x: 0.0,
-            para_end: *para_end,
-            break_after: break_after(*e),
-            rtl: rtl_line,
-        });
-        y += lh;
-        para_start_line = *para_end;
-    }
-    out.width = out.lines.iter().map(|l| l.width).fold(0.0, f64::max);
-    // Vertical trim: the box starts at the first line's cap height and ends at the last baseline.
-    let trim = text.leading_trim == LeadingTrim::CapHeight && text.path.is_none();
-    if trim && let Some(first) = out.lines.first() {
-        let shift = first.baseline - first_cap;
-        for l in &mut out.lines {
-            l.top -= shift;
-            l.baseline -= shift;
-        }
-        for g in &mut out.glyphs {
-            g.y -= shift;
-        }
-    }
-    let bottom = |l: &Line| if trim { l.baseline } else { l.top + l.height };
-    out.height = out.lines.last().map_or(y, bottom).max(0.0);
+    lines
+}
 
+#[derive(Clone, Copy)]
+struct LayoutFinish<'a> {
+    text: &'a TextData,
+    box_width: Option<f64>,
+    box_height: Option<f64>,
+    wrap: Option<f64>,
+    lines: &'a [(usize, usize, bool, usize)],
+    items: &'a [Item],
+    styles: &'a [TextStyle],
+    faces: &'a [Option<Arc<Face>>],
+    first_cap: f64,
+    flow_height: f64,
+}
+
+fn glyph_at(styles: &[TextStyle], item: &Item, pen: f64, baseline: f64) -> Option<Glyph> {
+    let size = styles.get(item.style).map(|st| sanitize_size(st.font_size)).unwrap_or(12.0) * item.scale;
+    (item.gid != 0 || !item.is_space()).then(|| Glyph {
+        face: item.face.clone(),
+        coords: item.coords.clone(),
+        gid: item.gid,
+        x: pen + item.dx,
+        y: baseline - item.dy,
+        size,
+        advance: item.adv,
+        char_start: item.char_start,
+        char_end: item.char_end,
+        style: item.style,
+        rtl: item.level % 2 == 1,
+        warp: Affine::IDENTITY,
+    })
+}
+
+fn truncate_layout(out: &mut TextLayout, finish: &LayoutFinish<'_>) {
+    let LayoutFinish { text, box_height, wrap, lines, items, styles, .. } = *finish;
+    let trim = text.leading_trim == LeadingTrim::CapHeight && text.path.is_none();
+    let bottom = |line: &Line| if trim { line.baseline } else { line.top + line.height };
     // Truncation by height.
     if matches!(text.auto_resize, TextAutoResize::Truncate)
         && let Some(h) = box_height
@@ -766,7 +600,7 @@ pub fn layout(text: &TextData, box_width: Option<f64>, box_height: Option<f64>) 
         let wrapped_on = last.and_then(|li| Some((out.lines.get(li)?, lines.get(li)?, lines.get(li + 1)?)));
         if let (Some(maxw), Some((line, &(_, e, para_end, _), &(ns, ne, _, _)))) = (wrap, wrapped_on)
             && !para_end
-            && !break_after(e)
+            && !line_break_after(items, e)
             && !line.rtl
         {
             let baseline = line.baseline;
@@ -776,7 +610,7 @@ pub fn layout(text: &TextData, box_width: Option<f64>, box_height: Option<f64>) 
                     break;
                 }
                 if !is_line_break(it.ch) {
-                    out.glyphs.extend(glyph_at(it, pen, baseline));
+                    out.glyphs.extend(glyph_at(styles, it, pen, baseline));
                     pen += it.adv;
                 }
             }
@@ -785,7 +619,7 @@ pub fn layout(text: &TextData, box_width: Option<f64>, box_height: Option<f64>) 
                 l.glyph_end = gend;
             }
         }
-        add_ellipsis(&mut out, wrap);
+        add_ellipsis(out, wrap);
         // Carets and selections reach every char the line shows, borrowed ones included.
         if let Some(l) = out.lines.last() {
             let shown =
@@ -795,6 +629,26 @@ pub fn layout(text: &TextData, box_width: Option<f64>, box_height: Option<f64>) 
             }
         }
     }
+}
+
+fn finish_layout(out: &mut TextLayout, finish: LayoutFinish<'_>) {
+    let LayoutFinish { text, box_width, faces, first_cap, flow_height, .. } = finish;
+    // Vertical trim: the box starts at the first line's cap height and ends at the last baseline.
+    let trim = text.leading_trim == LeadingTrim::CapHeight && text.path.is_none();
+    if trim && let Some(first) = out.lines.first() {
+        let shift = first.baseline - first_cap;
+        for l in &mut out.lines {
+            l.top -= shift;
+            l.baseline -= shift;
+        }
+        for g in &mut out.glyphs {
+            g.y -= shift;
+        }
+    }
+    let bottom = |l: &Line| if trim { l.baseline } else { l.top + l.height };
+    out.height = out.lines.last().map_or(flow_height, bottom).max(0.0);
+
+    truncate_layout(out, &finish);
 
     // Horizontal alignment within the box.
     let align_width = match text.auto_resize {
@@ -891,8 +745,240 @@ pub fn layout(text: &TextData, box_width: Option<f64>, box_height: Option<f64>) 
     out.decorations = decos;
     out.styles.extend(deco_styles);
     if let Some(tp) = &text.path {
-        crate::onpath::place(&mut out, tp, text.align_h);
+        crate::onpath::place(out, tp, text.align_h);
     }
+}
+
+/// Lay out `text` for a box of `box_width` (used when the text wraps or aligns; for auto width
+/// pass `None`). `box_height` is used for truncation only.
+pub fn layout(text: &TextData, box_width: Option<f64>, box_height: Option<f64>) -> TextLayout {
+    let ShapedText { chars, styles, faces, fallbacks, items, bidi, cluster_start } = shape_text(text);
+    let rtl_para_at = |i: usize| bidi.as_ref().and_then(|b| b.rtl_para.get(i)).copied().unwrap_or(false);
+
+    // List markers sit in a gutter (one more per nesting level) and wrapped lines hang at the
+    // text start; a hanging list puts the outermost gutter outside the box. Paragraph indent
+    // applies to plain paragraphs only. Right-to-left paragraphs mirror both: the gutter and the
+    // indent are on the right, the text ends where they start.
+    let lists: Vec<ParaList> = (0..text.paragraph_count()).map(|p| text.para_list(p)).collect();
+    let markers = list_markers(&lists);
+    let step = list_step(&lists, &markers, styles.first(), faces.first().cloned().flatten().as_ref());
+    let hang_list = if text.hanging_list { step } else { 0.0 };
+    // Paragraph indent applies to start-aligned text only (left, or right for a right-to-left paragraph).
+    let indent_px = if text.paragraph_indent.is_finite() { text.paragraph_indent.clamp(0.0, 10_000.0) } else { 0.0 };
+    let indent_at = |char_idx: usize| {
+        let start_aligned = if rtl_para_at(char_idx) { text.align_h == TextAlignH::Right } else { text.align_h == TextAlignH::Left };
+        if start_aligned { indent_px } else { 0.0 }
+    };
+    let list_of = |p: usize| lists.get(p).copied().unwrap_or_default();
+    // The start indent of a line of paragraph `p` (`first`: its first line, starting at char `ci`).
+    let line_indent_of = |p: usize, first: bool, ci: usize| {
+        let pl = list_of(p);
+        match pl.list {
+            ListStyle::None if first => indent_at(ci),
+            ListStyle::None => 0.0,
+            _ => step * (f64::from(pl.indent) + 1.0) - hang_list,
+        }
+    };
+    // Hanging punctuation: at the start edge of left-aligned and justified lines, at the end edge
+    // of right-aligned and justified ones (left-to-right paragraphs).
+    let hang_start = text.hanging_punctuation && matches!(text.align_h, TextAlignH::Left | TextAlignH::Justified);
+    let hang_end = text.hanging_punctuation && matches!(text.align_h, TextAlignH::Right | TextAlignH::Justified);
+
+    let wrap = match text.auto_resize {
+        TextAutoResize::WidthAndHeight => None,
+        _ => box_width.filter(|w| w.is_finite() && *w > 0.0),
+    };
+    let lines = break_lines(&items, &chars, &cluster_start, wrap, &line_indent_of, &rtl_para_at, hang_start, hang_end);
+    // Line metrics and positions.
+    let default_style = styles.first().cloned().unwrap_or_default();
+    let default_face = faces.first().cloned().flatten();
+    let mut out = TextLayout { styles: styles.clone(), ..Default::default() };
+    let mut y = 0.0;
+    let mut para_start_line = true;
+    let max_lines = if text.max_lines > 0 && text.truncates() { text.max_lines as usize } else { usize::MAX };
+    // A style's vertical metrics (ascent, descent, line height, cap height) come from its own
+    // font, never a fallback face, so lines mixing scripts keep the spacing of lines that don't.
+    let metrics = |st_idx: usize| -> [f64; 4] {
+        let st = styles.get(st_idx).unwrap_or(&default_style);
+        let size = sanitize_size(st.font_size);
+        match faces.get(st_idx).and_then(Option::as_ref).or(default_face.as_ref()) {
+            Some(f) => {
+                let k = size / f.upem;
+                [f.ascent * k, f.descent * k, whole_px(st.line_height.resolve(size, natural_ratio(f))), f.cap_height * k]
+            }
+            None => [size * 0.8, size * 0.2, whole_px(st.line_height.resolve(size, 1.2)), size * 0.7],
+        }
+    };
+    let mut first_cap = 0.0;
+    for (li, (s, e, para_end, para)) in lines.iter().enumerate() {
+        if li >= max_lines {
+            out.truncated = true;
+            break;
+        }
+        // Metrics from the styles present on the line (or the style at the break for empty lines).
+        let [mut asc, mut desc, mut lh, mut cap] = [0.0_f64; 4];
+        let mut seen = usize::MAX;
+        for st in items.get(*s..*e).unwrap_or(&[]).iter().map(|it| it.style) {
+            if st != seen {
+                seen = st;
+                let m = metrics(st);
+                (asc, desc, lh, cap) = (asc.max(m[0]), desc.max(m[1]), lh.max(m[2]), cap.max(m[3]));
+            }
+        }
+        if seen == usize::MAX {
+            [asc, desc, lh, cap] = metrics(items.get(s.saturating_sub(1)).map_or(0, |it| it.style));
+        }
+        if li == 0 {
+            first_cap = cap;
+        }
+        if para_start_line && li > 0 {
+            // Between two items of a list: the list spacing.
+            let in_list = |p: usize| list_of(p).list != ListStyle::None;
+            let gap = if in_list(*para) && para.checked_sub(1).is_some_and(in_list) { text.list_spacing } else { text.paragraph_spacing };
+            y += if gap.is_finite() { gap.clamp(0.0, 10_000.0) } else { 0.0 };
+        }
+        let baseline = y + (lh - (asc + desc)) / 2.0 + asc;
+        // Trailing spaces don't count for width/alignment.
+        let mut vis_end = *e;
+        while vis_end > *s && items.get(vis_end - 1).is_some_and(|it| it.is_space() || is_line_break(it.ch)) {
+            vis_end -= 1;
+        }
+        // Letter spacing separates glyphs: none after the line's last visible one.
+        let end_spacing = vis_end.checked_sub(1).filter(|i| *i >= *s).and_then(|i| items.get(i)).map_or(0.0, |it| it.spacing);
+        let width: f64 = items.get(*s..vis_end).unwrap_or(&[]).iter().map(|it| it.adv).sum::<f64>() - end_spacing;
+        let first_char = items.get(*s).map(|it| it.char_start).unwrap_or(0);
+        let rtl_line = rtl_para_at(first_char);
+        let line_indent = line_indent_of(*para, para_start_line, first_char);
+        // Hanging punctuation at the line's edges (the visible text's first and last chars).
+        let hang_l = items.get(*s).filter(|it| hang_start && !rtl_line && vis_end > *s && opens(it.ch)).map_or(0.0, |it| it.adv);
+        let hang_r =
+            items.get(vis_end.wrapping_sub(1)).filter(|it| hang_end && !rtl_line && vis_end > *s + 1 && closes(it.ch)).map_or(0.0, |it| it.adv);
+        let gstart = out.glyphs.len();
+        // Justify: extra space per gap.
+        let gaps = items.get(*s..vis_end).unwrap_or(&[]).iter().filter(|it| it.stretches()).count();
+        let justify_extra = match (text.align_h, wrap) {
+            (TextAlignH::Justified, Some(maxw)) if !para_end && !line_break_after(&items, *e) && gaps > 0 => {
+                ((maxw - line_indent + hang_l + hang_r - width) / gaps as f64).max(0.0)
+            }
+            _ => 0.0,
+        };
+        // Where the visible text ends once justified.
+        let text_end = width + justify_extra * gaps as f64;
+        // A right-to-left line's trailing spaces sit at its visual left (rule L1, below) and hang
+        // outside it, so its visible text spans [0, text_end] with the gutter and indent after it.
+        let trailing: f64 = items
+            .get(vis_end..*e)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|it| !is_line_break(it.ch))
+            .map(|it| it.adv + if it.stretches() { justify_extra } else { 0.0 })
+            .sum();
+        let mut pen = if rtl_line { -trailing } else { line_indent - hang_l };
+        // List marker (before the line's text; zero-length char range so carets skip it).
+        let pl = list_of(*para);
+        if para_start_line && pl.list != ListStyle::None {
+            let marker = markers.get(*para).cloned().unwrap_or_default();
+            let st_idx = items.get(*s).map(|it| it.style).unwrap_or(0);
+            let at = items.get(*s).map(|it| it.char_start).unwrap_or(chars.len());
+            // The marker takes the paragraph style's own font (not a fallback the line's first
+            // char needed, e.g. for Hebrew), so every bullet and number of a list matches; a
+            // nested bullet the font lacks comes from a fallback font.
+            let has = |f: &Arc<Face>| marker.chars().all(|c| f.has_char(c));
+            let own = faces.get(st_idx).cloned().flatten().filter(has);
+            let marker_face = match (own, styles.get(st_idx)) {
+                (Some(f), Some(st)) => {
+                    let coords = f.coords(&f.axis_values(st));
+                    Some((f, coords))
+                }
+                _ => fallbacks
+                    .iter()
+                    .find(|f| has(f))
+                    .map(|f| (f.clone(), no_coords()))
+                    .or_else(|| items.get(*s).map(|it| (it.face.clone(), it.coords.clone())))
+                    .or_else(|| default_face.clone().map(|f| (f, no_coords()))),
+            };
+            if let (Some(st), Some((face, coords))) = (styles.get(st_idx), marker_face) {
+                let size = sanitize_size(st.font_size);
+                let k = size / face.upem;
+                let numbered = pl.list == ListStyle::Numbered;
+                // Right to left, the number reads "1." with its full stop on the left (".1").
+                let marker = if rtl_line && numbered { format!(".{}", marker.trim_end_matches('.')) } else { marker };
+                let advance = marker_advance(&face, &coords, &marker, size);
+                // Numbers end (start, right to left) half an em from the text; bullets sit at the
+                // gutter's outer edge.
+                let gutter = step * f64::from(pl.indent) - hang_list;
+                let mut mx = match (rtl_line, numbered) {
+                    (false, true) => gutter + (step - size * 0.5 - advance).max(0.0),
+                    (false, false) => gutter,
+                    (true, true) => text_end + size * 0.5,
+                    (true, false) => text_end + (step - advance).max(0.0),
+                };
+                for c in marker.chars() {
+                    let gid = face.glyph_for(c);
+                    let adv = face.advance_at(gid, &coords) * k;
+                    out.glyphs.push(Glyph {
+                        face: face.clone(),
+                        coords: coords.clone(),
+                        gid,
+                        x: mx,
+                        y: baseline,
+                        size,
+                        advance: adv,
+                        char_start: at,
+                        char_end: at,
+                        style: st_idx,
+                        rtl: false,
+                        warp: Affine::IDENTITY,
+                    });
+                    mx += adv;
+                }
+            }
+        }
+        // Right-to-left runs are placed in visual order; trailing spaces take the paragraph's
+        // direction (rule L1).
+        let line_items = items.get(*s..*e).unwrap_or(&[]);
+        let order: Vec<usize> = if bidi.is_some() {
+            let para_level = u8::from(rtl_line);
+            let levels: Vec<u8> = line_items.iter().enumerate().map(|(k, it)| if *s + k >= vis_end { para_level } else { it.level }).collect();
+            visual_order(&levels)
+        } else {
+            (0..line_items.len()).collect()
+        };
+        for it in order.iter().filter_map(|k| line_items.get(*k)) {
+            if is_line_break(it.ch) {
+                continue;
+            }
+            out.glyphs.extend(glyph_at(&styles, it, pen, baseline));
+            pen += it.adv;
+            if it.stretches() {
+                pen += justify_extra;
+            }
+        }
+        let char_start = items.get(*s).map(|it| it.char_start).unwrap_or_else(|| chars.len());
+        let char_end = items.get(e.saturating_sub(1)).map(|it| it.char_end).unwrap_or(char_start).max(char_start);
+        out.lines.push(Line {
+            glyph_start: gstart,
+            glyph_end: out.glyphs.len(),
+            char_start,
+            char_end,
+            top: y,
+            height: lh,
+            baseline,
+            width: width + line_indent - hang_l - hang_r,
+            x: 0.0,
+            para_end: *para_end,
+            break_after: line_break_after(&items, *e),
+            rtl: rtl_line,
+        });
+        y += lh;
+        para_start_line = *para_end;
+    }
+    out.width = out.lines.iter().map(|l| l.width).fold(0.0, f64::max);
+    finish_layout(
+        &mut out,
+        LayoutFinish { text, box_width, box_height, wrap, lines: &lines, items: &items, styles: &styles, faces: &faces, first_cap, flow_height: y },
+    );
+
     out
 }
 

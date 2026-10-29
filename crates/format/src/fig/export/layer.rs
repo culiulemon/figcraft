@@ -1,5 +1,9 @@
 use super::common::{export_setting, layout_grid, outlined, prop_type, variant_pairs};
-use super::*;
+use super::{
+    AUX, AutoLayout, BoolOp, Bound, ContentAlign, CrossAlign, Exporter, Fields, HConstraint, Kv, LAYERS, LayoutMode, MAX_DEPTH, MainAlign, MaskType,
+    Node, NodeId, NodeKind, PropDef, STASH, Sizing, TextData, TextStyle, VConstraint, WindingRule, arr, b, blend_name, color, e, fl, grid_sizing,
+    guid, int, matrix, o, position, root_fields, s, u, xy,
+};
 
 impl<'d> Exporter<'d> {
     /// Write layer `id` (child `index` of the layer with GUID `parent_guid`) and its subtree.
@@ -15,11 +19,11 @@ impl<'d> Exporter<'d> {
             ("phase", e("CREATED")),
             ("parentIndex", o(vec![("guid", parent_guid), ("position", s(&position(index)))])),
         ];
-        let children = if let NodeKind::Page { background, guides, prototype, .. } = &n.kind {
+        let children = if let NodeKind::Page { background, prototype, .. } = &n.kind {
             f.extend([("type", e("CANVAS")), ("name", s(&n.name))]);
             f.extend(root_fields());
             f.extend([("backgroundColor", color(*background)), ("backgroundOpacity", fl(background.a.into())), ("backgroundEnabled", b(true))]);
-            if !guides.is_empty() {
+            if !n.guides.is_empty() {
                 self.warn("ruler guides were left out");
             }
             if *prototype != Default::default() {

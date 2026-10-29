@@ -77,6 +77,10 @@ pub struct Server {
     signals: BTreeSet<u32>,
     /// Who spotlights now (a newcomer is told).
     spotlight: Option<u32>,
+    /// Saved history this server restored or replayed left image entries out (or may give a
+    /// resuming client other bytes under a key it holds): every resuming client catches up with
+    /// the snapshot, not the log.
+    resync: bool,
 }
 
 /// The most client ids a session remembers for reconnecting (the oldest disconnected ones go
@@ -127,6 +131,7 @@ impl Server {
             journal: None,
             signals: BTreeSet::new(),
             spotlight: None,
+            resync: false,
         }
     }
 
@@ -148,7 +153,7 @@ impl Server {
     /// reconnect with their ids). A log that doesn't lead up to the sequence number is dropped
     /// (clients then catch up with a snapshot).
     pub fn restore(state: SessionState, token: impl Into<String>, limits: Limits) -> Result<Server, Error> {
-        let replica = Replica::from_snapshot(&state.snapshot)?;
+        let (replica, left_out) = Replica::from_snapshot_leaving_out(&state.snapshot)?;
         let mut server = Server::new(replica.document().clone(), token, limits);
         server.state = replica;
         server.session = state.session;
@@ -158,6 +163,12 @@ impl Server {
         server.deleted = state.deleted;
         server.removed = state.removed;
         let contiguous = state.log.windows(2).all(|w| matches!(w, [a, b] if a.seq + 1 == b.seq));
+        // History saved before the image checks may hold image entries they refuse. The snapshot
+        // opens without them, and a saved log putting images may give a resuming client other
+        // bytes under a key it holds, which this state can't check: either way resuming clients
+        // catch up with the snapshot.
+        let puts_images = state.log.iter().flat_map(|a| &a.changes).any(Change::is_image);
+        server.resync = left_out > 0 || puts_images;
         if contiguous && state.log.last().is_none_or(|a| a.seq == state.seq) {
             for a in state.log {
                 server.remember(a);
@@ -198,9 +209,15 @@ impl Server {
                 Ok(())
             }
             Journal::Accepted(acc) if acc.seq <= self.seq => Ok(()),
-            Journal::Accepted(acc) => {
+            Journal::Accepted(mut acc) => {
                 if acc.seq != self.seq + 1 {
                     return Err(Error::Protocol(format!("batch {} after {}", acc.seq, self.seq)));
+                }
+                // A log written before the image checks may hold an image entry they refuse: the
+                // batch replays without it, so the edits after it aren't dropped with the rest of
+                // the log, and resuming clients catch up with the snapshot.
+                if acc.changes.iter().any(Change::is_image) && self.state.clone().apply_kept(&mut acc.changes, Change::is_image)? > 0 {
+                    self.resync = true;
                 }
                 self.accept(acc.author, self.seq, &acc.changes)?;
                 self.issued.entry(acc.author).or_default().note(acc.batch_id, false);
@@ -284,7 +301,9 @@ impl Server {
         // The log holds every batch after `floor`.
         let floor = self.log.front().map_or(self.seq, |a| a.seq.saturating_sub(1));
         let catch_up = match resume {
-            Some(r) if r.seq <= self.seq && r.seq >= floor => CatchUp::Delta(self.log.iter().filter(|a| a.seq > r.seq).cloned().collect()),
+            Some(r) if !self.resync && r.seq <= self.seq && r.seq >= floor => {
+                CatchUp::Delta(self.log.iter().filter(|a| a.seq > r.seq).cloned().collect())
+            }
             _ => CatchUp::Snapshot(self.state.snapshot().map_err(|e| refuse(&e.to_string()))?),
         };
         let (id, secret) = match resume {

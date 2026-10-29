@@ -5,16 +5,19 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use figcraft_doc::*;
+use figcraft_doc::{Collection, Document, ImportedComponent, ImportedRecord, LibraryLink, LibraryManifest, NodeId, PublishedLibrary, VariableId};
 use serde_json::{Value, json};
 
 use figcraft_collab::message::{LibraryReply, LibraryReq};
 
 use super::CommandSpec;
-use crate::library::*;
+use crate::library::{
+    Pending, Selection, absolute_path, accept_updates, asset_root, default_selection, find_link, import, import_styles, import_variables,
+    is_remote_variable, pending, prune, publish, publishable, published_collections, published_variables,
+};
 use crate::library_server::{archive, is_server_link, read_archive, shown_path};
 use crate::live::{NetReply, NetRequest, PublishOptions};
-use crate::params::*;
+use crate::params::{boolean, get, id_of, num, req_string, string};
 use crate::{EngineError, Result, Session, bad, spec};
 
 /// Longest library description kept (chars).

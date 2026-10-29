@@ -2,12 +2,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use figcraft_doc::*;
+use figcraft_doc::{Document, Effect, ExportSetting, ImageData, LayoutGrid, Node, NodeId, NodeKind};
 use figcraft_geom::Affine;
 use serde_json::{Map, Value, json};
 
 use super::{CommandSpec, ok};
-use crate::params::*;
+use crate::params::{
+    blend, boolean, color, get, id, id_of, num, num_or, opt_index, paint_of, parse, req_id, req_index, req_num, req_string, req_targets, string,
+    targets,
+};
 use crate::{BatchStep, EngineError, Result, Session, bad, spec};
 
 mod clipboard;

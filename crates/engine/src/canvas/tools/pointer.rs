@@ -1,5 +1,8 @@
 use super::handles::{handle_at, label_at, locked_in, on_corner_square, resize_cursor, selected_end_at};
-use super::*;
+use super::{
+    Cursor, Document, Gesture, NodeId, NodeKind, Overlay, PenCursor, Point, PointerEvent, PointerKind, Rect, Result, Session, ToolId, at_45_degrees,
+    frame_at, json, select_target,
+};
 
 impl Session {
     /// The pointer left the canvas: what hovering there showed goes (the distances Alt or Dev Mode

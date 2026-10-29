@@ -122,6 +122,65 @@ fn publishing_collections_hides_and_versions_variables() {
     assert!(empty.execute("library.publish", &json!({})).is_err());
 }
 
+/// `bind_alias_mode_read_only_and_updates`: every edit of a copy's variable or collection is refused.
+fn assert_copies_read_only(s: &mut Session, local: &str) {
+    let coll = copy_of(s, "primary").collection;
+    for (cmd, p) in [
+        ("variable.set", json!({"variable": local, "value": "#ff0000"})),
+        ("variable.update", json!({"variable": local, "name": "mine"})),
+        ("variable.delete", json!({"variable": local})),
+        ("variable.duplicate", json!({"variable": local})),
+        ("variable.create", json!({"collection": coll, "name": "extra", "type": "number", "value": 1})),
+        ("variable.addMode", json!({"collection": coll, "name": "Mine"})),
+        ("variable.renameMode", json!({"collection": coll, "mode": "Dark", "name": "Night"})),
+        ("variable.renameCollection", json!({"collection": coll, "name": "Mine"})),
+        ("variable.deleteCollection", json!({"collection": coll})),
+    ] {
+        let e = s.execute(cmd, &p).unwrap_err();
+        assert!(e.to_string().contains("can't be edited"), "{cmd}: {e}");
+    }
+}
+
+/// `bind_alias_mode_read_only_and_updates`: saved and reopened, the file renders without the library.
+fn reopened_without_library(s: &mut Session, d: &std::path::Path, lib_path: &str, lid: &str, outer: NodeId) {
+    // Saved and reopened, the copies, records and bindings stay; the file renders without the library.
+    let user_path = path_str(&d.join("app.figcraft"));
+    ex(s, "file.saveAs", json!({"path": user_path}));
+    std::fs::remove_file(lib_path).unwrap();
+    let mut t = Session::empty();
+    ex(&mut t, "file.open", json!({"path": user_path}));
+    assert_eq!(t.doc().unwrap().libraries, s.doc().unwrap().libraries);
+    assert_eq!(fill(&t, outer), "FF0000");
+    assert!(t.execute("library.bindVariable", &json!({"library": lid, "variable": "primary", "field": "fill", "ids": [outer]})).is_err());
+}
+
+/// `bind_alias_mode_read_only_and_updates`: the library changes its variables; the copies, bindings and alias follow.
+fn library_update_follows(s: &mut Session, lib: &mut Session, local: &str, [inner, outer]: [NodeId; 2]) {
+    let modes = Default::default();
+    // The library changes its variables and publishes again.
+    ex(lib, "variable.set", json!({"variable": "primary", "mode": "Light", "value": "#ff0000"}));
+    ex(lib, "variable.set", json!({"variable": "primary", "mode": "Dark", "value": "#222222"}));
+    ex(lib, "variable.set", json!({"variable": "base", "value": "#00ffff"}));
+    ex(lib, "variable.renameMode", json!({"collection": "Theme", "mode": "Dark", "name": "Night"}));
+    republish(lib);
+    let u = ex(s, "library.updates", json!({}));
+    assert_eq!(u["count"], 3, "primary, base and the collection: {u}");
+    assert_eq!(u["libraries"][0]["variables"].as_array().map(Vec::len), Some(2));
+    let r = ex(s, "library.acceptUpdates", json!({}));
+    assert_eq!((r["variables"].as_u64(), r["collections"].as_u64()), (Some(2), Some(1)), "{r}");
+    // Same copies (same ids), new values: the bound layers and the alias follow.
+    assert_eq!(copy_of(s, "primary").id, local);
+    assert_eq!((fill(s, inner), fill(s, outer)), ("222222".into(), "FF0000".into()));
+    assert!(matches!(s.doc().unwrap().variables.resolve("brand", &modes), Some(VariableValue::Color(c)) if c.to_hex() == "00FFFF"));
+    assert_eq!(s.doc().unwrap().variables.collections[0].modes[1].name, "Night");
+    assert_eq!(ex(s, "library.updates", json!({}))["count"], 0);
+    // Undo takes the update back.
+    ex(s, "edit.undo", json!({}));
+    assert_eq!(fill(s, outer), "0000FF");
+    ex(s, "edit.redo", json!({}));
+    healthy(s);
+}
+
 #[test]
 fn bind_alias_mode_read_only_and_updates() {
     let d = dir("flow");
@@ -180,57 +239,14 @@ fn bind_alias_mode_read_only_and_updates() {
     assert!(s.execute("library.aliasVariable", &json!({"library": lid, "alias": "primary", "variable": local})).is_err(), "copies are read-only");
 
     // The copies are read-only.
-    let coll = copy_of(&s, "primary").collection;
-    for (cmd, p) in [
-        ("variable.set", json!({"variable": local, "value": "#ff0000"})),
-        ("variable.update", json!({"variable": local, "name": "mine"})),
-        ("variable.delete", json!({"variable": local})),
-        ("variable.duplicate", json!({"variable": local})),
-        ("variable.create", json!({"collection": coll, "name": "extra", "type": "number", "value": 1})),
-        ("variable.addMode", json!({"collection": coll, "name": "Mine"})),
-        ("variable.renameMode", json!({"collection": coll, "mode": "Dark", "name": "Night"})),
-        ("variable.renameCollection", json!({"collection": coll, "name": "Mine"})),
-        ("variable.deleteCollection", json!({"collection": coll})),
-    ] {
-        let e = s.execute(cmd, &p).unwrap_err();
-        assert!(e.to_string().contains("can't be edited"), "{cmd}: {e}");
-    }
+    assert_copies_read_only(&mut s, &local);
     // Local edits still work.
     ex(&mut s, "variable.set", json!({"variable": "gap", "value": 3}));
     healthy(&s);
 
-    // The library changes its variables and publishes again.
-    ex(&mut lib, "variable.set", json!({"variable": "primary", "mode": "Light", "value": "#ff0000"}));
-    ex(&mut lib, "variable.set", json!({"variable": "primary", "mode": "Dark", "value": "#222222"}));
-    ex(&mut lib, "variable.set", json!({"variable": "base", "value": "#00ffff"}));
-    ex(&mut lib, "variable.renameMode", json!({"collection": "Theme", "mode": "Dark", "name": "Night"}));
-    republish(&mut lib);
-    let u = ex(&mut s, "library.updates", json!({}));
-    assert_eq!(u["count"], 3, "primary, base and the collection: {u}");
-    assert_eq!(u["libraries"][0]["variables"].as_array().map(Vec::len), Some(2));
-    let r = ex(&mut s, "library.acceptUpdates", json!({}));
-    assert_eq!((r["variables"].as_u64(), r["collections"].as_u64()), (Some(2), Some(1)), "{r}");
-    // Same copies (same ids), new values: the bound layers and the alias follow.
-    assert_eq!(copy_of(&s, "primary").id, local);
-    assert_eq!((fill(&s, inner), fill(&s, outer)), ("222222".into(), "FF0000".into()));
-    assert!(matches!(s.doc().unwrap().variables.resolve("brand", &modes), Some(VariableValue::Color(c)) if c.to_hex() == "00FFFF"));
-    assert_eq!(s.doc().unwrap().variables.collections[0].modes[1].name, "Night");
-    assert_eq!(ex(&mut s, "library.updates", json!({}))["count"], 0);
-    // Undo takes the update back.
-    ex(&mut s, "edit.undo", json!({}));
-    assert_eq!(fill(&s, outer), "0000FF");
-    ex(&mut s, "edit.redo", json!({}));
-    healthy(&s);
+    library_update_follows(&mut s, &mut lib, &local, [inner, outer]);
 
-    // Saved and reopened, the copies, records and bindings stay; the file renders without the library.
-    let user_path = path_str(&d.join("app.figcraft"));
-    ex(&mut s, "file.saveAs", json!({"path": user_path}));
-    std::fs::remove_file(&lib_path).unwrap();
-    let mut t = Session::empty();
-    ex(&mut t, "file.open", json!({"path": user_path}));
-    assert_eq!(t.doc().unwrap().libraries, s.doc().unwrap().libraries);
-    assert_eq!(fill(&t, outer), "FF0000");
-    assert!(t.execute("library.bindVariable", &json!({"library": lid, "variable": "primary", "field": "fill", "ids": [outer]})).is_err());
+    reopened_without_library(&mut s, &d, &lib_path, &lid, outer);
 
     // Removing the library keeps the copies in use and drops the rest.
     ex(&mut s, "variable.bind", json!({"ids": [outer], "field": "cornerRadius", "variable": null}));

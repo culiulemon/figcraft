@@ -1,6 +1,8 @@
 use super::handles::SNAP_PX;
 use super::pen::take_enclosed;
-use super::*;
+use super::{
+    Affine, Cursor, Gesture, Node, NodeId, NodeKind, Point, PointerEvent, Rect, Result, Session, StrokeCap, Targets, ToolId, Vec2, frame_at, textedit,
+};
 
 impl Session {
     pub(super) fn draw_down(&mut self, ev: &PointerEvent) -> Result<()> {

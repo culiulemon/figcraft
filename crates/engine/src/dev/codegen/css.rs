@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    ContentAlign, CrossAlign, Document, EffectKind, LayoutMode, LetterSpacing, LineHeight, MainAlign, Node, NodeId, NodeKind, PaintKind, TextAlignH,
+    TextCase, TextDecoration, Variable, css_borders, num,
+};
 
 // ------------------------------------------------------------------ CSS
 
@@ -85,51 +88,7 @@ pub(crate) fn css_decls(doc: &Document, n: &Node, t: &mut Tokens, hug: (bool, bo
         put("height", tok(doc, n, &["height"], px(n.height), t));
     }
     if let Some(l) = &n.layout {
-        put("display", "flex".into());
-        put("flex-direction", if l.mode == LayoutMode::Vertical { "column" } else { "row" }.into());
-        if l.wrap {
-            put("flex-wrap", "wrap".into());
-        }
-        put("gap", tok(doc, n, &["gap"], px(l.gap), t));
-        let [pt, pr, pb, pl] = l.padding;
-        let sides = [
-            tok(doc, n, &["paddingTop", "paddingVertical", "padding"], px(pt), t),
-            tok(doc, n, &["paddingRight", "paddingHorizontal", "padding"], px(pr), t),
-            tok(doc, n, &["paddingBottom", "paddingVertical", "padding"], px(pb), t),
-            tok(doc, n, &["paddingLeft", "paddingHorizontal", "padding"], px(pl), t),
-        ];
-        put("padding", sides.join(" "));
-        let justify = match l.main_align {
-            MainAlign::Min => "flex-start",
-            MainAlign::Center => "center",
-            MainAlign::Max => "flex-end",
-            MainAlign::SpaceBetween => "space-between",
-            MainAlign::SpaceAround => "space-around",
-            MainAlign::SpaceEvenly => "space-evenly",
-        };
-        put("justify-content", justify.into());
-        let align = match l.cross_align {
-            CrossAlign::Min => "flex-start",
-            CrossAlign::Center => "center",
-            CrossAlign::Max => "flex-end",
-            CrossAlign::Baseline => "baseline",
-        };
-        put("align-items", align.into());
-        if l.wrap {
-            // The lines: spread, or packed where the items align (baseline: at the start).
-            let spread = l.content_align == ContentAlign::SpaceBetween;
-            put(
-                "align-content",
-                if spread {
-                    "space-between"
-                } else if align == "baseline" {
-                    "flex-start"
-                } else {
-                    align
-                }
-                .into(),
-            );
-        }
+        layout_decls(doc, n, l, t, &mut put);
     }
     if matches!(n.kind, NodeKind::Ellipse { .. }) {
         put("border-radius", "50%".into());
@@ -169,6 +128,65 @@ pub(crate) fn css_decls(doc: &Document, n: &Node, t: &mut Tokens, hug: (bool, bo
     for (key, value) in css_borders(doc, n, t) {
         put(&key, value);
     }
+    effect_decls(n, &mut put);
+    if let NodeKind::Text(tx) = &n.kind {
+        text_decls(doc, n, tx, t, &mut put);
+    }
+    out
+}
+
+/// The flex declarations of auto layout `l` on `n`.
+fn layout_decls(doc: &Document, n: &Node, l: &figcraft_doc::AutoLayout, t: &mut Tokens, put: &mut impl FnMut(&str, String)) {
+    let px = |v: f64| format!("{}px", num(v));
+    put("display", "flex".into());
+    put("flex-direction", if l.mode == LayoutMode::Vertical { "column" } else { "row" }.into());
+    if l.wrap {
+        put("flex-wrap", "wrap".into());
+    }
+    put("gap", tok(doc, n, &["gap"], px(l.gap), t));
+    let [pt, pr, pb, pl] = l.padding;
+    let sides = [
+        tok(doc, n, &["paddingTop", "paddingVertical", "padding"], px(pt), t),
+        tok(doc, n, &["paddingRight", "paddingHorizontal", "padding"], px(pr), t),
+        tok(doc, n, &["paddingBottom", "paddingVertical", "padding"], px(pb), t),
+        tok(doc, n, &["paddingLeft", "paddingHorizontal", "padding"], px(pl), t),
+    ];
+    put("padding", sides.join(" "));
+    let justify = match l.main_align {
+        MainAlign::Min => "flex-start",
+        MainAlign::Center => "center",
+        MainAlign::Max => "flex-end",
+        MainAlign::SpaceBetween => "space-between",
+        MainAlign::SpaceAround => "space-around",
+        MainAlign::SpaceEvenly => "space-evenly",
+    };
+    put("justify-content", justify.into());
+    let align = match l.cross_align {
+        CrossAlign::Min => "flex-start",
+        CrossAlign::Center => "center",
+        CrossAlign::Max => "flex-end",
+        CrossAlign::Baseline => "baseline",
+    };
+    put("align-items", align.into());
+    if l.wrap {
+        // The lines: spread, or packed where the items align (baseline: at the start).
+        let spread = l.content_align == ContentAlign::SpaceBetween;
+        put(
+            "align-content",
+            if spread {
+                "space-between"
+            } else if align == "baseline" {
+                "flex-start"
+            } else {
+                align
+            }
+            .into(),
+        );
+    }
+}
+
+/// Shadows and blurs of `n`.
+fn effect_decls(n: &Node, put: &mut impl FnMut(&str, String)) {
     let shadows: Vec<String> = n
         .effects
         .iter()
@@ -196,75 +214,82 @@ pub(crate) fn css_decls(doc: &Document, n: &Node, t: &mut Tokens, hug: (bool, bo
             _ => {}
         }
     }
-    if let NodeKind::Text(tx) = &n.kind {
-        let s = &tx.style;
-        put("font-family", tok(doc, n, &["fontFamily"], format!("\"{}\"", s.font_family.replace('"', "'")), t));
-        put("font-size", tok(doc, n, &["fontSize"], px(s.font_size), t));
-        put("font-weight", s.weight().to_string());
-        if s.italic() {
-            put("font-style", "italic".into());
+}
+
+/// The type declarations of text layer `n`.
+fn text_decls(doc: &Document, n: &Node, tx: &figcraft_doc::TextData, t: &mut Tokens, put: &mut impl FnMut(&str, String)) {
+    let px = |v: f64| format!("{}px", num(v));
+    let s = &tx.style;
+    put("font-family", tok(doc, n, &["fontFamily"], format!("\"{}\"", s.font_family.replace('"', "'")), t));
+    put("font-size", tok(doc, n, &["fontSize"], px(s.font_size), t));
+    put("font-weight", s.weight().to_string());
+    if s.italic() {
+        put("font-style", "italic".into());
+    }
+    match s.line_height {
+        LineHeight::Pixels(v) => put("line-height", tok(doc, n, &["lineHeight"], px(v), t)),
+        LineHeight::Percent(p) => put("line-height", format!("{}%", num(p))),
+        LineHeight::Auto => {}
+    }
+    match s.letter_spacing {
+        LetterSpacing::Pixels(v) if v != 0.0 => put("letter-spacing", tok(doc, n, &["letterSpacing"], px(v), t)),
+        LetterSpacing::Percent(p) if p != 0.0 => put("letter-spacing", format!("{}em", num(p / 100.0))),
+        _ => {}
+    }
+    match tx.align_h {
+        TextAlignH::Left => {}
+        TextAlignH::Center => put("text-align", "center".into()),
+        TextAlignH::Right => put("text-align", "right".into()),
+        TextAlignH::Justified => put("text-align", "justify".into()),
+    }
+    match s.case {
+        TextCase::Original => {}
+        TextCase::Upper => put("text-transform", "uppercase".into()),
+        TextCase::Lower => put("text-transform", "lowercase".into()),
+        TextCase::Title => put("text-transform", "capitalize".into()),
+        TextCase::SmallCaps => put("font-variant", "small-caps".into()),
+    }
+    match s.decoration {
+        TextDecoration::None => {}
+        TextDecoration::Underline => put("text-decoration", "underline".into()),
+        TextDecoration::Strikethrough => put("text-decoration", "line-through".into()),
+    }
+    decoration_decls(s, put);
+    if tx.leading_trim == figcraft_doc::LeadingTrim::CapHeight {
+        put("text-box", "trim-both cap alphabetic".into());
+    }
+}
+
+fn decoration_decls(s: &figcraft_doc::TextStyle, put: &mut impl FnMut(&str, String)) {
+    let px = |v: f64| format!("{}px", num(v));
+    if s.decoration != TextDecoration::None {
+        let l = s.look();
+        let len = |m: LineHeight| match m {
+            LineHeight::Auto => None,
+            LineHeight::Pixels(v) => Some(px(v)),
+            LineHeight::Percent(p) => Some(format!("{}%", num(p))),
+        };
+        match l.style {
+            figcraft_doc::DecorationStyle::Solid => {}
+            figcraft_doc::DecorationStyle::Dotted => put("text-decoration-style", "dotted".into()),
+            figcraft_doc::DecorationStyle::Wavy => put("text-decoration-style", "wavy".into()),
         }
-        match s.line_height {
-            LineHeight::Pixels(v) => put("line-height", tok(doc, n, &["lineHeight"], px(v), t)),
-            LineHeight::Percent(p) => put("line-height", format!("{}%", num(p))),
-            LineHeight::Auto => {}
+        if let Some(v) = len(l.thickness) {
+            put("text-decoration-thickness", v);
         }
-        match s.letter_spacing {
-            LetterSpacing::Pixels(v) if v != 0.0 => put("letter-spacing", tok(doc, n, &["letterSpacing"], px(v), t)),
-            LetterSpacing::Percent(p) if p != 0.0 => put("letter-spacing", format!("{}em", num(p / 100.0))),
-            _ => {}
+        if let Some(c) = l.color {
+            put("text-decoration-color", c.to_css());
         }
-        match tx.align_h {
-            TextAlignH::Left => {}
-            TextAlignH::Center => put("text-align", "center".into()),
-            TextAlignH::Right => put("text-align", "right".into()),
-            TextAlignH::Justified => put("text-align", "justify".into()),
-        }
-        match s.case {
-            TextCase::Original => {}
-            TextCase::Upper => put("text-transform", "uppercase".into()),
-            TextCase::Lower => put("text-transform", "lowercase".into()),
-            TextCase::Title => put("text-transform", "capitalize".into()),
-            TextCase::SmallCaps => put("font-variant", "small-caps".into()),
-        }
-        match s.decoration {
-            TextDecoration::None => {}
-            TextDecoration::Underline => put("text-decoration", "underline".into()),
-            TextDecoration::Strikethrough => put("text-decoration", "line-through".into()),
-        }
-        if s.decoration != TextDecoration::None {
-            let l = s.look();
-            let len = |m: LineHeight| match m {
-                LineHeight::Auto => None,
-                LineHeight::Pixels(v) => Some(px(v)),
-                LineHeight::Percent(p) => Some(format!("{}%", num(p))),
-            };
-            match l.style {
-                figcraft_doc::DecorationStyle::Solid => {}
-                figcraft_doc::DecorationStyle::Dotted => put("text-decoration-style", "dotted".into()),
-                figcraft_doc::DecorationStyle::Wavy => put("text-decoration-style", "wavy".into()),
+        if s.decoration == TextDecoration::Underline {
+            if let Some(v) = len(l.offset) {
+                put("text-underline-offset", v);
             }
-            if let Some(v) = len(l.thickness) {
-                put("text-decoration-thickness", v);
+            // Browsers skip ink by default; the canvas only when asked.
+            if !l.skip_ink {
+                put("text-decoration-skip-ink", "none".into());
             }
-            if let Some(c) = l.color {
-                put("text-decoration-color", c.to_css());
-            }
-            if s.decoration == TextDecoration::Underline {
-                if let Some(v) = len(l.offset) {
-                    put("text-underline-offset", v);
-                }
-                // Browsers skip ink by default; the canvas only when asked.
-                if !l.skip_ink {
-                    put("text-decoration-skip-ink", "none".into());
-                }
-            }
-        }
-        if tx.leading_trim == figcraft_doc::LeadingTrim::CapHeight {
-            put("text-box", "trim-both cap alphabetic".into());
         }
     }
-    out
 }
 
 /// A gradient fill on a `w`×`h` box as a CSS background: linear along its handles' direction

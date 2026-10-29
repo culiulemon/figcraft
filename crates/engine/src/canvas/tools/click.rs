@@ -1,5 +1,8 @@
 use super::handles::{PATH_REACH_PX, label_at, locked_in, path_candidates, readable_text_fills};
-use super::*;
+use super::{
+    Affine, Document, Gesture, Node, NodeId, NodeKind, Point, PointerEvent, Rect, Result, Session, Sizing, TextAutoResize, TextData, TextPath,
+    ToolId, frame_at, json, select_target, textedit, within_slop,
+};
 
 impl Session {
     /// Handle a double-click gesture: finish a pen path, rename or click labels/widgets,

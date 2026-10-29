@@ -7,13 +7,13 @@
 //! used by `inspect.code`. A component connected to code (see [`crate::code_connect`]) shows its
 //! real snippet instead.
 
-use figcraft_doc::*;
+use figcraft_doc::{Document, NodeId, NodeKind, PropDef};
 use serde_json::{Value, json};
 
 use crate::cmd::CommandSpec;
 use crate::codegen::{CodeLang, Ctx, Markup, arkui, class_name, compose, indent, literal, swift};
 use crate::components::{prop_default_value, slot_edited, slots_of, variant_options, variant_props, variant_set};
-use crate::params::*;
+use crate::params::{id_of, string, targets};
 use crate::{bad, spec};
 
 /// What a component property becomes in code.

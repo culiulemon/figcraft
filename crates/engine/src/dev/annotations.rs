@@ -7,12 +7,12 @@
 
 use std::sync::LazyLock;
 
-use figcraft_doc::*;
+use figcraft_doc::{Annotation, AnnotationCategory, Document, NodeId};
 use serde_json::{Value, json};
 
 use crate::cmd::CommandSpec;
 use crate::devinspect::{Prop, Section, properties};
-use crate::params::*;
+use crate::params::{color_of, get, id, req_index, req_string, string, targets};
 use crate::{bad, spec};
 
 /// Most annotations on one layer.

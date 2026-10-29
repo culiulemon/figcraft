@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use super::props::sizing;
 use super::{CommandSpec, ok};
-use crate::params::*;
+use crate::params::{get, num, req_num, req_targets, string};
 use crate::{Result, Session, bad, spec};
 
 pub fn specs() -> Vec<CommandSpec> {

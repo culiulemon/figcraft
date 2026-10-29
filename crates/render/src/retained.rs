@@ -344,7 +344,7 @@ fn patch(last: Frame, doc: &Arc<Document>, page: NodeId, view: &View, px: (i64, 
     let mut pix = last.pix;
     shift(&mut pix, dx, dy)?;
     for d in &damage {
-        render_into(doc, page, view, px, d, margin, opts, &mut pix)?;
+        render_into(FrameRender { doc, page, view, px, opts }, d, margin, &mut pix)?;
     }
     Some((pix, pixels))
 }
@@ -399,9 +399,17 @@ fn merge(mut rects: Vec<Px>) -> Vec<Px> {
     rects
 }
 
+struct FrameRender<'a> {
+    doc: &'a Document,
+    page: NodeId,
+    view: &'a View,
+    px: (i64, i64),
+    opts: &'a Options,
+}
+
 /// Render the frame pixels `d` (with `margin` more around, discarded) into `pix`.
-#[allow(clippy::too_many_arguments)]
-fn render_into(doc: &Document, page: NodeId, view: &View, px: (i64, i64), d: &Px, margin: i64, opts: &Options, pix: &mut Pixmap) -> Option<()> {
+fn render_into(frame: FrameRender<'_>, d: &Px, margin: i64, pix: &mut Pixmap) -> Option<()> {
+    let FrameRender { doc, page, view, px, opts } = frame;
     let s = view.scale;
     let (ox, oy) = (d.x0 - margin, d.y0 - margin);
     let (rw, rh) = (u32::try_from(d.x1 - d.x0 + 2 * margin).ok()?, u32::try_from(d.y1 - d.y0 + 2 * margin).ok()?);

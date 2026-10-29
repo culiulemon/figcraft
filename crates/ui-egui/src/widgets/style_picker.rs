@@ -706,8 +706,17 @@ fn grid_label(g: &figcraft_doc::LayoutGrid) -> String {
 
 /// The chip in `rect` of the variable `name` bound to `field` of text style `style`. A click on it
 /// opens the variable picker to change it, and its detach button unbinds it.
-#[allow(clippy::too_many_arguments)]
-fn text_binding(ui: &mut Ui, style: &str, field: &str, kind: VariableType, rect: Rect, name: &str, lead: widgets::Lead, out: &mut Frame) {
+struct TextBinding<'a> {
+    style: &'a str,
+    field: &'a str,
+    kind: VariableType,
+    rect: Rect,
+    name: &'a str,
+    lead: widgets::Lead<'a>,
+}
+
+fn text_binding(ui: &mut Ui, binding: TextBinding<'_>, out: &mut Frame) {
+    let TextBinding { style, field, kind, rect, name, lead } = binding;
     match widgets::bound_field(ui, Id::unique(("ts_bound", style, field)), lead, rect, name) {
         Some(widgets::BindEvent::Open(at)) => crate::variable_ui::open_style(ui, style, field, kind, at),
         Some(widgets::BindEvent::Detach) => out.act = Some(Act::Unbind(style.to_string(), field.to_string())),
@@ -747,7 +756,18 @@ fn font_family_field(ui: &mut Ui, doc: &Document, style: &Style, def: &TextStyle
     match bound_name(doc, style, "fontFamily") {
         Some(name) => {
             let (r, _) = ui.allocate_exact_size(vec2(W, widgets::FIELD_H), Sense::hover());
-            text_binding(ui, id, "fontFamily", VariableType::String, r, &name, widgets::Lead::Named(tr("Font")), out);
+            text_binding(
+                ui,
+                TextBinding {
+                    style: id,
+                    field: "fontFamily",
+                    kind: VariableType::String,
+                    rect: r,
+                    name: &name,
+                    lead: widgets::Lead::Named(tr("Font")),
+                },
+                out,
+            );
             None
         }
         None => Some(widgets::dropdown(ui, &def.font_family, W, None).on_hover_text(tr("Font"))),
@@ -762,7 +782,18 @@ fn font_style_size_row(ui: &mut Ui, doc: &Document, style: &Style, def: &TextSty
         match bound_name(doc, style, "fontStyle") {
             Some(name) => {
                 let (r, _) = ui.allocate_exact_size(vec2(half, widgets::FIELD_H), Sense::hover());
-                text_binding(ui, id, "fontStyle", VariableType::String, r, &name, widgets::Lead::Named(tr("Font style")), out);
+                text_binding(
+                    ui,
+                    TextBinding {
+                        style: id,
+                        field: "fontStyle",
+                        kind: VariableType::String,
+                        rect: r,
+                        name: &name,
+                        lead: widgets::Lead::Named(tr("Font style")),
+                    },
+                    out,
+                );
             }
             None => style_resp = Some(widgets::dropdown(ui, &def.font_style, half, None).on_hover_text(tr("Font style"))),
         }
@@ -802,7 +833,18 @@ fn line_height_field(ui: &mut Ui, doc: &Document, style: &Style, def: &TextStyle
     match bound_name(doc, style, "lineHeight") {
         Some(name) => {
             let (r, _) = ui.allocate_exact_size(area.size(), Sense::hover());
-            text_binding(ui, id, "lineHeight", VariableType::Number, r, &name, widgets::Lead::Named(tr("Line height")), out);
+            text_binding(
+                ui,
+                TextBinding {
+                    style: id,
+                    field: "lineHeight",
+                    kind: VariableType::Number,
+                    rect: r,
+                    name: &name,
+                    lead: widgets::Lead::Named(tr("Line height")),
+                },
+                out,
+            );
         }
         None => {
             if let Some(v) = widgets::text_field(ui, Id::unique(("ts_lh", id)), &def.line_height.label(), half, tr("Line height"))
@@ -823,7 +865,18 @@ fn letter_spacing_field(ui: &mut Ui, doc: &Document, style: &Style, def: &TextSt
     match bound_name(doc, style, "letterSpacing") {
         Some(name) => {
             let (r, _) = ui.allocate_exact_size(area.size(), Sense::hover());
-            text_binding(ui, id, "letterSpacing", VariableType::Number, r, &name, widgets::Lead::Named(tr("Letter spacing")), out);
+            text_binding(
+                ui,
+                TextBinding {
+                    style: id,
+                    field: "letterSpacing",
+                    kind: VariableType::Number,
+                    rect: r,
+                    name: &name,
+                    lead: widgets::Lead::Named(tr("Letter spacing")),
+                },
+                out,
+            );
         }
         None => {
             if let Some(v) = widgets::text_field(ui, Id::unique(("ts_ls", id)), &def.letter_spacing.label(), half, tr("Letter spacing"))

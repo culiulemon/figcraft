@@ -4,12 +4,15 @@
 
 use std::collections::BTreeSet;
 
-use figcraft_doc::*;
+use figcraft_doc::{
+    CODE_PLATFORMS, Collection, CollectionId, Document, ModeId, NodeId, NodeKind, Variable, VariableId, VariableType, VariableValue, Variables,
+    normalize_scopes, scope_known,
+};
 use serde_json::{Value, json};
 
 use super::lists::BoundList;
 use super::{CommandSpec, ok};
-use crate::params::*;
+use crate::params::{boolean, get, num, req_string, string};
 use crate::{Result, Session, bad, spec};
 
 pub fn specs() -> Vec<CommandSpec> {

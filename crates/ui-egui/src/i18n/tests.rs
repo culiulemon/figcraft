@@ -492,6 +492,50 @@ fn georgian_is_picked_for_georgian_locales() {
     }
 }
 
+#[test]
+fn arabic_tags_and_count_neutral_forms() {
+    let ar = LANGS.iter().position(|l| l.code == "ar").unwrap();
+    assert_eq!(LANGS[ar].name, "العربية");
+    for tag in ["ar", "ar-SA", "ar_EG.UTF-8", "ar_AE@arabic"] {
+        assert_eq!(resolve("system", Some(tag)), ar, "{tag}");
+        assert_eq!(resolve(tag, None), ar, "{tag}");
+    }
+    let counts = [0, 1, 2, 3, 10, 11, 99, 100, 102, 103, 111, 200, 1000];
+    for (key, text) in LANGS[ar].ui {
+        if let Text::Plural { one, few, many, other } = text {
+            assert!(one.is_none() && few.is_none() && many.is_none(), "{key}: count-neutral wording uses only other");
+            for n in counts {
+                assert_eq!(counted(ar, key, n), *other, "{key}, {n}");
+                assert!(fill(other, &[("n", &n)]).contains(&n.to_string()));
+            }
+        }
+    }
+}
+
+#[test]
+fn the_built_in_arabic_face_draws_the_arabic_catalog() {
+    if !figcraft_text::CRAFT_FONTS.iter().any(|f| f.family == "Noto Sans Arabic" && f.style == "Regular") {
+        eprintln!("built without craft-fonts' Noto Sans Arabic; skipping");
+        return;
+    }
+    let Some(face) = figcraft_text::face_with_char('ع', &["Noto Sans Arabic"]) else {
+        panic!("the supplied Noto Sans Arabic face must draw Arabic");
+    };
+    let ar = &LANGS[LANGS.iter().position(|l| l.code == "ar").unwrap()];
+    let letters: BTreeSet<char> = ar
+        .ui
+        .iter()
+        .chain(ar.commands)
+        .chain(ar.menu)
+        .flat_map(|(_, t)| forms(t))
+        .flat_map(str::chars)
+        .filter(|c| matches!(u32::from(*c), 0x0600..=0x06FF))
+        .collect();
+    assert!(letters.len() > 28);
+    let missing: String = letters.iter().filter(|c| !face.has_char(**c)).collect();
+    assert!(missing.is_empty(), "Arabic catalog glyphs missing from the embedded face: {missing:?}");
+}
+
 /// Release builds embed craft-fonts' Noto Sans Georgian (`theme::install_fonts`' built-in faces),
 /// since Inter and egui's fonts have no Georgian: it draws every Georgian letter the catalog uses.
 #[test]

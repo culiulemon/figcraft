@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    Arc, BatchScope, BatchStep, DocState, Document, EngineError, HistoryEntry, Interaction, NodeId, PREVIEW_READ_ONLY, Result, Session, UiRequest,
+    Value, cmd, figcraft_collab, normalize, textpreview,
+};
 
 impl Session {
     /// How many undo and redo steps the active document has (the user's own in a live session).
@@ -214,6 +217,7 @@ impl Session {
     /// own, and when it fails the documents stay at their group-start state.
     pub fn grouped<T>(&mut self, label: &str, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         self.ds()?;
+        let pending_mark = self.pending_events.len();
         let before: Vec<_> =
             self.docs.iter().map(|ds| (ds.uid, ds.doc.clone(), ds.selection.clone(), ds.page, ds.history.undo.len(), ds.history.limit)).collect();
         // An edit inside clears the redo steps; a failed group has to bring them back.
@@ -231,11 +235,13 @@ impl Session {
         self.group_depth += 1;
         let result = f(self);
         self.group_depth -= 1;
+        let at_root = self.group_depth == 0;
         for (uid, _, _, _, _, _) in &before {
             self.live_hold(*uid, false);
         }
 
         if result.is_err() {
+            self.pending_events.truncate(pending_mark);
             // Tabs the group closed come back from the stash, and the group-start order returns.
             let mut current = std::mem::take(&mut self.docs);
             for (uid, ..) in &before {
@@ -262,8 +268,9 @@ impl Session {
             }
             return result;
         }
-        if self.group_depth == 0 {
+        if at_root {
             self.closed_in_group.clear();
+            self.flush_pending_events();
         }
 
         let changed: Vec<_> = before

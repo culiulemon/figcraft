@@ -1,5 +1,5 @@
 use super::paint::color;
-use super::*;
+use super::{Kv, MAX_EXPR_DEPTH, Mapper, Obj, Value, View, guid, json, num, ref_guid};
 
 impl<'a> Mapper<'a> {
     pub(super) fn variable_bindings(&mut self, o: &mut Obj, v: &View<'a>) {

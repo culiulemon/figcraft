@@ -187,3 +187,27 @@ fn the_pencil_previews_its_stroke_in_its_colour_and_weight() {
     let w = preview(&flat(&u.frame_output(vec![egui::Event::PointerMoved(p)]).shapes)).expect("still previewing");
     assert!((w - 1.0).abs() < 0.01, "at least a point: {w}");
 }
+
+#[test]
+fn a_selected_layer_shows_its_constraint_guides_in_its_frame() {
+    // A child pinned left (the default) in a frame without auto layout: a dashed guide runs from its
+    // left-edge midpoint to the frame's left edge. An auto layout frame places its children itself,
+    // so only a child that ignores the auto layout (absolute) shows one there.
+    let mut s = Session::new();
+    let f = id(&s.execute("frame.create", &json!({"x": 0, "y": 0, "width": 200, "height": 120})).unwrap());
+    let c = id(&s.execute("node.create", &json!({"type": "rectangle", "x": 80, "y": 40, "width": 40, "height": 40, "parent": f})).unwrap());
+    s.execute("select.set", &json!({"ids": [c]})).unwrap();
+    let mut u = Ui::new(s);
+    let guide = |u: &mut Ui| {
+        let shapes = flat(&u.frame_output(vec![]).shapes);
+        let doc = u.app.session.doc().unwrap();
+        let (fb, cb) = (doc.world_bounds(f).unwrap(), doc.world_bounds(c).unwrap());
+        let y = cb.center().y;
+        dashes_along(&shapes, u.app.to_screen(fb.x0, y), u.app.to_screen(cb.x0, y))
+    };
+    assert!(guide(&mut u) > 0, "a left constraint draws a dashed guide to the frame's left edge");
+    u.app.run("node.set", json!({"id": f, "props": {"layout": "horizontal", "padding": 40}}));
+    assert_eq!(guide(&mut u), 0, "auto layout places the child: no constraint guide");
+    u.app.run("node.set", json!({"id": c, "props": {"absolute": true}}));
+    assert!(guide(&mut u) > 0, "an absolute child is pinned by its constraints again");
+}

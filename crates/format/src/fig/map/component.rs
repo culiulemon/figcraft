@@ -1,6 +1,6 @@
 use super::layer::own_text;
 use super::text::char_styles;
-use super::*;
+use super::{BTreeMap, BTreeSet, Kv, MAX_DEPTH, Mapper, Obj, Rc, Value, View, guid, json};
 
 /// An override row names a layer of the main by its current GUID or by the `overrideKey` the
 /// layer had when the row was written: the key becomes the current GUID, unless the layer is

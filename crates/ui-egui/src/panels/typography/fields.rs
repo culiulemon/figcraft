@@ -2,7 +2,11 @@ use super::axes::variable_axes;
 use super::glyphs::{LeadGlyph, caption, feature_row, text_seg};
 use super::picker::{font_picker, remember_family};
 use super::spacing::{SpacingField, commit_spacing, parse_letter_spacing, parse_line_height, spacing_field, spacing_input};
-use super::*;
+use super::{
+    Arc, DecorationLength, Document, FEATURES, FIELD_H, FieldEdit, FigApp, Icon, Id, Lead, LeadingTrim, ListStyle, MIXED, NodeId, PAD, SIZES, Sense,
+    TABS, TextAlignH, TextAlignV, TextAutoResize, TextCase, TextData, TextDecoration, TextStyle, Tokens, Ui, Value, VariableType, common, field_row,
+    icons, json, live, menu_item, menu_popup, regular, row, semibold, text_style_params, tr, tr_noop, trf, trim_num, uniform, vec2, widgets,
+};
 
 /// The font rows: family, style and size, line height and letter spacing.
 pub(super) fn font_rows(

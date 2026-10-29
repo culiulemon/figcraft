@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 
-use figcraft_doc::*;
+use figcraft_doc::{DevStatus, Document, MAX_SNAPSHOT_NODES, Node, NodeId, NodeKind};
 use serde::Serialize;
 
 use crate::devinspect::{Prop, Section, properties};

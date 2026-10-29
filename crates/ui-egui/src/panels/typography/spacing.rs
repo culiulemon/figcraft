@@ -1,5 +1,8 @@
 use super::glyphs::{LeadGlyph, paint_lead};
-use super::*;
+use super::{
+    Align2, CornerRadius, FIELD_H, FieldEdit, FigApp, Id, LetterSpacing, LineHeight, MIXED, NodeId, Rect, Sense, Stroke, StrokeKind, Tokens, Ui,
+    Value, VariableType, commit_text, json, live, pos2, regular, tr, trim_num, vec2, widgets,
+};
 
 /// Line height, letter spacing or paragraph spacing: property, field id, glyph and tooltip.
 pub(super) struct SpacingField {

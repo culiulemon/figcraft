@@ -335,6 +335,56 @@ fn thai_comes_from_a_thai_font_when_one_is_installed() {
 }
 
 #[test]
+fn thai_emergency_break_can_back_up_to_the_first_letter() {
+    // #1219: in "กเม" the overflow lands between the leading vowel and its consonant; the only
+    // safe break is right after the first letter, so the vowel moves down with "ม".
+    let s = "กเม";
+    let thai = ["Noto Sans Thai", "Noto Sans Thai UI", "Leelawadee UI", "Thonburi", "Tahoma"];
+    if face().is_none() || !thai.iter().any(|t| find_face(t, "Regular").is_some_and(|t| s.chars().all(|c| t.has_char(c)))) {
+        return;
+    }
+    let mut t = text(s, TextAutoResize::Height);
+    t.style.font_size = 16.0;
+    let two = layout(&t, None, None).caret(2).0;
+    let lines = layout(&t, Some(two + 0.5), None).lines;
+    assert_eq!(lines.get(1).map(|l| l.char_start), Some(1), "the leading vowel stays with its consonant");
+}
+
+#[test]
+fn thai_emergency_breaks_keep_marks_and_leading_vowels_with_their_letter() {
+    // #1219: Thai writes no spaces between words, so a paragraph is one run with no break
+    // opportunity and wraps where it overflows. Even that emergency break must not start a line
+    // with a mark (it belongs to the letter before it) or end one with a leading vowel (it is
+    // written before the consonant it is read with). Skips without a Thai face.
+    let s = "ระบบช่วยให้ทีมพัฒนาซอฟต์แวร์จัดทำเอกสารที่มีโครงสร้างได้ในที่เดียว";
+    let chars: Vec<char> = s.chars().collect();
+    let thai = ["Noto Sans Thai", "Noto Sans Thai UI", "Leelawadee UI", "Thonburi", "Tahoma"];
+    if face().is_none() {
+        return;
+    }
+    if !thai.iter().any(|t| find_face(t, "Regular").is_some_and(|t| chars.iter().all(|c| t.has_char(*c)))) {
+        return;
+    }
+    let mut t = text(s, TextAutoResize::Height);
+    t.style.font_size = 16.0;
+    let total = layout(&t, None, None).caret(chars.len()).0;
+    let is_mark = |c: char| matches!(c, '\u{0E31}' | '\u{0E34}'..='\u{0E3A}' | '\u{0E47}'..='\u{0E4E}');
+    let is_leading_vowel = |c: char| ('\u{0E40}'..='\u{0E44}').contains(&c);
+    let mut breaks = 0;
+    for k in 1..40 {
+        let width = total * f64::from(k) / 40.0;
+        for line in layout(&t, Some(width), None).lines.iter().skip(1) {
+            let (Some(start), Some(&first)) = (line.char_start.checked_sub(1), chars.get(line.char_start)) else { continue };
+            let Some(&before) = chars.get(start) else { continue };
+            assert!(!is_mark(first), "at {width:.1} px a line starts with U+{:04X}: {s}", first as u32);
+            assert!(!is_leading_vowel(before), "at {width:.1} px a line ends with {before:?} before {first:?}: {s}");
+            breaks += 1;
+        }
+    }
+    assert!(breaks > 0, "the sentence wraps at least once across these widths");
+}
+
+#[test]
 fn symbols_come_from_a_symbol_font_when_one_is_installed() {
     // ⌖ (U+2316) and ⤒ (U+2912) are in no Latin text face. With a symbol font that has them (Apple
     // Symbols on macOS, Segoe UI Symbol on Windows, Noto Sans Symbols 2 and Noto Sans Math on

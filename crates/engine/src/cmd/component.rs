@@ -2,13 +2,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use figcraft_doc::*;
+use figcraft_doc::{Document, Node, NodeId, NodeKind, PropDef, VariableType, VariableValue};
 use serde_json::{Value, json};
 
 use super::edit::{roots, z_sorted};
 use super::{CommandSpec, ok};
-use crate::components::*;
-use crate::params::*;
+use crate::components::{
+    OVERRIDE_GROUPS, PROP_BINDING, SLOT, copy_group, create_instance, create_instance_at, default_props, default_variant, exposed_copies,
+    find_variant, inside_instance, instances_of, is_slot, keep_text_overrides, owning_component, owning_instance, prop_default_value,
+    rebase_instance, root_instance, set_boolean_default, slot_edited, slot_name, slots_of, takes_value, unlink_layers, variant_conflicts,
+    variant_name, variant_options, variant_props, variant_set,
+};
+use crate::params::{boolean, get, id, id_of, num, req_id, req_num, req_string, req_targets, string, targets};
 use crate::{EngineError, Result, Session, bad, spec};
 
 mod instance;

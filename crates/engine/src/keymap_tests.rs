@@ -95,6 +95,11 @@ fn key_names_normalise() {
 
 #[test]
 fn lookups_follow_the_platform_and_context() {
+    lookups_on_every_platform();
+    lookups_that_differ_by_platform();
+}
+
+fn lookups_on_every_platform() {
     let none = Mods::default();
     let shift = mods(true, false, false, false);
     for p in PLATFORMS {
@@ -119,6 +124,9 @@ fn lookups_follow_the_platform_and_context() {
         assert_eq!(id_for(p, Context::Text, "V", none), None);
         assert_eq!(id_for(p, Context::Text, "A", mods(false, true, false, false)), None);
     }
+}
+
+fn lookups_that_differ_by_platform() {
     let mac = Platform::Mac;
     let other = Platform::Other;
     // Use as mask: ⌃⌘M on macOS, Ctrl+Alt+M elsewhere.
@@ -133,6 +141,10 @@ fn lookups_follow_the_platform_and_context() {
     assert_eq!(id_for(mac, Context::Canvas, "T", mods(false, true, false, true)), Some("arrange.tidy"));
     assert_eq!(id_for(other, Context::Canvas, "T", mods(true, true, true, true)), Some("arrange.tidy"));
     assert_eq!(id_for(other, Context::Canvas, "T", mods(false, true, true, true)), Some("text.alignCenter"));
+    macos_tells_ctrl_from_cmd(mac, other);
+}
+
+fn macos_tells_ctrl_from_cmd(mac: Platform, other: Platform) {
     // macOS tells ⌃ from ⌘: ⌃G is layout grids, ⌘G groups; ⌃C picks a colour, ⌘C copies.
     assert_eq!(id_for(mac, Context::Canvas, "G", mods(false, false, false, true)), Some("view.layoutGrids"));
     assert_eq!(id_for(mac, Context::Canvas, "G", mods(false, false, true, false)), Some("object.group"));

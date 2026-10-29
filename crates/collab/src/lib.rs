@@ -136,6 +136,8 @@ mod entry_ids_tests;
 #[cfg(test)]
 mod frac_tests;
 #[cfg(test)]
+mod image_tests;
+#[cfg(test)]
 mod journal_tests;
 #[cfg(test)]
 mod merge_list_tests;

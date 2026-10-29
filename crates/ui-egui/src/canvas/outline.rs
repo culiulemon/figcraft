@@ -1,4 +1,6 @@
-use super::*;
+use super::{
+    Arc, COMPONENT, Color32, CornerRadius, Document, FigApp, NodeId, NodeKind, Point, Pos2, Rect, Shape, Stroke, pos2, regular, semibold, tr, vec2,
+};
 
 pub(super) fn stroke(c: Color32, w: f32) -> Stroke {
     Stroke::new(w, c)

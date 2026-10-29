@@ -102,6 +102,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "key",
     "type_text",
     "inspect_ui",
+    "wait_for_changes",
 ];
 
 /// All tools, in `tools/list` order.
@@ -319,6 +320,21 @@ pub fn tool_definitions() -> Vec<Value> {
             empty(),
             true,
         ),
+        tool(
+            "wait_for_changes",
+            "Wait for changes",
+            "Wait for new comment events in the attached FigCraft app. Returns pending events immediately; otherwise waits up to `timeoutMs` (default 20000, max 25000). Call it again with the returned `cursor` to keep watching. Headless returns immediately (no other writer). Events carry a sequence number, kind, document and a small payload (for comments, the thread id).",
+            obj(
+                json!({
+                    "after": int("Return events after this cursor (default 0)"),
+                    "timeoutMs": int("Longest wait in milliseconds (default 20000, max 25000)"),
+                    "topics": {"type": "array", "items": {"type": "string", "enum": ["comments", "document", "all"]}, "description": "Event topics (default [\"comments\"]; document events are not emitted yet)"},
+                    "limit": int("Most events to return (default 100, max 1000)")
+                }),
+                &[],
+            ),
+            true,
+        ),
     ]
 }
 
@@ -326,6 +342,10 @@ pub fn tool_definitions() -> Vec<Value> {
 
 fn exec(b: &mut dyn Backend, cmd: &str, params: Value) -> Result<Value, String> {
     b.call("engine.execute", json!({"command": cmd, "params": params}))
+}
+
+fn wait_for_changes(b: &mut dyn Backend, a: &Map<String, Value>) -> Result<ToolResult, String> {
+    b.call("events.poll", Value::Object(a.clone())).map(|v| ToolResult::json(&v))
 }
 
 fn args_obj(args: &Value) -> Result<Map<String, Value>, String> {
@@ -439,6 +459,7 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, args: &Value) -> ToolResult {
         "key" => key(b, &a),
         "type_text" => type_text(b, &a),
         "inspect_ui" => b.call("ui.inspect", json!({})).map(|v| ToolResult::json(&v)),
+        "wait_for_changes" => wait_for_changes(b, &a),
         other => Err(format!("unknown tool `{other}` (tools/list has: {})", TOOL_NAMES.join(", "))),
     };
     r.unwrap_or_else(ToolResult::error)

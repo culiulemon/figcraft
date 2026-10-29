@@ -1,4 +1,4 @@
-use super::*;
+use super::{BlendMode, Color32, CornerRadius, FIELD_H, FigApp, Id, NodeId, PAD, Rect, Sense, Tokens, Ui, a11y, json, pos2, regular, tr, vec2};
 
 /// The smallest width a popup menu is measured in (see [`menu_popup`]).
 const MENU_MIN_W: f32 = 48.0;
@@ -14,11 +14,6 @@ pub(crate) fn menu_style(s: &mut egui::Style) {
     s.wrap_mode = Some(egui::TextWrapMode::Extend);
 }
 
-/// The menu a dropdown or button opens: as wide as its widest row and at least as wide as
-/// `anchor`. egui measures a popup in a first, invisible pass as wide as the width it is given
-/// (else its 600 px default area width) and keeps the size measured; rows ([`menu_row`]) take the
-/// larger of that width and their content, so the menu fits its content. Chain `.width(w)` for a
-/// menu at least `w` wide.
 /// The blend modes as menu items in groups (pass-through only for layers); the one picked. Each
 /// row `preview`s its mode on the canvas while hovered.
 pub fn blend_menu(ui: &mut Ui, with_pass_through: bool, mut preview: impl FnMut(BlendMode)) -> Option<BlendMode> {
@@ -44,6 +39,11 @@ pub(crate) fn preview_blend(app: &mut FigApp, ctx: &egui::Context, ids: &[NodeId
     app.preview_text(ctx, "node.set", json!({"ids": ids, "props": {"blend": blend.label()}}));
 }
 
+/// The menu a dropdown or button opens: as wide as its widest row and at least as wide as
+/// `anchor`. egui measures a popup in a first, invisible pass as wide as the width it is given
+/// (else its 600 px default area width) and keeps the size measured; rows ([`menu_row`]) take the
+/// larger of that width and their content, so the menu fits its content. Chain `.width(w)` for a
+/// menu at least `w` wide.
 pub fn menu_popup(anchor: &egui::Response) -> egui::Popup<'static> {
     egui::Popup::menu(anchor).width(anchor.rect.width().max(MENU_MIN_W)).style(menu_style)
 }

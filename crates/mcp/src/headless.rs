@@ -284,6 +284,14 @@ impl Backend for Headless {
                     None => Ok(json!({"format": "png", "width": w, "height": h, "data": base64::engine::general_purpose::STANDARD.encode(&bytes)})),
                 }
             }
+            "events.poll" => {
+                let after = p.get("after").and_then(Value::as_u64).unwrap_or(0);
+                let limit = p.get("limit").and_then(Value::as_u64).unwrap_or(100).clamp(1, 1000) as usize;
+                let topics = figcraft_engine::events::topics(p.get("topics"))?;
+                // Headless has no other writer to wait for.
+                let result = self.session.events.poll(after, &topics, limit, std::time::Duration::ZERO);
+                serde_json::to_value(result).map_err(|e| e.to_string())
+            }
             "app.quit" => Ok(json!({"ok": true})),
             other => Err(format!("unknown method `{other}`")),
         }

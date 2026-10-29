@@ -1,4 +1,4 @@
-use super::*;
+use super::{CanvasState, Done, FigApp, Job, NodeId, Worker};
 
 #[derive(Clone, PartialEq)]
 pub(super) struct JobKey {
@@ -218,7 +218,7 @@ fn a_moved_document_asks_for_a_new_frame() {
     let Some(first) = app.canvas.submitted.clone() else { return };
     // Where a drag's step lands: one command, one new revision.
     app.session.set_selection(vec![card]);
-    assert!(app.run("node.set", json!({"props": {"x": 20.0}})).is_some(), "the move");
+    assert!(app.run("node.set", serde_json::json!({"props": {"x": 20.0}})).is_some(), "the move");
     let _ = request_render(&mut app, &mut worker, 1.0, 16_383, None, false);
     let Some(second) = app.canvas.submitted.clone() else { return };
     assert!(first != second, "the moved frame was the job before it: the canvas keeps its texture");

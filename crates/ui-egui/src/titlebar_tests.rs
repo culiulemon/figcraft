@@ -149,7 +149,7 @@ fn tabs_and_new_tab_keep_their_clicks() {
     assert!(!u.app.ui.home);
     // The `+` right of it opens a new file (found by clicking along the bar past the tab).
     let mut opened = false;
-    for x in (176..320).step_by(4) {
+    for x in (180..320).step_by(4) {
         u.time += 1.0;
         assert!(u.click(pos2(x as f32, 20.0)).is_empty(), "{x}");
         if u.app.session.docs.len() > 1 {

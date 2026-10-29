@@ -1,6 +1,9 @@
 use super::diff::{binding_group, bindings_of};
 use super::sync::{insert_linked, sync_instance_depth};
-use super::*;
+use super::{
+    Affine, BTreeMap, ChildLayout, DocError, Document, Node, NodeId, NodeKind, Value, default_instance_name, default_props, holds_content, is_slot,
+    slot_edited,
+};
 
 /// Create an instance of `component` under `parent` at `(x, y)` (parent space).
 pub fn create_instance(doc: &mut Document, component: NodeId, parent: NodeId, x: f64, y: f64) -> Result<NodeId, DocError> {

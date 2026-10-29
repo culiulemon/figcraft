@@ -1,5 +1,5 @@
 use super::limits::Admission;
-use super::*;
+use super::{Access, Admin, AdminReply, ClientMsg, HostInfo, IpAddr, LibraryReply, LibraryReq, PluginReply, PluginReq, Server};
 
 /// An admin request's reply, and what the hub must do about connections it affects.
 #[derive(Clone, Debug, PartialEq)]

@@ -1,5 +1,8 @@
 use super::menu::{menu_item, menu_item_with, menu_popup, row};
-use super::*;
+use super::{
+    Brush, Color32, Document, FigApp, Icon, Id, Lead, NodeId, NodeKind, PAD, Pos2, Rect, Stroke, StrokeAlign, StrokeCap, StrokeJoin, StrokeProps,
+    Tokens, Ui, Value, WidthPoint, WidthPreset, WidthProfile, a11y, common, icons, json, pos2, tr, widgets,
+};
 
 /// A width profile drawn as a filled band across `rect` (thickest point = full height); `None`
 /// draws a uniform stroke.

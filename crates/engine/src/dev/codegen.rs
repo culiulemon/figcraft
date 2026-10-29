@@ -6,12 +6,15 @@
 //! output is a starting point, not a pixel-exact translation.
 
 use figcraft_color::{Color, PaintKind};
-use figcraft_doc::*;
+use figcraft_doc::{
+    ContentAlign, CrossAlign, Document, EffectKind, LayoutMode, LetterSpacing, LineHeight, MainAlign, Node, NodeId, NodeKind, Shadow, Sizing,
+    TextAlignH, TextCase, TextDecoration, Variable,
+};
 use serde_json::json;
 
 use crate::cmd::CommandSpec;
 use crate::component_codegen::{Component, Param};
-use crate::params::*;
+use crate::params::{get, id_of, num_or, string, targets};
 use crate::{bad, spec};
 
 mod arkui;

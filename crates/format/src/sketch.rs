@@ -66,7 +66,7 @@ const MAX_JSON_TOTAL: u64 = 2 * 1024 * 1024 * 1024;
 #[cfg(target_pointer_width = "32")]
 const MAX_JSON_TOTAL: u64 = 512 * 1024 * 1024;
 /// Largest image member read.
-const MAX_IMAGE: u64 = 256 * 1024 * 1024;
+const MAX_IMAGE: u64 = figcraft_doc::ImageData::MAX_BYTES;
 /// Most pages read from one file.
 const MAX_PAGES: usize = 1000;
 

@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    Access, Action, CODE_GONE, CODES_BUSY, Entry, FileInfo, Instant, IpAddr, LINKS, LinkInfo, MAX_GONE_CODES, NO_CODE, NewLink, OpenFile, Sealed,
+    Store, clean_name, codes, fs, hash, new_link, now, same_secret, write_json,
+};
 
 impl Store {
     /// The files kept.

@@ -50,7 +50,14 @@ pub fn show(s: &mut Session, command: &str, params: &Value) -> Result<()> {
     ds.text_edit = text_edit;
     match result {
         Ok(_) if !Arc::ptr_eq(&ds.doc, &base) => {
-            normalize(ds.doc_mut(), &base);
+            // A panic while normalising shows no preview (#1085).
+            if let Err(e) = guard::run(command, || {
+                normalize(ds.doc_mut(), &base);
+                Ok(())
+            }) {
+                ds.doc = base;
+                return Err(e);
+            }
             ds.text_preview = Some(base);
             ds.revision += 1;
             Ok(())

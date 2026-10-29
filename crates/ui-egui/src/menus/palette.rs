@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    Align2, Color32, CornerRadius, FigApp, Id, MENU, Rect, SEP, Sense, Stroke, StrokeKind, Tokens, Ui, available, i18n, invoke, json, pos2,
+    pretty_shortcut, record_recent, regular, tr, vec2,
+};
 
 /// The Actions palette's tab.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]

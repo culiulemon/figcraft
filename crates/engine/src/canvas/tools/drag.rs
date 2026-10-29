@@ -2,7 +2,11 @@ use super::handles::{
     SNAP_PX, handle_at, in_quad, label_at, locked_in, on_corner_square, paints_below, resized_box, scale_factor, selection_box, selection_frame,
     shape_hint,
 };
-use super::*;
+use super::{
+    Affine, ArcHandle, ArcHint, Cursor, Document, Gesture, Guide, Handle, ImageScaleMode, LayoutMode, NodeId, NodeKind, PaintKind, Point,
+    PointerEvent, Rect, ResizeStart, Result, ScaleHint, Session, Sizing, Targets, TextAutoResize, ToolId, Vec2, move_world, roots, select_target,
+    textedit, within_slop,
+};
 
 impl Session {
     pub(super) fn move_down(&mut self, ev: &PointerEvent) -> Result<()> {

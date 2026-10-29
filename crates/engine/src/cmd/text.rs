@@ -1,11 +1,14 @@
 //! Text menu and text editing commands.
 
-use figcraft_doc::*;
+use figcraft_doc::{
+    LetterSpacing, LineHeight, ListStyle, NodeId, NodeKind, TextAlignH, TextAutoResize, TextCase, TextData, TextDecoration, TextPath, TextStyle,
+    VariableId,
+};
 use serde_json::{Map, Value, json};
 
 use super::props::{styled_name, weight_name};
 use super::{CommandSpec, ok};
-use crate::params::*;
+use crate::params::{boolean, get, id, num, req_id, req_num, req_string, req_targets, string, targets};
 use crate::{Result, Session, bad, spec, textedit};
 
 fn finite(v: f64) -> f64 {

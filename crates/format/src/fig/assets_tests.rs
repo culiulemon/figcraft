@@ -274,19 +274,30 @@ fn variables_modes_and_bindings_round_trip() {
 #[test]
 fn variables_are_written_as_nodes_on_a_hidden_page() {
     let nodes = written(&themed());
-    let hidden = named(&nodes, "Internal Only Canvas");
+    assert_hidden_theme(&nodes);
+    assert_variable_values(&nodes);
+    assert_variable_bindings(&nodes);
+}
+
+fn assert_hidden_theme(nodes: &[Value]) {
+    let hidden = named(nodes, "Internal Only Canvas");
     assert_eq!((hidden["type"].as_str(), hidden["internalOnly"].as_bool(), hidden["visible"].as_bool()), (Some("CANVAS"), Some(true), Some(false)));
-    let set = named(&nodes, "Theme");
+    let set = named(nodes, "Theme");
     assert_eq!(set["type"], "VARIABLE_SET");
     assert_eq!(set["parentIndex"]["guid"], hidden["guid"]);
     let modes = set["variableSetModes"].as_array().unwrap();
     assert_eq!(modes.iter().map(|m| m["name"].as_str().unwrap()).collect::<Vec<_>>(), ["Light", "Dark"]);
-    let bg = named(&nodes, "color/bg");
+}
+
+fn assert_variable_values(nodes: &[Value]) {
+    let set = named(nodes, "Theme");
+    let modes = set["variableSetModes"].as_array().unwrap();
+    let bg = named(nodes, "color/bg");
     assert_eq!((bg["type"].as_str(), bg["variableResolvedType"].as_str()), (Some("VARIABLE"), Some("COLOR")));
     assert_eq!(bg["variableSetID"]["guid"], set["guid"]);
     assert_eq!(bg["description"], "Behind everything");
     assert_eq!(bg["variableScopes"], json!(["FRAME_FILL", "SHAPE_FILL"]));
-    assert_eq!(named(&nodes, "color/fg")["variableScopes"], json!(["TEXT_FILL", "STROKE", "EFFECT_COLOR"]));
+    assert_eq!(named(nodes, "color/fg")["variableScopes"], json!(["TEXT_FILL", "STROKE", "EFFECT_COLOR"]));
     let values = bg["variableDataValues"]["entries"].as_array().unwrap();
     assert_eq!(values.len(), 2);
     assert_eq!(values[1]["modeID"], modes[1]["id"]);
@@ -295,19 +306,25 @@ fn variables_are_written_as_nodes_on_a_hidden_page() {
         (Some("COLOR"), Some(0.25))
     );
     // An alias names the variable's node; every value says the type it resolves to.
-    let accent = &named(&nodes, "color/accent")["variableDataValues"]["entries"];
+    let accent = &named(nodes, "color/accent")["variableDataValues"]["entries"];
     assert_eq!(accent[0]["variableData"]["dataType"], "ALIAS");
     assert_eq!(accent[0]["variableData"]["resolvedDataType"], "COLOR");
-    assert_eq!(accent[0]["variableData"]["value"]["alias"]["guid"], named(&nodes, "color/fg")["guid"]);
-    assert_eq!(named(&nodes, "title")["variableDataValues"]["entries"][1]["variableData"]["value"]["textValue"], "Grüße 😀");
-    assert_eq!(named(&nodes, "shown")["variableDataValues"]["entries"][1]["variableData"]["value"]["boolValue"], false);
-    assert_eq!(named(&nodes, "space/gap")["variableDataValues"]["entries"][0]["variableData"]["value"]["floatValue"], 8.0);
+    assert_eq!(accent[0]["variableData"]["value"]["alias"]["guid"], named(nodes, "color/fg")["guid"]);
+    assert_eq!(named(nodes, "title")["variableDataValues"]["entries"][1]["variableData"]["value"]["textValue"], "Grüße 😀");
+    assert_eq!(named(nodes, "shown")["variableDataValues"]["entries"][1]["variableData"]["value"]["boolValue"], false);
+    assert_eq!(named(nodes, "space/gap")["variableDataValues"]["entries"][0]["variableData"]["value"]["floatValue"], 8.0);
+}
+
+fn assert_variable_bindings(nodes: &[Value]) {
+    let bg = named(nodes, "color/bg");
+    let set = named(nodes, "Theme");
+    let modes = set["variableSetModes"].as_array().unwrap();
     // Bindings: on the paint, the gradient stop, the effect and the grid, and in the layer's map.
-    let card = named(&nodes, "Card");
+    let card = named(nodes, "Card");
     assert_eq!(card["fillPaints"][0]["colorVar"]["value"]["alias"]["guid"], bg["guid"]);
     assert_eq!(card["variableModeBySetMap"]["entries"][0]["variableSetID"]["guid"], set["guid"]);
     assert_eq!(card["variableModeBySetMap"]["entries"][0]["variableModeID"], modes[1]["id"]);
-    assert_eq!(card["layoutGrids"][0]["gutterSizeVar"]["value"]["alias"]["guid"], named(&nodes, "space/gap")["guid"]);
+    assert_eq!(card["layoutGrids"][0]["gutterSizeVar"]["value"]["alias"]["guid"], named(nodes, "space/gap")["guid"]);
     let fields: Vec<&str> =
         card["variableConsumptionMap"]["entries"].as_array().unwrap().iter().map(|e| e["variableField"].as_str().unwrap()).collect();
     for f in
@@ -315,7 +332,7 @@ fn variables_are_written_as_nodes_on_a_hidden_page() {
     {
         assert!(fields.contains(&f), "{f} in {fields:?}");
     }
-    let swatch = named(&nodes, "Swatch");
+    let swatch = named(nodes, "Swatch");
     assert!(swatch["fillPaints"][1]["stopsVar"][0].get("colorVar").is_none());
     assert_eq!(swatch["fillPaints"][1]["stopsVar"][1]["colorVar"]["value"]["alias"]["guid"], bg["guid"]);
     assert_eq!(swatch["fillPaints"][1]["stopsVar"].as_array().unwrap().len(), 2);
@@ -324,7 +341,7 @@ fn variables_are_written_as_nodes_on_a_hidden_page() {
         assert_eq!(swatch["effects"][0][key]["dataType"], "ALIAS", "{key}");
     }
     // The page sets a mode too.
-    assert_eq!(named(&nodes, "Page 1")["variableModeBySetMap"]["entries"][0]["variableSetID"]["guid"], named(&nodes, "Spacing")["guid"]);
+    assert_eq!(named(nodes, "Page 1")["variableModeBySetMap"]["entries"][0]["variableSetID"]["guid"], named(nodes, "Spacing")["guid"]);
 }
 
 #[test]

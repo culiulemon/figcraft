@@ -10,12 +10,12 @@
 
 use std::collections::BTreeMap;
 
-use figcraft_doc::proto::*;
-use figcraft_doc::*;
+use figcraft_doc::proto::{Action, ConditionalBlock, Expr, ExprOp, MAX_ACTION_DEPTH, walk};
+use figcraft_doc::{Variable, VariableType, VariableValue, Variables};
 use serde_json::{Value, json};
 
 use super::CommandSpec;
-use crate::params::*;
+use crate::params::{bool_of, f64_of, get, id, parse, req_index, req_targets, string};
 use crate::{Result, Session, bad, spec};
 
 /// Most actions in one list (an interaction's, or a block's).

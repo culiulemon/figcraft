@@ -1,12 +1,15 @@
 use super::chrome::{BarAction, layer_at, paint_menu_chevron};
 use super::device::{device_body, device_glass};
 use super::draw::draw;
-use super::input::input;
+use super::input::{InputMode, input};
 use super::layout::{Chrome, Layout, layout};
 use super::navigate::next_delay;
 use super::scroll::page_settings;
 use super::transition::lerp;
-use super::*;
+use super::{
+    ACCENT, Align2, Arc, Color32, CornerRadius, Device, Icon, NodeKind, PresentScale, Presenter, Rect, Sense, Stroke, StrokeKind, Tip, Tokens, Ui,
+    icons, pos2, regular, semibold, tr, tr_noop, vec2,
+};
 
 /// One frame of the player in `rect`: the top bar, then the prototype (on its device) below.
 /// Returns what the bar asked for (restarting is done here).
@@ -55,7 +58,7 @@ pub(super) fn player(p: &mut Presenter, ui: &mut Ui, rect: Rect, now: f64, chrom
         // The pane only takes the keyboard while the pointer is over it. While a link notice shows
         // the prototype takes neither keys nor the pointer (Escape there cancels the notice).
         let keys = chrome.keys && p.link_notice.is_none() && (!chrome.pane || over);
-        input(p, &ctx, &l, over && p.link_notice.is_none(), keys, chrome.pane, now);
+        input(p, &ctx, &l, InputMode { over_area: over && p.link_notice.is_none(), keys_on: keys, pane: chrome.pane, now });
     } else {
         p.pads.clear();
     }

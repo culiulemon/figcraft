@@ -1,5 +1,8 @@
 use super::fields::menu_item_hover;
-use super::*;
+use super::{
+    Color32, CornerRadius, FIELD_H, FieldEdit, FigApp, Id, Lead, MIXED, NodeId, Rect, Sense, Stroke, TextStyle, Tokens, Ui, Value, commit_text, json,
+    pos2, regular, text_style_params, tr, trf, trim_num, uniform, vec2, widgets,
+};
 
 /// Type settings ▸ Variable: the font's named instances, then a slider and a field per visible
 /// axis (values the style name implies show until changed; "Mixed" when the shown styles differ).
