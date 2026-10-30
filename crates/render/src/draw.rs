@@ -568,17 +568,15 @@ pub fn effect_margin(n: &Node) -> f64 {
 /// takes in what lies that far off, as culling does.
 pub fn paint_bounds(doc: &Document, id: NodeId) -> Option<Rect> {
     let n = doc.node(id)?;
-    let m = effect_margin(n).abs();
-    Some(layer_bounds(doc, id)?.inflate(m, m))
+    let world = doc.world_transform(id);
+    let local = local_paint_bounds(doc, n, world, 0, None);
+    Some(figcraft_geom::transform_rect_bbox(world, local))
 }
 
 /// What node `id` paints, in page coordinates, without its effects' margin: the rectangle its
 /// isolated layer is drawn into, and what a shadow cast by that layer is cropped to.
 pub fn layer_bounds(doc: &Document, id: NodeId) -> Option<Rect> {
-    let n = doc.node(id)?;
-    let world = doc.world_transform(id);
-    let local = local_paint_bounds(doc, n, world, 0, None);
-    Some(figcraft_geom::transform_rect_bbox(world, local))
+    paint_bounds(doc, id)
 }
 
 /// The local → page map of a layer drawn at `xf` (local → device): the view's scale taken out.
