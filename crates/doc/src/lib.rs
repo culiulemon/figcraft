@@ -9,6 +9,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod board;
+mod board_route;
 pub mod colors;
 pub mod comments;
 pub mod facilitation;
@@ -26,6 +27,7 @@ pub mod vector_faces;
 pub mod vector_regions;
 
 pub use board::*;
+pub use board_route::{RouteEnd, route_points};
 pub use colors::*;
 pub use comments::*;
 pub use facilitation::*;
@@ -738,7 +740,8 @@ impl Document {
 
     /// Bounds of everything painted by a node, effects and strokes included (page coordinates):
     /// a clipping frame's own area, else that and what its visible children show (masked
-    /// children only within their mask). A group is what its children show, grown by its effects.
+    /// children only within their mask). A group, or an unclipped frame past its box, is what its
+    /// children show grown by its effects, which apply to all of it.
     pub fn world_render_bounds(&self, id: NodeId) -> Option<Rect> {
         self.render_bounds_at(id, 0)
     }
@@ -751,7 +754,8 @@ impl Document {
         }
         Some(match (self.children_render_bounds(n, depth + 1), &n.kind) {
             (Some(kids), NodeKind::Group) => n.grow_by_effects(kids),
-            (Some(kids), _) => own.union(kids),
+            // An unclipped frame's effects apply to its children too, past its box included.
+            (Some(kids), _) => own.union(n.grow_by_effects(kids)),
             (None, _) => own,
         })
     }

@@ -18,14 +18,14 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "variable.export",
             "Export variables",
-            "{collections? [ids or names; default every collection of this file, not library copies], format? (json (default): the local variables JSON that variable.import reads | css: custom properties, the default mode on :root and each other mode on [data-<collection>=\"<mode>\"]; numbers in px unless layers or scopes use them as opacity or font weight | tailwind: a Tailwind CSS v4 stylesheet, the default mode as an @theme block named the way inspect.code's tailwind utilities read them: --color-*, --radius-*, --text-*, --spacing-*, --font-*, unique per file) | dart: a Dart file for Flutter, a class of constants per collection and mode (Color, double, String, bool), aliases resolved), path? (write it there)}  → {text}, or {path} when written",
+            "{collections? [ids or names; default every collection of this file, not library copies], format? (json (default): the local variables JSON that variable.import reads, colour calculations as the colour they show in each mode with other collections in their default modes | css: custom properties, the default mode on :root and each other mode on [data-<collection>=\"<mode>\"], colour calculations as the colour they show in that mode with other collections in their default modes; numbers in px unless layers or scopes use them as opacity or font weight | tailwind: a Tailwind CSS v4 stylesheet, the default mode as an @theme block named the way inspect.code's tailwind utilities read them: --color-*, --radius-*, --text-*, --spacing-*, --font-*, unique per file; each other mode as in css; colour calculations as the colour they show in that mode, other collections in their default modes) | dart: a Dart file for Flutter, a class of constants per collection and mode (Color, double, String, bool), aliases and colour calculations resolved), path? (write it there)}  → {text}, or {path} when written",
             false,
             export
         ),
         spec!(
             "variable.import",
             "Import variables",
-            "{variables (the local variables JSON, as variable.export writes it: an object, JSON text or a path; `variableCollections` and `variables` under `meta` or at the top level)}  collections join this file's collection of the same name (values by mode name; new modes and variables are added, a variable of another type is skipped), others are added  → {collections (added), variables (added), updated, warnings (also when it holds no variables, or fewer than its collections list)}",
+            "{variables (the local variables JSON, as variable.export writes it: an object, JSON text or a path to a regular file of at most 256 MiB; `variableCollections` and `variables` under `meta` or at the top level)}  collections join this file's collection of the same name (values by mode name; new modes and variables are added, a variable of another type is skipped), others are added  → {collections (added), variables (added), updated, warnings (also when it holds no variables, or fewer than its collections list)}",
             true,
             import
         ),
@@ -67,9 +67,10 @@ fn css_safe(text: &str) -> String {
 
 /// Each collection's variables as custom properties (named as generated code names them): the
 /// default mode's values on `:root`, every other mode's on `[data-<collection>="<mode>"]`;
-/// aliases are `var(--name)`.
+/// aliases are `var(--name)` and colour calculations resolve to their colour in the mode.
 fn css(doc: &Document, colls: &[&Collection], tailwind: bool) -> String {
     let vars = &doc.variables;
+    let flattener = vars.flattener();
     // Tailwind theme names, unique per file and the same ones page code reads.
     let theme = crate::tailwind::Theme::new(doc);
     let name = |v: &Variable| if tailwind { theme.name(v) } else { css_var_of(v) };
@@ -89,17 +90,21 @@ fn css(doc: &Document, colls: &[&Collection], tailwind: bool) -> String {
             };
             out.push_str(&format!("/* {} · {} */\n{sel} {{\n", css_safe(&c.name), css_safe(&m.name)));
             for v in vars.variables.iter().filter(|v| v.collection == c.id) {
-                let value = match v.values.get(&m.id) {
+                // A calculation is written as the colour it resolves to in this mode (no color-mix()
+                // or relative-colour output), and so is an alias to one some mode leaves out:
+                // `var()` of a property no block defines would invalidate whatever reads it.
+                let flat = v.values.get(&m.id).and_then(|x| flattener.value(v, &m.id, x));
+                let value = match flat.as_ref() {
                     Some(VariableValue::Color(col)) => col.to_css(),
                     Some(VariableValue::Number(x)) if roles.role(v) == crate::token_roles::NumberRole::Unitless => trim_num(*x),
                     Some(VariableValue::Number(x)) => format!("{}px", trim_num(*x)),
                     Some(VariableValue::String(t)) => format!("\"{}\"", css_safe(t)),
                     Some(VariableValue::Boolean(b)) => b.to_string(),
-                    Some(VariableValue::Alias(a)) => match vars.get(a) {
+                    Some(VariableValue::Alias(a)) => match vars.get_by_id(a) {
                         Some(t) => format!("var({})", name(t)),
                         None => continue,
                     },
-                    None => continue,
+                    Some(VariableValue::ColorAlpha { .. } | VariableValue::ColorMix { .. }) | None => continue,
                 };
                 out.push_str(&format!("  {}: {value};\n", name(v)));
             }
@@ -330,7 +335,7 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
                 VariableValue::Alias(a) => {
                     let Some(var) = doc.variables.variables.iter().find(|x| x.id == *local) else { continue };
                     let target = ids.get(a).ok_or_else(|| "its alias target wasn't imported".to_string());
-                    match target.and_then(|t| super::variables::alias_target(&doc.variables, var, t)) {
+                    match target.and_then(|t| super::variables::alias_target_by_id(&doc.variables, var, t)) {
                         Ok(t) => VariableValue::Alias(t),
                         Err(e) => {
                             warnings.push(format!("`{}`: {e}", v.name));

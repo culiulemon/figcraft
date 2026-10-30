@@ -25,7 +25,9 @@ pub mod retained;
 pub mod shadow;
 
 pub use dots::Dots;
-pub use draw::{layer_bounds, node_outline, paint_bounds, stroke_area, stroke_fill, stroke_rule, subtree_outline, ts_path};
+pub use draw::{
+    at_layer_depth, layer_bounds, layer_depth, node_outline, paint_bounds, stroke_area, stroke_fill, stroke_rule, subtree_outline, ts_path,
+};
 pub use export_depth::{ExportDepthError, MAX_EXPORT_DEPTH, check_export_depth};
 pub use fx::{Accelerator, GlassPaint, set_accelerator};
 pub use retained::{Begun, Retained, Steps, Work};
@@ -135,20 +137,15 @@ pub(crate) fn render_number() -> u64 {
 pub fn render_view(doc: &Document, page: NodeId, view: &View, opts: &Options) -> Option<Pixmap> {
     start_render();
     #[cfg(not(target_arch = "wasm32"))]
-    {
-        let threads = rayon::current_num_threads().clamp(1, 16) as u32;
-        let bands = match std::env::var("FIGCRAFT_BANDS").ok().and_then(|v| v.parse::<u32>().ok()) {
-            // Benchmarks pick a band count by hand.
-            Some(n) => n.clamp(1, 16),
-            // Layers whose effects read their backdrop (glass, background blur) hand the window's
-            // GPU one submission a band and wait for it: with those, a band more costs a round-trip
-            // and buys little (the layers below the band are drawn in parallel either way).
-            None if opts.accelerate && backdrop_effects(doc, page) => threads.min(2),
-            None => threads.min(view.height / 96).max(1),
-        };
+    if let Some(pool) = band_pool() {
+        let threads = pool.current_num_threads().clamp(1, 16) as u32;
+        // Layers whose effects read their backdrop (glass, background blur) hand the window's GPU
+        // one submission a band and wait for it: with those, a band more costs a round-trip and buys
+        // little (the layers below the band are drawn in parallel either way).
+        let bands = if opts.accelerate && backdrop_effects(doc, page) { threads.min(2) } else { threads.min(view.height / 96).max(1) };
         if bands > 1
             && view.width.saturating_mul(view.height) > 300_000
-            && let Some(p) = render_bands(doc, page, view, opts, bands)
+            && let Some(p) = pool.install(|| render_bands(doc, page, view, opts, bands))
         {
             return Some(p);
         }
@@ -159,6 +156,21 @@ pub fn render_view(doc: &Document, page: NodeId, view: &View, opts: &Options) ->
 /// Whether the page has a layer whose effects read its backdrop (glass, background blur).
 fn backdrop_effects(doc: &Document, page: NodeId) -> bool {
     doc.subtree(page).iter().skip(1).any(|id| doc.node(*id).is_some_and(backdrop::has_effects))
+}
+
+/// The stack a thread that renders needs (#1082). A level of the layer tree takes about 6.5 KB of
+/// stack in a render (6.8 KB in a debug build), so the deepest render [`MAX_EXPORT_DEPTH`] allows,
+/// pattern sources included, needs about 1.7 MB: more than the 2 MiB threads get by default once
+/// the rest of the stack is counted, and over 4x margin here. The desktop app's main thread has the
+/// same 8 MiB.
+pub const RENDER_STACK: usize = 8 << 20;
+
+/// The pool bands render on, with [`RENDER_STACK`] (rayon's own threads have 2 MiB); `None` when
+/// it can't be made (bands then render on the calling thread, in one piece).
+#[cfg(not(target_arch = "wasm32"))]
+fn band_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().thread_name(|i| format!("figcraft-band-{i}")).stack_size(RENDER_STACK).build().ok()).as_ref()
 }
 
 /// Render `view` as `bands` horizontal bands in parallel. Bands overlap by what background blurs
@@ -302,8 +314,10 @@ fn nodes_into(doc: &Document, ids: &[NodeId], view: &View, pix: &mut Pixmap, tim
         images: 0,
         accelerate: false,
     };
+    // 0, but inside an exporter's [`at_layer_depth`] its depth: one cap for both (#1082).
+    let depth = draw::layer_depth();
     for id in ids {
-        draw::draw_node(&ctx, pix, *id, view.transform() * parent_transform(doc, *id), 0);
+        draw::draw_node(&ctx, pix, *id, view.transform() * parent_transform(doc, *id), depth);
     }
 }
 
@@ -565,6 +579,8 @@ mod mask_bounds_tests;
 mod paint_behaviour_tests;
 #[cfg(test)]
 mod progressive_tests;
+#[cfg(test)]
+mod render_depth_tests;
 #[cfg(test)]
 mod retained_edit_tests;
 #[cfg(test)]

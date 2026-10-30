@@ -70,7 +70,8 @@ unknown id is an error.
 request acts on that file without bringing its tab to the front; the tab in front comes back
 afterwards unless the command opened or switched to another file itself. A file that isn't open is
 an error, and so is a `document` naming a file behind the tab in front on any other method
-(`ui.screenshot`, `ui.input`, `ui.key`… act on what the window shows).
+(`ui.screenshot`, `ui.input`, `ui.key`… act on what the window shows). `doc.list` includes each file's
+`path` only when the call names no `agent`: an AI agent's calls (MCP sets `agent`) get ids and names.
 
 ## Confining file access
 
@@ -162,14 +163,15 @@ against the shared log, not by the UI thread, so it does not freeze the app, use
 need a drawn frame: it works while the window is minimised. Other requests on the same connection
 wait until the poll finishes (at most 25 s); use a separate connection to keep editing meanwhile.
 
-### `document.inspect {depth?, allPages?}`
+### `document.inspect {depth?, allPages?, fields?, outline?}`
 
 The active document as JSON: name, path, dirty, currentPage, selection, pages (the current page's
 layer tree to `depth`, default 8; others summarised unless `allPages`), styles, variable count,
 images, the colour profile (`colorProfile`: `srgb` or `displayP3`), the text being edited and the
-undo history.
+undo history. `fields` and `outline` select layer properties at every level, pages included, without
+changing document metadata (see below).
 
-### `node.get {id, depth?}`
+### `node.get {id, depth?, fields?, outline?}`
 
 One layer (children to `depth`, default 1). Fields: id, name, type, x, y, width, height, rotation,
 absoluteBounds, visible, locked, opacity, blend, fills, strokes, strokeWeight, effects, cornerRadius,
@@ -186,12 +188,32 @@ starting from the layer: `[{to} | {side}]`), `pluginData` (layer data written wi
 only when there is some). The auto layout props
 that `node.set` accepts are listed in [mcp.md](mcp.md#conventions-agents-must-know).
 
+Both inspection methods accept `fields: [string]`: exact, case-sensitive top-level node keys such
+as `name`, `type`, `x`, `fills`, `characters` or `pluginData`, applied recursively to pages too.
+`[]` keeps only ids and structure. `id`, `children` and depth-boundary `childCount` are always kept.
+An unknown key is an error that lists the valid keys; a `fields` that is not an array of strings,
+or an `outline` that is not a boolean, is an error too.
+
+`outline: true` selects `id`, `name`, `type`, `characters`, `mainComponentName` and `visible`, plus
+structure. `characters` is cut after 120 characters (Unicode scalars), with ASCII `...` appended
+only when longer. When `visible` is selected (by either option), every node has an explicit
+boolean; without options the output stays sparse. `outline: true` with `fields` is an error;
+`outline: false` with `fields` is allowed. Document metadata is unchanged. Through
+`engine.execute`, the engine command `node.get` takes the same options but no `depth`; it always
+returns one level of children.
+
+```json
+{"id":5,"method":"document.inspect","params":{"depth":6,"outline":true}}
+{"id":6,"method":"node.get","params":{"id":3,"depth":2,"fields":["name","width","height"]}}
+```
+
 ### `ui.inspect {}`
 
 UI state: panels and tabs (`panels`: the `left` and `right` panels' widths as asked for and whether the left one is closed, `leftCollapsed`), the cursor the canvas shows (`cursor`: a CSS cursor name such as `default`, `crosshair`, `ew-resize`, `grab`, `copy`, `not-allowed`, `zoom-in`, or one FigCraft draws: `rotate <degrees>`, `pen`, `pen-close`, `pen-add`, `pen-bend`, `eyedropper`, `comment`; `null` while the pointer is elsewhere or over something with a cursor of its own, a ruler guide or a gradient handle; the engine's own hint is `tool.overlay.cursor`), current tool (`tool`: its id, overlay hints and, for a selected
 ellipse, its arc handles `arcHandles`, for a selected rectangle, frame, polygon or star, its corner radius and ratio handles `shapeHandles`; see [mcp.md](mcp.md#measuring-the-scale-tool-arc-handles-and-selecting)), canvas rect, dialogs, view, timings (`frameMs`,
 `renderMs`), frames drawn since start or the last `ui.set {resetFrameStats: true}` (`framesDrawn`;
-an idle window draws none) with the most frequent repaint requests behind them (`repaintCauses`:
+an idle window draws none), how long building them took (`frameTimes`: `{frames, meanMs, maxMs}`, the
+UI pass before it is painted) and the most frequent repaint requests behind them (`repaintCauses`:
 `[{at: "file:line", count}]`, every request made in the frame before each one, delayed ones such as
 the autosave deadline included; egui's `context.rs` begin-pass line means input events) and what the last canvas render had to do (`canvas.renderWork`: `full`, `partial` with
 the `pixels` re-rendered after a pan or an edit, or `reused`), whether the canvas shows a coarse
@@ -351,8 +373,8 @@ frame or section id opens the Compare changes view, like `dev.compare {id, show:
 true}`; `null` closes it) with `devCompareVersion` (a version id to compare with; `null`: when it
 was marked ready for dev), `devCompareMode` (`sideBySide|overlay`) and `devCompareSplit` (the
 overlay slider, 0–1), `annotationFilter` (`all`, `none` for uncategorised, or a category id or name:
-the annotations the canvas shows). `resetFrameStats` (true: start `framesDrawn` and
-`repaintCauses` over). Returns `ui.inspect` (which reports `stylePicker`,
+the annotations the canvas shows). `resetFrameStats` (true: start `framesDrawn`,
+`frameTimes` and `repaintCauses` over). Returns `ui.inspect` (which reports `stylePicker`,
 `stylePickerView`, `comments`: `open`, `draft`, `filter`, `sort`, `search`, `editing` and the
 `mentions` the picker offers, `devCompare` (`{id, mode, split, version}` or `null`), `devFocus` (the frame the
 focus view shows, or `null`) and `annotationFilter`).

@@ -209,6 +209,12 @@ which other files use without anyone copying the library file around.
   **Library updates available**; accepting keeps instance overrides. While the server can't be
   reached, the last version fetched stays in use. The file keeps the link, token included:
   sharing that file shares read access to the library.
+- **Only libraries you chose are checked by themselves.** The app asks only about team libraries
+  you added or checked on this computer (kept as hashes of their links in the preferences). A file
+  someone sent you that names another one contacts nothing when you open it: **Assets ▸ Libraries**
+  says it isn't checked yet, and **Check for updates** (`library.check`) asks its server and
+  checks it by itself from then on (#1097). Placing one of its components or applying one of its
+  styles asks the server too, since you did that yourself.
 - **Usage.** Each time a file's app asks for the library it reports which of its components the
   file uses and how often. **Show usage** in the library file (`library.usage`) lists the files and
   the instances of each component. Files are told apart by their names; a file's report changes
@@ -291,7 +297,7 @@ are errors):
 | `max_file_mb` | 64 (16 when open) | Largest file (its snapshot), in MiB; a welcome carries the whole file, so messages may be as large as a file and 1 MiB (at least 64 MiB on a private server). The app opens files of up to 1023 MiB; above 64 with `open_publish` the server warns |
 | `max_links` | 100 | Most share links per file |
 | `max_connections` | 512 | Most open connections |
-| `max_people` | 256 | Most people in one file at once |
+| `max_people` | 256 | Most people in one file at once (a value above 4096 is lowered to it, with a warning at startup: clients keep track of no more) |
 | `compact_after` | 1000 | Compact a file's log into a new snapshot after this many entries… |
 | `compact_mb` | 16 | …or once its log is this large (MiB) |
 | `max_log_mb` | 64 | Most MiB of recent batches a file in use keeps in memory (and in its snapshot) for apps that reconnect; an app further behind catches up with the whole file. Open to the public, at most a quarter of `max_file_mb` too |
@@ -337,7 +343,8 @@ behaves as before (blocked addresses, report rates and the limits on
 ```
 
 A file published without the key also has, in its `meta.json`, the SHA-256 of its owner token,
-the address it came from and when it was last opened (for expiry).
+the address it came from and when it was last opened (for expiry; written at most hourly while the
+file is used, and when the server stops).
 
 - **Writes are atomic**: a snapshot, a description or a link list is written to a temporary file
   beside it, flushed, then renamed over the old one. The log is only ever appended to, and synced
@@ -347,6 +354,8 @@ the address it came from and when it was last opened (for expiry).
   edited (the ids of people who only joined stay in the log), and when the server stops. A log left over from a compaction cut short is replayed over the snapshot, which already
   holds it all, so nothing changes. If a damaged generation field made a current log look like such
   a leftover, its edits the snapshot lacks are recovered the same way and the damage is reported.
+- **A file everyone left stays loaded for a minute** (at most 16 such files, 256 MiB together),
+  its log already synced: someone joining in that time gets it without anything being read again.
 - **Damage is skipped and reported, never deleted.** At startup a folder whose description, links
   or snapshot can't be read is left out and logged; a log that ends in a cut-short or damaged
   record loses only that end (logged when the file opens). Leftover temporary files are removed.
@@ -464,7 +473,7 @@ What someone can do, by what they hold (the server is reached through TLS at the
 
 | Who | Can | Cannot |
 |---|---|---|
-| Anyone who reaches the server, with nothing | Ask about its hosting (open, operator, terms, limits); on an open server publish files within the limits per address and for everyone; list and download the plugin directory; ask `/healthz`; try join codes, within the limits on wrong ones | Join, read or list any file; see links, reports or blocked addresses; use or learn the server key or anyone's token (none are ever sent back, and all are compared in constant time against hashes); publish plugins; spoof their address through `X-Forwarded-For` (believed only from `trusted_proxy`); get past a block |
+| Anyone who reaches the server, with nothing | Ask about its hosting (open, operator, terms, limits); on an open server publish files within the limits per address and for everyone; list and download the plugin directory; ask `/healthz`; try join codes, within the limits on wrong ones | Join, read or list any file; see links, reports or blocked addresses; use or learn the server key or anyone's token (none are ever sent back; a presented secret is hashed with SHA-256 and the two digests, always the same length, are compared without stopping at the first difference; hashing and the rest of the request still take time that depends on what was sent); publish plugins; spoof their address through `X-Forwarded-For` (believed only from `trusted_proxy`); get past a block |
 | Someone with a **join code** | Exactly what its link gives (a view code: the view link's row; a comment code: the comment link's; an edit code: the edit link's), until the code or its link is gone | Get a code for any other link; learn anything from a wrong code but that it is wrong |
 | Someone with a file's **view link** | See that file and everyone's changes and presence in it; read its team library and usage; report it | Change it (the server refuses a viewer's edits); reach any other file; manage links |
 | Someone with a file's **comment link** | What a view link gives, and add, reply to, react to, resolve, move and remove that file's comment threads (anyone's: comments are signed with the name in Preferences, there are no accounts) | Change anything else in it (the server refuses a batch that touches more than comment threads); reach any other file; manage links |
@@ -475,7 +484,10 @@ What someone can do, by what they hold (the server is reached through TLS at the
 Limits that hold against everyone: message sizes by what a connection is for, file sizes as they
 grow, connections in all and per address and block, connection, message, publish and download rates
 per address and block, files and MiB per address and for everyone, the bytes queued for slow
-clients and waiting for the server, and idle expiry ([Resource limits](#resource-limits)). Revoking
+clients and waiting for the server, and idle expiry ([Resource limits](#resource-limits)). A
+library or plugin larger than an address's download burst is still served, only from a full
+budget that it then owes, so a large object comes more slowly but never lets an address past its
+rate: over any stretch of time it gets at most the largest object plus the rate times that time. Revoking
 a link or removing a file cuts every connection that used it, library connections included. Not
 defended against: someone with many unrelated addresses (each gets its own limits; the global caps
 still hold, so they can fill the server up to them until you block them or the files expire), a
@@ -505,7 +517,7 @@ are larger.
 | Bytes being read | Messages not yet whole: the largest message and 1 MiB per block, 192 MiB for everyone; past everyone's budget the readers holding the most are cut off until it fits (their bytes count as free at once), and a reader is refused only when it is the biggest |
 | Bytes waiting for the server | 128 MiB of read messages not handled yet: past it a connection is dropped as busy |
 | Connections | `max_connections` (512) in all (*always*); `max_connections_per_ip` (32) per address, ×2 per IPv6 /56 (at most a sixteenth of all), ×4 per /48 (at most an eighth of all), joins included, so no block can take every connection; one-shot requests (asking about hosting, libraries, browsing plugins) can't take the last eighth, which stays for people joining files, and are dropped after 20 idle seconds |
-| Rates | Per address and block: `connects_per_minute`, `publishes_per_hour` (and 32 addresses' worth for everyone), `messages_per_second` (cursors, selections, cursor chat and pings have their own budget beside it, twice that, so an office moving its cursors together doesn't trip it); reports, ten an hour (*always*); requests that change files (join codes, links, renames, removals, blocks, publishing with the key), sixty a minute, with the server key or an owner token too ("too many changes to this server's files from your address…"; listing and looking aren't counted) (*always*); downloads of libraries and plugins, 1 MiB a second with bursts of 16 MiB per address (*always*), checked before anything is read, within 32 MiB a second (512 MiB at once) for libraries and for plugins, everyone together |
+| Rates | Per address and block: `connects_per_minute`, `publishes_per_hour` (and 32 addresses' worth for everyone), `messages_per_second` (cursors, selections, cursor chat and pings have their own budget beside it, twice that, so an office moving its cursors together doesn't trip it); reports, ten an hour (*always*); requests that change files (join codes, links, renames, removals, blocks, publishing with the key), sixty a minute, with the server key or an owner token too ("too many changes to this server's files from your address…"; listing and looking aren't counted) (*always*); downloads of libraries and plugins, 1 MiB a second with bursts of 16 MiB per address (*always*; a larger one is served once the address's budget is full, which it then pays back at that rate before its next download), checked before anything is read, within 32 MiB a second (512 MiB at once) for libraries and for plugins, everyone together |
 | Team libraries | Only files published with the key hold one on a public server; an archive is at most `max_file_mb` and everything it unpacks to counts against the same cap (*always*), so a zip bomb is refused before it expands |
 | Usage reports | Kept in memory, written at most once a minute per library and when the server stops; at most 1,000 components per file and 200 files per library (*always*) |
 | Disk writes | A batch is confirmed only once it is on disk; when its log can't be written, nobody hears it was accepted: the file closes, everyone in it reconnects and their apps send again what wasn't confirmed. Below 1 GiB (or two of the largest files) free, changes and new files are refused with "the server's disk is nearly full" instead (*always*, where the free space can be told: Unix). The server keeps the last 200 problems for the operator |

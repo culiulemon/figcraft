@@ -97,7 +97,7 @@ fn current_paint(app: &FigApp, target: &PickerTarget) -> Option<Paint> {
         }
         PickerTarget::Effect { ids, index, secondary } => doc.node(*ids.first()?)?.effects.get(*index)?.color(*secondary).map(Paint::solid),
         PickerTarget::TextRange { id, start, .. } => range_fills(doc, *id, *start)?.into_iter().next(),
-        PickerTarget::Variable { id, mode } => match doc.variables.get(id)?.values.get(mode)? {
+        PickerTarget::Variable { id, mode } => match doc.variables.get_by_id(id)?.values.get(mode)? {
             figcraft_doc::VariableValue::Color(c) => {
                 let mut p = Paint::solid(c.with_alpha(1.0));
                 p.opacity = c.a;
@@ -584,7 +584,7 @@ fn paint_type_row(ui: &mut Ui, app: &mut FigApp, target: &PickerTarget, paint: &
                     image_pending = true;
                     let target = target.clone();
                     app.pick_open(tr("Choose image"), &["png", "jpg", "jpeg", "webp", "gif", "tif", "tiff"], move |app, p| {
-                        let Ok(bytes) = figcraft_engine::file_access::read(&p) else { return };
+                        let Ok(bytes) = figcraft_engine::file_access::read_capped(&p, figcraft_doc::ImageData::MAX_BYTES) else { return };
                         let Some(hash) = app.session.doc_mut().ok().and_then(|d| figcraft_format_add(d, bytes)) else { return };
                         if let Some(mut paint) = current_paint(app, &target) {
                             paint.kind = Paint::image(hash, ImageScaleMode::Fill).kind;

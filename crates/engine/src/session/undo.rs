@@ -13,6 +13,7 @@ struct GroupDocCheckpoint {
     undo: Vec<HistoryEntry>,
     redo: Vec<HistoryEntry>,
     limit: usize,
+    group_step: Option<usize>,
 }
 
 struct GroupCheckpoint {
@@ -56,7 +57,7 @@ impl Session {
             return Err(EngineError::Disabled(label.to_string(), PREVIEW_READ_ONLY.into()));
         }
         if ds.interaction.is_none() {
-            ds.interaction = Some(Interaction { label: label.to_string(), doc: ds.doc.clone(), selection: ds.selection.clone() });
+            ds.interaction = Some(Interaction { label: label.to_string(), doc: ds.doc.clone(), selection: ds.selection.clone(), moved_by: None });
         }
         Ok(())
     }
@@ -250,7 +251,8 @@ impl Session {
     }
 
     /// Run `f` as one undo step called `label`: the commands it executes push no steps of their
-    /// own, and when it fails the documents stay at their group-start state.
+    /// own, and when it fails or panics the documents stay at their group-start state (a panic
+    /// then carries on unwinding).
     pub fn grouped<T>(&mut self, label: &str, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         self.ds()?;
         self.checkpointed(Some(label), f)
@@ -259,8 +261,13 @@ impl Session {
     /// Without a label, only roll back failures: leave successful steps' history to the outer group.
     /// A checkpoint also works between closing the last tab and opening another one.
     fn checkpointed<T>(&mut self, label: Option<&str>, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        let before = self.group_checkpoint();
-        let result = f(self);
+        let before = self.group_checkpoint(label.is_some());
+        // A panic in `f` ends the group like a failure, then goes on to the caller's guard (#1085);
+        // the stand-in error only drives the rollback and is never returned.
+        let (result, panic) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
+            Ok(result) => (result, None),
+            Err(payload) => (Err(EngineError::Other("the group panicked".into())), Some(payload)),
+        };
         self.group_depth -= 1;
         let at_root = self.group_depth == 0;
         for ds in &before.docs {
@@ -275,6 +282,7 @@ impl Session {
                 let Some(ds) = self.docs.iter_mut().find(|ds| ds.uid == saved.uid) else { continue };
                 ds.history.limit = saved.limit;
                 if label.is_some() {
+                    ds.history.group_step = saved.group_step;
                     if !Arc::ptr_eq(&saved.doc, &ds.doc) && ds.interaction.is_none() {
                         changed.push((saved.uid, saved.doc.clone(), saved.selection.clone(), saved.page));
                     }
@@ -288,13 +296,22 @@ impl Session {
             }
         }
         if at_root {
+            // Tabs opened inside the group have no checkpoint to restore theirs from.
+            for ds in &mut self.docs {
+                ds.history.group_step = None;
+            }
             self.closed_in_group.clear();
             self.flush_pending_events();
+        }
+        if let Some(payload) = panic {
+            std::panic::resume_unwind(payload);
         }
         result
     }
 
-    fn group_checkpoint(&mut self) -> GroupCheckpoint {
+    /// `own_step`: the group becomes an undo step of its own (it has a label), so its edits don't
+    /// add to the step of a group around it.
+    fn group_checkpoint(&mut self, own_step: bool) -> GroupCheckpoint {
         let docs = self
             .docs
             .iter()
@@ -308,6 +325,7 @@ impl Session {
                 // An edit inside clears redo; a failed group has to bring it back.
                 redo: ds.history.redo.clone(),
                 limit: ds.history.limit,
+                group_step: ds.history.group_step,
             })
             .collect();
         let before = GroupCheckpoint {
@@ -320,6 +338,9 @@ impl Session {
         // The steps inside are dropped again below, so they mustn't push the oldest ones out.
         for ds in &mut self.docs {
             ds.history.limit = usize::MAX;
+            if own_step {
+                ds.history.group_step = None;
+            }
         }
         for ds in &before.docs {
             self.live_hold(ds.uid, true);
@@ -346,6 +367,7 @@ impl Session {
                 ds.page = saved.page;
                 ds.history.undo = saved.undo;
                 ds.history.limit = saved.limit;
+                ds.history.group_step = saved.group_step;
             }
         }
         self.active = before.active;

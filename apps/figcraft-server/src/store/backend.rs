@@ -1,7 +1,7 @@
 use super::journal::flush_log;
 use super::{
     Access, Action, Admin, AdminReply, Admission, BUSY_ADMIN, BUSY_DOWNLOADS, Backend, ClientMsg, Closing, Handled, HostInfo, Instant, IpAddr,
-    LibraryReply, LibraryReq, OpenFile, PluginReply, PluginReq, Server, Store, disk, now, same_secret,
+    LibraryReply, LibraryReq, OpenFile, PluginReply, PluginReq, Server, Store, disk, hash, now, same_secret,
 };
 
 /// Whether `req` changes the server's files (a write, a removal or a join code's stretching):
@@ -62,12 +62,14 @@ impl Backend for Store {
     }
 
     fn idle(&mut self, file: &str, server: &mut Server) -> bool {
+        let mut synced = false;
         let compact = self.files.get_mut(file).is_some_and(|entry| {
             let snapshot_seq = entry.meta.seq;
             entry.log.as_mut().is_some_and(|log| {
                 // Issued client ids and refusals are durable in the log; only edits need a
                 // new image-bearing snapshot. Still try a snapshot if syncing the log failed.
-                flush_log(file, log).is_err() || (log.dirty && server.seq() > snapshot_seq)
+                synced = flush_log(file, log).is_ok();
+                !synced || (log.dirty && server.seq() > snapshot_seq)
             })
         });
         if compact {
@@ -75,8 +77,12 @@ impl Backend for Store {
         }
         // It closes anyway, with its state in the snapshot and durable log.
         self.cut_short.retain(|f| f != file);
-        if let Some(e) = self.files.get_mut(file) {
-            e.log = None;
+        let log = self.files.get_mut(file).and_then(|e| e.log.take());
+        // Kept loaded a while, when its log was sound: a join soon after reads and rewrites
+        // nothing (#1074). The hub drops its room as this returns: the session moves here.
+        if let Some(log) = log.filter(|l| synced && l.pending.is_empty()) {
+            let left = std::mem::replace(server, Server::new(figcraft_collab::Document::new(""), "", self.cfg.core));
+            self.park(file, left, log);
         }
         // Everyone just left: idle time counts from now.
         self.touch(file);
@@ -86,6 +92,11 @@ impl Backend for Store {
     fn stop(&mut self, open: Vec<(&str, &mut Server)>) {
         self.write_usage(true);
         self.flush_all();
+        // The open times not written yet (they are written at most hourly while files are used).
+        let unwritten: Vec<String> = self.files.iter().filter(|(_, e)| e.meta.opened > e.opened_written).map(|(id, _)| id.clone()).collect();
+        for file in unwritten {
+            self.write_opened(&file);
+        }
         for (file, server) in open {
             if self.files.get(file).and_then(|e| e.log.as_ref()).is_some_and(|l| l.dirty) {
                 self.compact(file, server);
@@ -94,7 +105,8 @@ impl Backend for Store {
     }
 
     fn manage(&mut self, key: &str) -> Result<(), String> {
-        match same_secret(key, &self.key) {
+        // Both sides are SHA-256 digests, so the comparison sees equal lengths whatever was sent.
+        match same_secret(&hash(key), &hash(&self.key)) {
             true => Ok(()),
             false if self.cfg.hosting.open => {
                 Err("wrong server key (this server is open to the public: publish without a key, with an up-to-date FigCraft)".into())

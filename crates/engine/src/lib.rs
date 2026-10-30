@@ -187,6 +187,8 @@ mod arc_fields_tests;
 #[cfg(test)]
 mod arc_handles_tests;
 #[cfg(test)]
+mod auto_layout_move_tests;
+#[cfg(test)]
 mod autosave_tests;
 #[cfg(test)]
 mod batch_continue_events_tests;
@@ -195,7 +197,11 @@ mod batch_rollback_tests;
 #[cfg(test)]
 mod batch_step_ref_tests;
 #[cfg(test)]
+mod batch_undo_snapshot_tests;
+#[cfg(test)]
 mod binding_lists_tests;
+#[cfg(test)]
+mod board_connected_tests;
 #[cfg(test)]
 mod board_connector_tests;
 #[cfg(test)]
@@ -273,6 +279,8 @@ mod devmode_behaviour_tests;
 #[cfg(test)]
 mod devmode_tail_tests;
 #[cfg(test)]
+mod doc_list_paths_tests;
+#[cfg(test)]
 mod doc_urls_tests;
 #[cfg(test)]
 mod double_click_tests;
@@ -301,6 +309,8 @@ mod fig_export_assets_tests;
 #[cfg(test)]
 mod fig_export_tests;
 #[cfg(test)]
+mod fig_font_names_tests;
+#[cfg(test)]
 mod fig_import_tests;
 #[cfg(test)]
 mod fill_none_tests;
@@ -320,6 +330,8 @@ mod fx_behaviour_tests;
 mod gesture_preview_tests;
 #[cfg(test)]
 mod gradient_shorthand_tests;
+#[cfg(test)]
+mod group_panic_tests;
 #[cfg(test)]
 mod guide_snap_tests;
 #[cfg(test)]
@@ -343,6 +355,8 @@ mod import_journal_tests;
 #[cfg(test)]
 mod inspect_behaviour_tests;
 #[cfg(test)]
+mod inspect_fields_tests;
+#[cfg(test)]
 mod instance_modes_tests;
 #[cfg(test)]
 mod instance_resizing_tests;
@@ -355,6 +369,8 @@ mod jam_open_tests;
 #[cfg(test)]
 mod keymap_tests;
 #[cfg(test)]
+mod library_beacon_tests;
+#[cfg(test)]
 mod library_path_tests;
 #[cfg(test)]
 mod library_range_styles_tests;
@@ -366,6 +382,8 @@ mod line_endings_tests;
 mod live_access_tests;
 #[cfg(test)]
 mod live_docs_tests;
+#[cfg(test)]
+mod live_peer_cap_tests;
 #[cfg(test)]
 mod live_share_tests;
 #[cfg(test)]
@@ -380,6 +398,8 @@ mod masks_behaviour_tests;
 mod measure_tests;
 #[cfg(test)]
 mod menu_gaps_tests;
+#[cfg(test)]
+mod moved_by_tests;
 #[cfg(test)]
 mod nested_override_tests;
 #[cfg(test)]
@@ -408,6 +428,8 @@ mod paint_reorder_tests;
 mod paint_tests;
 #[cfg(test)]
 mod panels_behaviour_tests;
+#[cfg(test)]
+mod path_read_caps_tests;
 #[cfg(test)]
 mod pdf_print_tests;
 #[cfg(test)]
@@ -501,6 +523,8 @@ mod sketch_import_tests;
 #[cfg(test)]
 mod slot_tests;
 #[cfg(test)]
+mod stored_ids_tests;
+#[cfg(test)]
 mod stroke_style_tests;
 #[cfg(test)]
 mod style_tests;
@@ -545,6 +569,8 @@ mod variable_tests;
 #[cfg(test)]
 mod variables_behaviour_tests;
 #[cfg(test)]
+mod variables_colour_tests;
+#[cfg(test)]
 mod variables_editor_tests;
 #[cfg(test)]
 mod variables_import_shapes_tests;
@@ -572,6 +598,8 @@ mod version_tests;
 mod view_behaviour_tests;
 #[cfg(test)]
 mod vue_codegen_tests;
+#[cfg(test)]
+mod widget_hover_tests;
 #[cfg(test)]
 mod widget_input_tests;
 #[cfg(test)]

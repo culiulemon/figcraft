@@ -52,7 +52,7 @@ pub fn bound_name(doc: &Document, ids: &[NodeId], field: &str) -> Option<String>
     if !it.all(|v| v.as_ref() == Some(&first)) {
         return None;
     }
-    doc.variables.get(&first).map(|v| v.name.clone())
+    doc.variables.get_by_id(&first).map(|v| v.name.clone())
 }
 
 /// A variable a picker offers: one of this file's, or a published one of an enabled library.
@@ -131,7 +131,7 @@ pub fn mode_rows<'a>(doc: &'a Document, libs: &'a [Arc<PublishedLibrary>]) -> Ve
         let (id, name) = (lib.manifest.id.as_str(), library::library_name(doc, &lib.manifest.id));
         for c in library::published_collections(lib) {
             let local = copy(id, &c.id).map(|r| r.local.as_str());
-            let coll = local.and_then(|l| doc.variables.collection(l)).unwrap_or(c);
+            let coll = local.and_then(|l| doc.variables.collection_by_id(l)).unwrap_or(c);
             if several(coll) {
                 out.push(ModeRow { coll, library: Some((id, name)), key: Some(&c.id), local });
             }
@@ -141,7 +141,7 @@ pub fn mode_rows<'a>(doc: &'a Document, libs: &'a [Arc<PublishedLibrary>]) -> Ve
         if out.iter().any(|x| x.local == Some(r.local.as_str())) {
             continue;
         }
-        if let Some(c) = doc.variables.collection(&r.local).filter(|c| several(c)) {
+        if let Some(c) = doc.variables.collection_by_id(&r.local).filter(|c| several(c)) {
             out.push(ModeRow { coll: c, library: Some((&r.library, library::library_name(doc, &r.library))), key: None, local: Some(&r.local) });
         }
     }
@@ -397,7 +397,7 @@ pub fn picker(app: &mut FigApp, ctx: &egui::Context) {
     // variables never lead back to this file's).
     let (scope, own) = match &p.target {
         Target::Bind { ids, field } => (ids.first().and_then(|id| figcraft_engine::cmd::variables::field_scope(&doc, *id, field)), None),
-        Target::Alias { variable, .. } => (None, doc.variables.get(variable)),
+        Target::Alias { variable, .. } => (None, doc.variables.get_by_id(variable)),
         Target::Proto(_) | Target::Style { .. } => (None, None),
     };
     // A style's fields offer variables scoped to one of the properties the field sets.

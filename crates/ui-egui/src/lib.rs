@@ -5,6 +5,15 @@
 //! below this crate knows about egui, so the frontend can be replaced.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+/// FigCraft as craft-update knows it, with its 128 px icon and accent colour: the update
+/// prompt shows both, and an AppImage's menu entry gets the icon.
+#[cfg(not(target_arch = "wasm32"))]
+pub const UPDATE_APP: craft_update::app::App = craft_update::app::App {
+    icon_png: Some(include_bytes!("../../../assets/app-icon/hicolor/128x128/apps/ai.storyteller.figcraft.png")),
+    accent: Some([0x02, 0xda, 0x96]),
+    ..craft_update::suite::FIGCRAFT
+};
+
 pub mod a11y;
 pub mod bidi;
 pub mod canvas;
@@ -28,6 +37,8 @@ pub mod widgets;
 pub mod windows;
 
 #[cfg(test)]
+mod board_connect_tests;
+#[cfg(test)]
 mod board_picker_tests;
 #[cfg(test)]
 mod board_ui_tests;
@@ -49,6 +60,8 @@ mod canvas_drag_tests;
 #[cfg(test)]
 mod canvas_fixes_tests;
 #[cfg(test)]
+mod canvas_hover_tests;
+#[cfg(test)]
 mod canvas_image_rect_tests;
 #[cfg(test)]
 mod clipboard_fence_tests;
@@ -60,6 +73,8 @@ mod colorpicker_selection_tests;
 mod comments_tests;
 #[cfg(test)]
 mod component_props_reorder_tests;
+#[cfg(test)]
+mod component_set_narrow_tests;
 #[cfg(test)]
 mod component_swap_default_tests;
 #[cfg(test)]
@@ -109,6 +124,8 @@ mod ime_tests;
 #[cfg(test)]
 mod import_report_tests;
 #[cfg(test)]
+mod inspect_fields_tests;
+#[cfg(test)]
 mod layers_behaviour_tests;
 #[cfg(test)]
 mod layers_drag_tests;
@@ -118,6 +135,8 @@ mod layers_keyboard_tests;
 mod layers_keys_tests;
 #[cfg(test)]
 mod layers_rename_tests;
+#[cfg(test)]
+mod library_beacon_tests;
 #[cfg(test)]
 mod live_chat_tests;
 #[cfg(test)]
@@ -240,6 +259,7 @@ mod windows_qa_tests;
 #[cfg(test)]
 mod windows_tests;
 pub use canvas::board_bar;
+pub use canvas::board_connect;
 pub use canvas::board_facilitate;
 pub use canvas::comments;
 pub use canvas::cursors;
@@ -305,6 +325,7 @@ pub use control::{ControlReply, ControlRequest, RequestGate, RequestState};
 mod app;
 mod clock;
 mod open;
+mod selection_cache;
 mod services;
 mod state;
 
