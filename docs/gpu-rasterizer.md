@@ -984,5 +984,15 @@ stays on the fallback list.
   image store (`layers::images_id`), so an image that arrives after a frame was drawn redraws it;
   the web build renders with `doc_id = 0`, so the CPU renderer stays stateless there. Tests:
   `an_image_that_arrives_draws_the_layer_again`, `the_gpu_canvas_runs_only_when_the_preference_is_on`.
+- 2026-10-30: **the effects are the canvas's, and the CPU canvas goes back to stateless.** The
+  window's GPU could draw the renderer's raster effects (blur, glass, shadows) for every render,
+  exports included, because `figcraft_gpu::install` gave the renderer an accelerator at launch.
+  `Options::accelerate` now follows each render down to every effect call (`fx::blur`, `blur::apply`,
+  `shadow::drop_shadow`/`inner_shadow`/`inner_shadow_of`, `EffectFrame`) and only a canvas render with
+  the preference on sets it, so an export, a thumbnail or the CLI draws them on the CPU. With the
+  preference off the CPU canvas keeps no layers between frames either (`doc_id` 0): the layers a
+  frame keeps are the GPU canvas's fallback's, and everything else is the stateless renderer it was.
+  Tests: `an_export_never_uses_the_canvas_accelerator`,
+  `the_cpu_canvas_keeps_layers_and_accelerates_only_for_the_gpu_preference`.
 
 

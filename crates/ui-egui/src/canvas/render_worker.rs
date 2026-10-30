@@ -15,13 +15,16 @@
 //! The browser renders on the UI thread, so a zoom's full render blocks the page: there a preview
 //! is refined only once no newer request has come for [`SETTLE_MS`] (the zoom has paused), or for
 //! as long as the last full render took when that is shorter (a wait never costs more than the
-//! render it may save).
+//! render it may save), and the full render is then drawn a band at a time
+//! ([`figcraft_render::Steps`]), at least a band a frame and more while they fit in [`STEP_MS`],
+//! so input is handled while it draws (on a page whose render takes seconds, a band is a
+//! fraction of that: eight at most).
 
 use std::sync::Arc;
 
 use figcraft_color::ColorProfile;
 use figcraft_doc::{Document, NodeId};
-use figcraft_render::{Pixmap, Retained, View, Work};
+use figcraft_render::{Begun, Pixmap, Retained, Steps, View, Work};
 // A monotonic clock in the browser too: preview decisions rest on how long renders take there.
 use web_time::Instant;
 
@@ -43,6 +46,17 @@ pub const GPU_REFINE_AFTER_MS: f64 = 60.0;
 /// long as the last full render took, when shorter): a full render there blocks the page, and one
 /// between every two wheel steps of a zoom held it up for seconds.
 pub const SETTLE_MS: u64 = 120;
+/// The browser draws a full render a band at a time ([`figcraft_render::Steps`]): at least one
+/// band a frame, and more while they fit in this long, so input is handled while it draws. A
+/// band of a render that takes seconds takes a fraction of that (see [`MAX_BANDS`]).
+pub const STEP_MS: f64 = 24.0;
+/// Bands are at least this many rows ...
+const MIN_BAND_ROWS: u32 = 64;
+/// ... and a view has at most this many: a frame draws at least one band, so the longest frame of
+/// a render drawn in steps is about a band's time, a part of the render rather than the whole of it
+/// (0.7–1.4 s where the render took 3.7–4.0 s, measured for #1496; more bands would repeat more of
+/// the overlap and of the per-band work).
+const MAX_BANDS: u32 = 8;
 
 #[derive(Clone)]
 pub struct Job {
@@ -125,32 +139,42 @@ fn mark_outside_srgb(image: &mut egui::ColorImage, pix: &Pixmap, profile: ColorP
     }
 }
 
-/// Render `view` of the job (its own view, or the coarse one standing in for it).
-fn run(job: &Job, view: &View, retained: &mut Retained, coarse: bool) -> Option<Done> {
-    let t0 = Instant::now();
-    // The canvas is a preview: what's too small to see in detail at this zoom is approximated.
-    let opts = figcraft_render::Options {
+/// The canvas is a preview: what's too small to see in detail at this zoom is approximated.
+fn options(job: &Job) -> figcraft_render::Options {
+    figcraft_render::Options {
         outline_mode: job.outline,
         outline: job.outline_extras,
         outlined: job.outlined.clone(),
         skip: job.skip.clone(),
         solo: job.solo,
         lod: true,
-        // The canvas keeps unchanged layers between frames (see `figcraft_render::layers`). A
-        // browser tab renders without them: the CPU renderer stays stateless there (0 keeps
-        // nothing), as it does for exports and thumbnails.
-        doc_id: if cfg!(target_arch = "wasm32") { 0 } else { job.uid },
+        // Layers are kept between frames only as part of the GPU canvas's fallback: with the
+        // preference off — and in a browser tab, which has no GPU canvas — the CPU renderer stays
+        // stateless (0 keeps nothing), as it does for exports and thumbnails.
+        doc_id: if job.gpu { job.uid } else { 0 },
         magnified_image_pixels: true,
         dots: job.dots,
+        // The GPU preference on: this frame may be a canvas one, so its effects may use the
+        // window's GPU. Exports never ask, whatever the preference says.
+        accelerate: job.gpu,
         ..Default::default()
-    };
-    let (view, pix, work) = retained.render(&job.doc, job.page, view, &opts)?;
+    }
+}
+
+/// Render `view` of the job (its own view, or the coarse one standing in for it).
+fn run(job: &Job, view: &View, retained: &mut Retained, coarse: bool) -> Option<Done> {
+    let t0 = Instant::now();
+    let (view, pix, work) = retained.render(&job.doc, job.page, view, &options(job))?;
+    Some(done(job, view, pix, work, t0.elapsed().as_secs_f64() * 1000.0, coarse))
+}
+
+/// The image `pix` of `view`, rendered for `job` in `ms`.
+fn done(job: &Job, view: View, pix: &Pixmap, work: Work, ms: f64, coarse: bool) -> Done {
     let mut image = screen_image(pix, job.doc.color_profile);
     if job.proof {
         mark_outside_srgb(&mut image, pix, job.doc.color_profile);
     }
-    let ms = t0.elapsed().as_secs_f64() * 1000.0;
-    Some(Done {
+    Done {
         image,
         #[cfg(not(target_arch = "wasm32"))]
         gpu: None,
@@ -163,7 +187,7 @@ fn run(job: &Job, view: &View, retained: &mut Retained, coarse: bool) -> Option<
         coarse,
         at: job.at,
         seq: 0,
-    })
+    }
 }
 
 /// `view` with [`PREVIEW_FACTOR`] times fewer pixels each way, showing at least the same area.
@@ -190,6 +214,56 @@ pub struct Renders {
     full_ms: f64,
     /// Previews come first only when renders from scratch take at least this long.
     preview_after_ms: f64,
+    /// A full render being drawn band by band (the browser): the job it was started for, the
+    /// font generation then, the bands and the time they took so far.
+    steps: Option<Stepping>,
+}
+
+/// A full render drawn in steps and what it is of: a newer job of the same file, page, zoom, size
+/// and render options keeps it going (its image is then patched to the job, as a pan or an edit
+/// is), any other drops it.
+struct Stepping {
+    job: Job,
+    fonts: u64,
+    steps: Box<Steps>,
+    spent: f64,
+}
+
+/// Whether `a` and `b` are drawn the same way: the same file, page, zoom, size and options (the
+/// view may be elsewhere and the document edited: a render of one is patched to the other).
+fn same_settings(a: &Job, b: &Job) -> bool {
+    a.uid == b.uid
+        && a.page == b.page
+        && a.view.scale.to_bits() == b.view.scale.to_bits()
+        && (a.view.width, a.view.height) == (b.view.width, b.view.height)
+        && a.outline == b.outline
+        && a.outline_extras == b.outline_extras
+        && a.outlined == b.outlined
+        && a.skip == b.skip
+        && a.solo == b.solo
+        && a.proof == b.proof
+        && a.dots == b.dots
+}
+
+/// Whether a render drawn for `a` (with fonts of generation `fonts`) is `b`'s image as it is:
+/// the same settings, document and view, and no fonts arrived meanwhile.
+fn same_request(a: &Job, fonts: u64, b: &Job) -> bool {
+    same_settings(a, b)
+        && Arc::ptr_eq(&a.doc, &b.doc)
+        && a.view.origin.0.to_bits() == b.view.origin.0.to_bits()
+        && a.view.origin.1.to_bits() == b.view.origin.1.to_bits()
+        && figcraft_text::layout_generation() == fonts
+}
+
+/// What [`Renders::refine_for`] got to.
+pub enum Refined {
+    /// The image (`None`: nothing could be drawn).
+    Done(Option<Done>),
+    /// Bands remain: call again (next frame).
+    More,
+    /// A full render drawn for what has changed since (an edit, a pan or images that came while
+    /// it was drawn), shown meanwhile; it is drawn again: call again.
+    Shown(Done),
 }
 
 impl Default for Renders {
@@ -201,7 +275,7 @@ impl Default for Renders {
 impl Renders {
     /// Previews when renders from scratch take at least `ms` (tests: 0, always).
     pub fn with_threshold(ms: f64) -> Self {
-        Self { full: Retained::default(), preview: Retained::default(), last: None, full_ms: 0.0, preview_after_ms: ms }
+        Self { full: Retained::default(), preview: Retained::default(), last: None, full_ms: 0.0, preview_after_ms: ms, steps: None }
     }
 
     /// Whether `job` is a render from scratch: the kept image is of another zoom, page or file, or
@@ -213,7 +287,13 @@ impl Renders {
     /// Whether `job` gets a preview first: it renders from scratch and those have been slow on a
     /// page already drawn (the first render has no measure).
     fn wants_preview(&self, job: &Job) -> bool {
-        job.zoom_preview && self.last.is_some() && self.full_ms >= self.preview_after_ms && self.starts_over(job)
+        job.zoom_preview && self.last.is_some() && self.full_ms_so_far() >= self.preview_after_ms && self.starts_over(job)
+    }
+
+    /// How long the last render from scratch took, or what the one being drawn in steps has taken
+    /// so far when that is more: a render dropped mid-way (a zoom going on) leaves a measure too.
+    pub fn full_ms_so_far(&self) -> f64 {
+        self.full_ms.max(self.steps.as_ref().map_or(0.0, |s| s.spent))
     }
 
     /// Whether `job` should get a preview should its render run long: from scratch, with none first.
@@ -281,6 +361,107 @@ impl Renders {
             self.full_ms = ms;
         }
         Some(d)
+    }
+
+    /// [`Self::refine`] for about `budget_ms` at a time (the browser): a full render is drawn band by
+    /// band over several calls, the kept image (re-projected) or the preview showing meanwhile.
+    pub fn refine_for(&mut self, job: &Job, budget_ms: f64) -> Refined {
+        let t0 = Instant::now();
+        if let Some(s) = self.steps.as_ref()
+            && !same_settings(&s.job, job)
+        {
+            // Dropped for a render of the new view. What its bands took is at least what a full
+            // render takes: enough for the next zoom to get its preview and its wait.
+            self.full_ms = self.full_ms.max(s.spent);
+            self.steps = None;
+        }
+        if self.steps.is_none()
+            && let Some(r) = self.begin(job, t0, None)
+        {
+            return r;
+        }
+        let Some(s) = self.steps.as_mut() else { return Refined::Done(None) };
+        let steps = &mut s.steps;
+        let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            loop {
+                if steps.step() {
+                    return true;
+                }
+                if t0.elapsed().as_secs_f64() * 1000.0 >= budget_ms {
+                    return false;
+                }
+            }
+        }));
+        s.spent += t0.elapsed().as_secs_f64() * 1000.0;
+        match stepped {
+            Ok(false) => Refined::More,
+            Ok(true) => {
+                let Some(Stepping { job: drawn_for, fonts, steps, spent }) = self.steps.take() else { return Refined::Done(None) };
+                let (view, pix) = self.full.finish(*steps);
+                self.full_ms = spent;
+                // The image of the job it was started for: its document's colour profile, its
+                // proof setting and its request time.
+                let drawn = done(&drawn_for, view, pix, Work::Full, spent, false);
+                // Drawn for this very request: shown, done. Otherwise kept, then started on like
+                // any render: an edit, a pan or images that came meanwhile are patched in, or it
+                // is drawn again in steps (never all at once here), this one shown till then.
+                if same_request(&drawn_for, fonts, job) {
+                    return Refined::Done(self.finished(job, Some(drawn)));
+                }
+                self.begin(job, t0, Some(drawn)).unwrap_or(Refined::More)
+            }
+            Err(_) => {
+                self.steps = None;
+                self.full.clear();
+                Refined::Done(None)
+            }
+        }
+    }
+
+    /// Start `job` on the kept image: done when it is reused or patched, `None` when a full render
+    /// is now drawn in steps. `drawn` is the kept image just drawn in steps: what a reuse shows,
+    /// else shown while it is drawn again.
+    fn begin(&mut self, job: &Job, t0: Instant, mut drawn: Option<Done>) -> Option<Refined> {
+        // The snapped view may be a row taller.
+        let rows = job.view.height.saturating_add(1).div_ceil(MAX_BANDS).max(MIN_BAND_ROWS);
+        let begun =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match self.full.begin(&job.doc, job.page, &job.view, &options(job), rows) {
+                Some(Begun::Done(view, pix, work)) => Err(Box::new(match drawn.take() {
+                    Some(d) if work == Work::Reused => Some(d),
+                    _ => Some(done(job, view, pix, work, t0.elapsed().as_secs_f64() * 1000.0, false)),
+                })),
+                Some(Begun::Steps(steps)) => Ok(steps),
+                None => Err(Box::new(None)),
+            }));
+        match begun {
+            Ok(Ok(steps)) => {
+                // A pan or an edit at this zoom builds on this render: no preview for it.
+                self.last = Some((job.uid, job.page, job.view.scale));
+                self.steps = Some(Stepping { job: job.clone(), fonts: figcraft_text::layout_generation(), steps, spent: 0.0 });
+                drawn.map(Refined::Shown)
+            }
+            Ok(Err(d)) => Some(Refined::Done(self.finished(job, *d))),
+            Err(_) => {
+                self.full.clear();
+                Some(Refined::Done(None))
+            }
+        }
+    }
+
+    /// Record a render done at once in [`Self::refine_for`].
+    fn finished(&mut self, job: &Job, d: Option<Done>) -> Option<Done> {
+        if let Some(d) = &d {
+            self.last = Some((job.uid, job.page, job.view.scale));
+            if d.work == Work::Full {
+                self.full_ms = d.ms;
+            }
+        }
+        d
+    }
+
+    /// Whether a full render is being drawn band by band.
+    pub fn stepping(&self) -> bool {
+        self.steps.is_some()
     }
 }
 
@@ -535,6 +716,12 @@ impl Inline {
             renders: Renders::default(),
         }
     }
+    /// Previewing when renders from scratch take at least `ms` (tests: 0, whatever the machine).
+    #[cfg(test)]
+    pub fn with_threshold(mut self, ms: f64) -> Self {
+        self.renders = Renders::with_threshold(ms);
+        self
+    }
     pub fn submit(&mut self, job: Job) {
         self.pending = Some(job);
         self.submitted += 1;
@@ -546,26 +733,43 @@ impl Inline {
         self.pending.is_some()
     }
     pub fn poll(&mut self) -> Option<Done> {
+        self.poll_at(Instant::now())
+    }
+    /// [`Self::poll`] as of `now` (tests pass the time, so a busy machine can't stretch the wait).
+    pub fn poll_at(&mut self, now: Instant) -> Option<Done> {
         if !self.previewed {
             self.previewed = true;
             if let Some(d) = self.pending.as_ref().and_then(|job| self.renders.preview(job)) {
                 self.preview_shown = true;
-                self.since = Instant::now();
-                let full = std::time::Duration::try_from_secs_f64(self.renders.full_ms / 1000.0);
+                self.since = now;
+                let full = std::time::Duration::try_from_secs_f64(self.renders.full_ms_so_far() / 1000.0);
                 self.wait = full.map_or(self.settle, |full| full.min(self.settle));
                 self.ctx.request_repaint_after(self.wait);
                 return Some(answering(d, self.submitted));
             }
         }
         if self.pending.is_some() && self.preview_shown {
-            let waited = self.since.elapsed();
+            let waited = now.saturating_duration_since(self.since);
             if waited < self.wait {
                 self.ctx.request_repaint_after(self.wait - waited);
                 return None;
             }
         }
-        let job = self.pending.take()?;
-        self.renders.refine(&job).map(|d| answering(d, self.submitted))
+        let job = self.pending.as_ref()?;
+        match self.renders.refine_for(job, STEP_MS) {
+            Refined::Done(d) => {
+                self.pending = None;
+                d.map(|d| answering(d, self.submitted))
+            }
+            Refined::More => {
+                self.ctx.request_repaint();
+                None
+            }
+            Refined::Shown(d) => {
+                self.ctx.request_repaint();
+                Some(answering(d, self.submitted))
+            }
+        }
     }
 }
 
@@ -607,6 +811,21 @@ mod gpu_job_tests {
         assert!(!gpu_job(&job(d.clone(), p)), "off by default");
         assert!(gpu_job(&Job { gpu: true, ..job(d.clone(), p) }), "the preference asks for the GPU");
         assert!(!gpu_job(&Job { gpu: true, outline: true, ..job(d, p) }), "outline mode is the CPU renderer's");
+    }
+
+    /// With the preference off the CPU canvas is the one it always was: every frame drawn from the
+    /// document, its effects on the CPU. Only the GPU canvas's fallback keeps layers, and only then
+    /// may its effects use the window's GPU — exports never do, whatever the preference says.
+    #[test]
+    fn the_cpu_canvas_keeps_layers_and_accelerates_only_for_the_gpu_preference() {
+        let d = Document::new("cpu canvas");
+        let p = d.first_page().unwrap();
+        let off = options(&job(d.clone(), p));
+        assert_eq!(off.doc_id, 0, "off: nothing is kept between frames");
+        assert!(!off.accelerate, "off: the effects stay on the CPU");
+        let on = options(&Job { gpu: true, ..job(d, p) });
+        assert_eq!(on.doc_id, 1, "on: the fallback's layers are kept");
+        assert!(on.accelerate, "on: the fallback's effects may use the window's GPU");
     }
 
     #[test]

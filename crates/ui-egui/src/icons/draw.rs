@@ -285,6 +285,14 @@ fn draw(p: &P, icon: Icon) {
             p.line(6.0, 10.0, 13.0, 3.0);
             p.poly(&[(9.5, 2.5), (13.5, 2.5), (13.5, 6.5)], false);
         }
+        FitContents => {
+            // Four frame corners around the content: a compact mark for fitting the frame.
+            p.poly(&[(2.5, 6.0), (2.5, 2.5), (6.0, 2.5)], false);
+            p.poly(&[(10.0, 2.5), (13.5, 2.5), (13.5, 6.0)], false);
+            p.poly(&[(2.5, 10.0), (2.5, 13.5), (6.0, 13.5)], false);
+            p.poly(&[(10.0, 13.5), (13.5, 13.5), (13.5, 10.0)], false);
+            p.rect(5.5, 5.5, 10.5, 10.5, 0.0);
+        }
         Hand => {
             hand(p);
         }
@@ -510,6 +518,18 @@ fn draw(p: &P, icon: Icon) {
             p.fill(&[(3.0, 9.0), (13.0, 9.0), (13.0, 14.0)]);
         }
         CornerRadius | CornerTopLeft => p.corner(2.5, 2.5, 1.0, 1.0, 11.5, 6.0),
+        CornerSmoothing => {
+            // An original superellipse corner, with dots marking its tangent endpoints.
+            let points: Vec<_> = (0..=24)
+                .map(|i| {
+                    let a = i as f32 / 24.0 * FRAC_PI_2;
+                    (2.5 + 11.0 * (1.0 - a.cos().max(0.0).sqrt()), 2.5 + 11.0 * (1.0 - a.sin().max(0.0).sqrt()))
+                })
+                .collect();
+            p.path(&points, false);
+            p.dot(2.5, 13.5, 1.0);
+            p.dot(13.5, 2.5, 1.0);
+        }
         CornerTopRight => p.corner(13.5, 2.5, -1.0, 1.0, 11.5, 6.0),
         CornerBottomRight => p.corner(13.5, 13.5, -1.0, -1.0, 11.5, 6.0),
         CornerBottomLeft => p.corner(2.5, 13.5, 1.0, -1.0, 11.5, 6.0),

@@ -49,6 +49,9 @@ pub struct Ctx<'a, 'd> {
     /// [`layers::images_id`] of the document when layers may be kept (0 otherwise): an image that
     /// arrived after a layer was drawn must not leave it reused.
     pub images: u64,
+    /// Whether the raster effects may run on the window's GPU ([`crate::Options::accelerate`]): the
+    /// canvas with its GPU preference on, never an export.
+    pub accelerate: bool,
 }
 
 /// What one render works out about layers with children, which a walk down their subtree finds:
@@ -329,7 +332,8 @@ fn node_outline_at(doc: &Document, n: &Node, depth: usize) -> Option<(BezPath, F
                     Some((p, c.bool_op.unwrap_or(*op)))
                 })
                 .collect();
-            Some((crate::boolean::fold_cached(&operands), FillRule::EvenOdd))
+            // Past the path operations' caps the group has no outline: it draws without its result.
+            crate::boolean::fold_cached(&operands).map(|p| (p, FillRule::EvenOdd))
         }
         NodeKind::Text(_) => {
             let (l, dy) = figcraft_text::layout_node(n)?;
@@ -481,17 +485,32 @@ pub(crate) fn bounds_within<'a>(
     (r, levels)
 }
 
+/// The most one effect counts for in [`effect_margin`] (document units): far past any view, and
+/// sums of any number of them stay finite.
+pub(crate) const MAX_REACH: f64 = 1e12;
+
 /// How far (document units) effects that read outside a node's paint bounds reach: blurs, glass,
 /// drop shadows and texture. Culling and partial renders keep this much margin.
+///
+/// Layer blurs and texture apply one after another, each moving what the one before it moved, so
+/// their reaches add up. What the other effects paint goes through them or is cast from their
+/// result (drop shadows from the blurred layer, a backdrop blurred with it), so the largest of
+/// those reaches comes on top. Each reach counts up to [`MAX_REACH`], so the sum stays finite.
 pub fn effect_margin(n: &Node) -> f64 {
-    n.effects
-        .iter()
-        .filter(|e| e.visible)
+    let visible = || n.effects.iter().filter(|e| e.visible);
+    let finite = |m: f64| if m.is_finite() { m.clamp(0.0, MAX_REACH) } else { 0.0 };
+    let layer: f64 = visible()
         .map(|e| match &e.kind {
             EffectKind::LayerBlur(b) => b.max_radius() * 2.0,
+            EffectKind::Texture(t) => t.radius.abs(),
+            _ => 0.0,
+        })
+        .map(finite)
+        .sum();
+    let others = visible()
+        .map(|e| match &e.kind {
             EffectKind::BackgroundBlur { .. } | EffectKind::Glass(_) => e.backdrop_radius() * 2.0,
             EffectKind::DropShadow(s) => s.radius * 2.0 + s.spread.abs() * figcraft_doc::SPREAD_MITER_LIMIT + s.offset.0.abs() + s.offset.1.abs(),
-            EffectKind::Texture(t) => t.radius.abs(),
             // Inner shadows cast from around a layer's pixels (groups, image fills with alpha; any
             // image counts here): a layer cut off at the view would cast one from the cut.
             EffectKind::InnerShadow(s)
@@ -501,8 +520,9 @@ pub fn effect_margin(n: &Node) -> f64 {
             }
             _ => 0.0,
         })
-        .filter(|m| m.is_finite())
-        .fold(0.0, f64::max)
+        .map(finite)
+        .fold(0.0, f64::max);
+    layer + others
 }
 
 /// Everything node `id` can paint, in page coordinates: its paint bounds (glyphs of overflowing
@@ -636,7 +656,7 @@ fn draw_layer(ctx: &Ctx, pix: &mut Pixmap, n: &Node, parent_xf: Affine, depth: u
     let settled = key.filter(|k| root.is_some() && layers::settled(*k));
     let whole = settled.and_then(|_| whole_layer(dev));
     let kept = settled.filter(|_| whole.is_some());
-    let (rx0, ry0, rw, rh) = match whole {
+    let (x0, y0, w, h) = match whole {
         Some(r) => r,
         None => {
             let vis = dev.intersect(view);
@@ -645,15 +665,17 @@ fn draw_layer(ctx: &Ctx, pix: &mut Pixmap, n: &Node, parent_xf: Affine, depth: u
         }
     };
     // The kept layer's place on the page (whole device pixels: `cacheable` checked it).
-    let anchor = (rx0 as i32 + ctx.page_at.0.round() as i32, ry0 as i32 + ctx.page_at.1.round() as i32);
-    if !(rx0.is_finite() && ry0.is_finite() && rw >= 1.0 && rh >= 1.0) {
+    let anchor = (x0 as i32 + ctx.page_at.0.round() as i32, y0 as i32 + ctx.page_at.1.round() as i32);
+    if !(x0.is_finite() && y0.is_finite() && w >= 1.0 && h >= 1.0) {
         return;
     }
-    let (lx, ly) = (rx0 as i32, ry0 as i32);
-    let lw = rw.min(16_384.0) as u32;
-    let lh = rh.min(16_384.0) as u32;
+    let (lx, ly) = (x0 as i32, y0 as i32);
+    let lw = w.min(16_384.0) as u32;
+    let lh = h.min(16_384.0) as u32;
+    // Nested layers hold their pixmaps while the ones inside them draw: within one budget.
+    let Some(_held) = crate::layer_budget::Held::take(lw, lh, 1) else { return };
     let Some(mut layer) = Pixmap::new(lw, lh) else { return };
-    let lxf = Affine::translate((-rx0, -ry0)) * xf;
+    let lxf = Affine::translate((-x0, -y0)) * xf;
     let shape = node_outline(ctx.doc, n);
     // Background blur and glass: the whole backdrop under the layer (every surface below this
     // one, composited), through the shape, under the content.
@@ -679,8 +701,8 @@ fn draw_layer(ctx: &Ctx, pix: &mut Pixmap, n: &Node, parent_xf: Affine, depth: u
             for e in n.effects.iter().filter(|e| e.visible) {
                 if let EffectKind::InnerShadow(s) = &e.kind
                     && let Some(inner) = match &fills {
-                        Some(f) => shadow::inner_shadow_of(f, ctx.scale, s),
-                        None => shape.as_ref().and_then(|sh| shadow::inner_shadow(sh, lw, lh, lxf, ctx.scale, s)),
+                        Some(f) => shadow::inner_shadow_of(f, ctx.scale, s, ctx.accelerate),
+                        None => shape.as_ref().and_then(|sh| shadow::inner_shadow(sh, lw, lh, lxf, ctx.scale, s, ctx.accelerate)),
                     }
                 {
                     l.draw_pixmap(0, 0, inner.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
@@ -701,7 +723,7 @@ fn draw_layer(ctx: &Ctx, pix: &mut Pixmap, n: &Node, parent_xf: Affine, depth: u
         let cover = layer.clone();
         for e in n.effects.iter().filter(|e| e.visible) {
             if let EffectKind::InnerShadow(s) = &e.kind
-                && let Some(sh) = shadow::inner_shadow_of(&cover, ctx.scale, s)
+                && let Some(sh) = shadow::inner_shadow_of(&cover, ctx.scale, s, ctx.accelerate)
             {
                 layer.draw_pixmap(0, 0, sh.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
             }
@@ -726,7 +748,7 @@ fn draw_layer(ctx: &Ctx, pix: &mut Pixmap, n: &Node, parent_xf: Affine, depth: u
         let caster = shadow::Caster::new(ctx.doc, n, content.as_ref().unwrap_or(&layer), lxf, ctx.scale);
         for e in n.effects.iter().filter(|e| e.visible) {
             if let EffectKind::DropShadow(s) = &e.kind
-                && let Some(sh) = shadow::drop_shadow(&caster, s)
+                && let Some(sh) = shadow::drop_shadow(&caster, s, ctx.accelerate)
             {
                 if kept.is_some() {
                     // Kept with the layer: the next frame composites it instead of drawing it.
@@ -764,14 +786,14 @@ fn backdrop_layer(ctx: &Ctx, pix: &Pixmap, n: &Node, sh: &shadow::Outline, at: (
     let pad = backdrop::pad(n, ctx.scale);
     let p = i32::try_from(pad).unwrap_or(0);
     let back = backdrop::backdrop(pix, ctx.under, lx.saturating_sub(p), ly.saturating_sub(p), lw + pad * 2, lh + pad * 2)?;
-    backdrop::effects(n, backdrop::EffectFrame { shape: sh, back: &back, pad, size: (lw, lh), xf: lxf, scale: ctx.scale })
+    backdrop::effects(n, backdrop::EffectFrame { shape: sh, back: &back, pad, size: (lw, lh), xf: lxf, scale: ctx.scale, accelerate: ctx.accelerate })
 }
 
 /// Node `n`'s layer blur, noise and texture on its `layer`, in list order.
 fn layer_effects(ctx: &Ctx, layer: &mut Pixmap, n: &Node, id: NodeId, lxf: Affine) {
     for e in n.effects.iter().filter(|e| e.visible) {
         match &e.kind {
-            EffectKind::LayerBlur(b) => blur::apply(layer, b, (n.width, n.height), lxf, ctx.scale),
+            EffectKind::LayerBlur(b) => blur::apply(layer, b, (n.width, n.height), lxf, ctx.scale, ctx.accelerate),
             EffectKind::Noise(nz) => grain::noise(layer, nz, lxf, id.0 as u32),
             EffectKind::Texture(t) => grain::texture(layer, t, lxf, ctx.scale, id.0 as u32),
             _ => {}
@@ -967,52 +989,98 @@ fn draw_children(ctx: &Ctx, pix: &mut Pixmap, n: &Node, xf: Affine, depth: usize
     }
 }
 
-fn draw_masked(ctx: &Ctx, pix: &mut Pixmap, mask_id: NodeId, content: &[NodeId], xf: Affine, depth: usize) {
-    let (w, h) = (pix.width(), pix.height());
-    let Some(mut mask_px) = Pixmap::new(w, h) else { return };
-    let mask_type = ctx.doc.node(mask_id).map(|m| m.mask_type).unwrap_or_default();
-    // Draw the mask node as if it weren't a mask (a vector mask: its outline, fully opaque).
-    if let Some(m) = ctx.doc.node(mask_id) {
-        let mut m2 = m.clone();
-        m2.is_mask = false;
-        let mxf = xf * m2.transform;
-        if mask_type == figcraft_doc::MaskType::Vector {
-            if let Some((outline, rule)) = subtree_outline(ctx.doc, &m2, depth + 1)
-                && let Some(path) = ts_path(&outline)
-            {
-                let mut paint = tiny_skia::Paint::default();
-                paint.set_color_rgba8(255, 255, 255, 255);
-                paint.anti_alias = true;
-                mask_px.fill_path(&path, &paint, rule, ts_transform(mxf), None);
-            }
-        } else if needs_layer(&m2) {
-            let paint = PixmapPaint { opacity: m2.opacity, ..Default::default() };
-            let mut tmp = Pixmap::new(w, h);
-            if let Some(tmp) = tmp.as_mut() {
-                draw_content(ctx, tmp, &m2, mxf, depth + 1, None);
-                mask_px.draw_pixmap(0, 0, tmp.as_ref(), &paint, Transform::identity(), None);
-            }
-        } else {
-            draw_content(ctx, &mut mask_px, &m2, mxf, depth + 1, None);
-        }
+#[cfg(test)]
+thread_local! {
+    /// Tests: mask groups draw over the whole pixmap, as they did before [`masked_area`].
+    pub(crate) static WHOLE_MASK_AREA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The pixels of `pix` a mask group (mask `mask_id`, then `content`, drawn at `xf`) can paint,
+/// rounded out to whole pixels: where the mask or the content reach, effects included (#1061).
+fn masked_area(ctx: &Ctx, pix: &Pixmap, mask_id: NodeId, content: &[NodeId], xf: Affine) -> Option<IntRect> {
+    let size = (pix.width(), pix.height());
+    let whole = Rect::new(0.0, 0.0, f64::from(size.0), f64::from(size.1));
+    #[cfg(test)]
+    if WHOLE_MASK_AREA.with(std::cell::Cell::get) {
+        return int_rect(whole, size);
     }
+    let reach = |id: &NodeId| {
+        let n = ctx.bounds.node(ctx.doc, *id)?;
+        let (local, levels) = bounds_within(ctx.doc, n, 0, ctx.lod.then_some(ctx.scale), Some(ctx.bounds));
+        // Bounds the nesting cap cut short could miss a layer: anywhere then.
+        if levels.is_none() {
+            return Some(whole);
+        }
+        // A pixel more for antialiasing.
+        let m = (effect_margin(n) * ctx.scale).min(MAX_EFFECT_MARGIN_PX) + 1.0;
+        Some(device_rect(xf * n.transform, local).inflate(m, m))
+    };
+    let area = std::iter::once(&mask_id).chain(content).filter_map(reach).reduce(|a, b| a.union(b))?;
+    int_rect(area, size)
+}
+
+/// Mask `m` drawn as if it weren't a mask into a `w` × `h` pixmap at `xf` (a vector mask: its
+/// outline, fully opaque).
+fn mask_pixels(ctx: &Ctx, m: &Node, (w, h): (u32, u32), xf: Affine, depth: usize) -> Option<Pixmap> {
+    let mut mask_px = Pixmap::new(w, h)?;
+    let mut m2 = m.clone();
+    m2.is_mask = false;
+    let mxf = xf * m2.transform;
+    if m.mask_type == figcraft_doc::MaskType::Vector {
+        if let Some((outline, rule)) = subtree_outline(ctx.doc, &m2, depth + 1)
+            && let Some(path) = ts_path(&outline)
+        {
+            let mut paint = tiny_skia::Paint::default();
+            paint.set_color_rgba8(255, 255, 255, 255);
+            paint.anti_alias = true;
+            mask_px.fill_path(&path, &paint, rule, ts_transform(mxf), None);
+        }
+    } else if needs_layer(&m2) {
+        let paint = PixmapPaint { opacity: m2.opacity, ..Default::default() };
+        if let Some(mut tmp) = Pixmap::new(w, h) {
+            draw_content(ctx, &mut tmp, &m2, mxf, depth + 1, None);
+            mask_px.draw_pixmap(0, 0, tmp.as_ref(), &paint, Transform::identity(), None);
+        }
+    } else {
+        draw_content(ctx, &mut mask_px, &m2, mxf, depth + 1, None);
+    }
+    Some(mask_px)
+}
+
+fn draw_masked(ctx: &Ctx, pix: &mut Pixmap, mask_id: NodeId, content: &[NodeId], xf: Affine, depth: usize) {
+    // Only over the pixels the group can paint, not the whole pixmap.
+    let Some(area) = masked_area(ctx, pix, mask_id, content, xf) else { return };
+    let (ax, ay, w, h) = (area.x(), area.y(), area.width(), area.height());
+    // The mask (and its own layer), the content, and the pixels it goes onto.
+    let Some(_held) = crate::layer_budget::Held::take(w, h, 4) else { return };
+    let axf = Affine::translate((-f64::from(ax), -f64::from(ay))) * xf;
+    let m = ctx.doc.node(mask_id);
+    let mask_px = match m {
+        Some(m) => mask_pixels(ctx, m, (w, h), axf, depth),
+        None => Pixmap::new(w, h),
+    };
+    let Some(mask_px) = mask_px else { return };
     let Some(mut layer) = Pixmap::new(w, h) else { return };
-    let kind = if mask_type == figcraft_doc::MaskType::Luminance { MaskType::Luminance } else { MaskType::Alpha };
+    let kind = if m.is_some_and(|m| m.mask_type == figcraft_doc::MaskType::Luminance) { MaskType::Luminance } else { MaskType::Alpha };
     let mask = Mask::from_pixmap(mask_px.as_ref(), kind);
     {
-        let under = Under { clip: Some(&mask), ..Under::new(pix, (0, 0), ctx.under) };
+        let under = Under { clip: Some(&mask), ..Under::new(pix, (ax, ay), ctx.under) };
         let sub = Ctx { under: Some(&under), ..*ctx };
         for c in content {
-            draw_node(&sub, &mut layer, *c, xf, depth + 1);
+            draw_node(&sub, &mut layer, *c, axf, depth + 1);
         }
     }
-    pix.draw_pixmap(0, 0, layer.as_ref(), &PixmapPaint::default(), Transform::identity(), Some(&mask));
+    // A mask applies to a pixmap of its own size: through it onto a copy of the area, put back.
+    let Some(mut onto) = pix.clone_rect(area) else { return };
+    onto.draw_pixmap(0, 0, layer.as_ref(), &PixmapPaint::default(), Transform::identity(), Some(&mask));
+    backdrop::replace(pix, (ax, ay), &onto, None);
 }
 
 fn draw_children_clipped(ctx: &Ctx, pix: &mut Pixmap, n: &Node, xf: Affine, depth: usize, clip: Option<&BezPath>) {
     let (pw, ph) = (pix.width(), pix.height());
     let dev = device_rect(xf, n.local_rect());
     let Some(ir) = int_rect(dev, (pw, ph)) else { return };
+    let Some(_held) = crate::layer_budget::Held::take(ir.width(), ir.height(), 1) else { return };
     let (lx, ly) = (ir.x(), ir.y());
     // The layer starts as what lies under it and goes back in its place through the clip:
     // clipping cuts the children off without isolating them, so their blend modes reach the

@@ -81,8 +81,11 @@ the region a pan uncovers or an edit touches; overlays (selection, handles, guid
 drawn by egui on top. A seeded random walk checks the retained canvas against full renders.
 Within that region, isolated layers (opacity, blend modes, effects) are rasterised on the page's
 pixel grid and kept between frames (`figcraft_render::layers`), so dragging a few layers across a
-page full of shadows, blurs and glass re-composites the rest instead of drawing it again; layers
-that read the backdrop (glass, background blur) or start from it (masks) are always drawn. SVG and
+page full of shadows, blurs and glass re-composites the rest instead of drawing it again; only the
+GPU canvas's fallback keeps them (`Options::doc_id`), so with the preference off the canvas is the
+stateless renderer it was; layers that read the backdrop (glass, background blur) or start from it
+(masks) are always drawn. The window's GPU draws raster effects only inside a canvas frame
+(`Options::accelerate`): exports, thumbnails and the CLI use the CPU's. SVG and
 PDF export walk the same scene and embed rasters where those formats can't express an effect.
 
 ## File I/O
@@ -97,7 +100,7 @@ content. Exports: PNG, JPG, WebP, SVG, PDF, code. There is no `.fig` reader yet
 
 Workspace lints deny `unwrap`, `expect`, `panic!` and friends in shipped code; `unsafe_code` is
 forbidden. `figcraft_engine::guard` turns a panicking command into an error and rolls the document
-back; the desktop app also guards each UI frame. Junk-parameter sweeps run every command with bad
+back; the desktop app also guards each UI frame. The browser build can't catch a panic (wasm32 aborts), so there a panic stops the page and its panic hook keeps the files with unsaved changes in local storage for the next page. Junk-parameter sweeps run every command with bad
 input.
 
 ## Revision history

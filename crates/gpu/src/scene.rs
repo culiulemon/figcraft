@@ -1358,7 +1358,8 @@ impl Builder<'_> {
     /// where an export's does.
     fn group_inner_shadow(&mut self, layer: &Layer, s: &figcraft_doc::Shadow, scale: f64) -> Result<Layer, Unsupported> {
         let Some(pixels) = self.layers.layer_pixels(layer) else { return Err(Unsupported::Effect) };
-        let Some(shadow) = figcraft_render::shadow::inner_shadow_of(&pixels, scale, s) else { return Ok(layer.clone()) };
+        // The canvas draws this layer: its GPU may cast the shadow.
+        let Some(shadow) = figcraft_render::shadow::inner_shadow_of(&pixels, scale, s, true) else { return Ok(layer.clone()) };
         let shadow = image_data(&Arc::new(shadow));
         let sampler = ImageSampler { x_extend: Extend::Pad, y_extend: Extend::Pad, quality: ImageQuality::Low, alpha: 1.0 };
         let mut scene = Scene::new();

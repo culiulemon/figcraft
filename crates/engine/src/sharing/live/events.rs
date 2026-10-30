@@ -2,8 +2,30 @@ use super::host::{clean_hosting, clean_shared};
 use super::types::{Event, PageInfo, Role, SessionId, Status};
 use super::{
     Access, Arc, Client, ClientMsg, DocState, Document, EngineError, Live, NodeId, PUBLISHING, Peer, Presence, Result, ServerMsg, Session, Signal,
-    ToolId, VIEW_ONLY, editing_hint, editing_of, sanitize,
+    ToolId, display_name, editing_hint, editing_of, limited_by, sanitize, tool_left,
 };
+
+/// What a live session's document holding components that contain each other's instances shows
+/// (`names`: the loop): those instances stop expanding where they would show themselves again.
+fn loop_notice(names: &str) -> String {
+    format!("Components contain each other's instances ({names}): those instances stop where they would show themselves")
+}
+
+/// A session that starts reconnecting forgets who's here (that comes again with the next welcome;
+/// edits wait for it), and the host's signal support until it says it reads them again (a
+/// spotlight of yours goes out again then).
+fn reset_for_reconnect(live: &mut Live) {
+    live.peers.clear();
+    live.presence.clear();
+    live.sent = None;
+    live.signals = false;
+    live.chats.clear();
+    live.chat.clear();
+    live.spotlight = None;
+    if let Some(c) = live.client.as_mut() {
+        c.disconnect();
+    }
+}
 
 impl Session {
     /// The active document (`None`: no document is open).
@@ -37,6 +59,12 @@ impl Session {
     /// Install a document that came from the session (others' edits): the selection, page and view
     /// stay where they can, and the undo history isn't touched.
     pub fn apply_remote(&mut self, uid: u64, doc: Arc<Document>) {
+        let Some(old) = self.docs.iter().find(|d| d.uid == uid).map(|d| d.doc.clone()) else { return };
+        // Edits merged from others can close a loop of components containing each other.
+        let changed = crate::derived::changed_nodes(&doc, &old);
+        if let Some(names) = crate::components::new_cycle(&old, &doc, changed.iter()) {
+            self.message = Some(loop_notice(&names));
+        }
         let Some(ds) = self.docs.iter_mut().find(|d| d.uid == uid) else { return };
         ds.doc = doc;
         if !ds.doc.pages.contains(&ds.page) {
@@ -127,20 +155,8 @@ impl Session {
                 self.live.end(id);
             }
             Event::Status(st) => {
-                // Who's here comes again with the next welcome; edits wait for it.
                 if let Status::Reconnecting { .. } = st {
-                    live.peers.clear();
-                    live.presence.clear();
-                    live.sent = None;
-                    // Until the host says it reads them again (a spotlight of yours goes out
-                    // again then).
-                    live.signals = false;
-                    live.chats.clear();
-                    live.chat.clear();
-                    live.spotlight = None;
-                    if let Some(c) = live.client.as_mut() {
-                        c.disconnect();
-                    }
+                    reset_for_reconnect(live);
                 }
                 live.status = st;
             }
@@ -161,7 +177,10 @@ impl Session {
                 live.sent = None;
             }
             Event::PeerJoined(p) => {
-                self.message = Some(format!("{} joined{behind}", p.name));
+                // Someone already here was renamed: no newcomer to announce.
+                if !live.peers.contains_key(&p.client_id) {
+                    self.message = Some(format!("{} joined{behind}", p.name));
+                }
                 live.peers.insert(p.client_id, p);
             }
             Event::PeerLeft(peer) => {
@@ -234,6 +253,9 @@ impl Session {
                 if live.spotlighting {
                     self.live.send(id, [ClientMsg::Signal(Signal::spotlight(true))]);
                 }
+                // Renamed while away, or before the session read signals: the host's hello had
+                // the old name.
+                self.live_send_name(id);
             }
             (Signal::CHAT, Some(_)) if sig.text.is_empty() => {
                 live.chats.remove(&peer);
@@ -258,6 +280,28 @@ impl Session {
             }
             _ => {}
         }
+    }
+
+    /// Your name from Preferences changed: every session you're in shows you by it.
+    pub(crate) fn live_rename(&mut self) {
+        let ids: Vec<SessionId> = self.live.sessions.keys().copied().collect();
+        for id in ids {
+            self.live_send_name(id);
+        }
+    }
+
+    /// Tell session `id` your name from Preferences when it shows you by another one. The default
+    /// name isn't sent: the name the session gave you ("Guest N") stays. A host older than
+    /// renaming ignores it.
+    fn live_send_name(&mut self, id: SessionId) {
+        let name = display_name(&self.prefs);
+        let Some(live) = self.live.sessions.get_mut(&id) else { return };
+        if name.is_empty() || !live.signals {
+            return;
+        }
+        let Some(info) = live.info.as_mut().filter(|i| i.name != name) else { return };
+        info.name.clone_from(&name);
+        self.live.send(id, [ClientMsg::Signal(Signal::name(&name))]);
     }
 
     /// Why cursor chat or a spotlight can't go out now, if it can't.
@@ -355,7 +399,10 @@ impl Session {
             (Some(Role::Guest), None) => {
                 // The session's file gets a tab of its own, in front.
                 let ds = DocState::new(client.document().clone(), None);
-                self.message = Some(format!("Joined {}", ds.doc.name));
+                self.message = Some(match crate::components::cycle_text(&ds.doc) {
+                    Some(names) => format!("Joined {}. {}", ds.doc.name, loop_notice(&names)),
+                    None => format!("Joined {}", ds.doc.name),
+                });
                 let opened = (ds.uid, Some(ds.doc.clone()));
                 self.active = self.docs.len();
                 self.docs.push(ds);
@@ -363,8 +410,11 @@ impl Session {
             }
             _ => return,
         };
-        // A view link: the editing tools are off.
-        if client.access() == Access::View && self.tab() == Some(uid) && !matches!(self.tool.tool, ToolId::Move | ToolId::Hand) {
+        // A view or comment link: the editing tools are off.
+        if let Some(why) = limited_by(client.access())
+            && self.tab() == Some(uid)
+            && !tool_left(why, self.tool.tool)
+        {
             self.set_tool(ToolId::Move);
         }
         let Some(live) = self.live.sessions.get_mut(&id) else { return };
@@ -392,16 +442,23 @@ impl Session {
         self.message = Some(reason);
     }
 
-    /// Why document `uid` can't be edited now, if it can't: you may only view it in its session,
-    /// or it is on its way to a server.
+    /// Why document `uid` can't be edited now, if it can't: you may only view it (or view and
+    /// comment on it: see [`live_comment_edit`](Self::live_comment_edit)) in its session, or it is
+    /// on its way to a server.
     pub fn live_read_only(&self, uid: u64) -> Option<&'static str> {
         let live = self.live.doc(uid)?;
         match &live.client {
-            Some(c) if c.access() == Access::View => Some(VIEW_ONLY),
-            Some(_) => None,
+            Some(c) => limited_by(c.access()),
             None if live.status.active() && live.role() != Some(Role::Host) => Some(PUBLISHING),
             None => None,
         }
+    }
+
+    /// Whether `doc` is session document `uid` with nothing but comment threads changed, and the
+    /// link it was joined with lets you comment: such an edit goes through where others are refused.
+    pub(crate) fn live_comment_edit(&self, uid: u64, doc: &Document) -> bool {
+        let client = self.live.doc(uid).and_then(|l| l.client.as_ref());
+        client.is_some_and(|c| c.access() == Access::Comment && c.changes_only_comments(doc))
     }
 
     /// The active document can't be edited now (see [`live_read_only`](Self::live_read_only)).

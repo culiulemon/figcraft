@@ -112,6 +112,8 @@ pub struct CanvasState {
     /// The pen pressure last reported during the current press (pen and stylus touches; the
     /// winit backends and browsers that report it).
     pressure: Option<f32>,
+    /// The latest scroll came from a mouse wheel rather than a trackpad (Scroll wheel zoom).
+    wheel_is_mouse: bool,
 }
 
 impl Default for CanvasState {
@@ -152,6 +154,7 @@ impl Default for CanvasState {
             hovering: false,
             preedit: None,
             pressure: None,
+            wheel_is_mouse: false,
         }
     }
 }
@@ -390,6 +393,7 @@ pub fn show(app: &mut FigApp, ui: &mut Ui, worker: &mut Worker) {
     crate::comments::draw(app, &painter);
     crate::live_text::draw(app, &painter);
     crate::live::draw(app, &painter, &ctx);
+    crate::live::agent::draw(app, &painter, &ctx);
     crate::live::chat_box(app, &ctx);
     crate::live::spotlight_banner(app, &ctx, rect);
     crate::comments::popovers(app, &ctx);
@@ -481,6 +485,12 @@ fn describe_box([x0, y0, x1, y1]: [f64; 4]) -> String {
 
 #[cfg(test)]
 mod builder_poly_tests;
+
+#[cfg(test)]
+mod outline_tests;
+
+#[cfg(test)]
+mod wheel_zoom_tests;
 
 #[cfg(test)]
 mod zoom_preview_tests;

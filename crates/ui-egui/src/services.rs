@@ -73,6 +73,14 @@ pub trait Services {
     fn gamepad_held(&mut self) -> u32 {
         0
     }
+    /// The fonts installed on this computer can be asked for and haven't been (the browser's Local
+    /// Font Access; the desktop app sees them anyway).
+    fn can_ask_for_local_fonts(&self) -> bool {
+        false
+    }
+    /// Ask for them (the browser asks the person): they join the font list by name, each read when
+    /// text uses it.
+    fn ask_for_local_fonts(&mut self) {}
 }
 
 pub type DialogFuture = Pin<Box<dyn Future<Output = Option<PathBuf>>>>;
@@ -114,6 +122,21 @@ impl Picked {
 /// What the user is told about a file whose contents couldn't be read.
 pub fn unreadable(name: &str) -> String {
     i18n::trf("Couldn't read {name}.", &[("name", &name)])
+}
+
+/// What the page says once the browser build stopped on an internal error (in the browser a panic
+/// ends the page): `unsaved` files had unsaved changes and `kept` of them fitted in its storage.
+pub fn browser_stopped(unsaved: usize, kept: usize) -> String {
+    let next = if unsaved == 0 {
+        i18n::tr("Reload the page to start again.")
+    } else if kept >= unsaved {
+        i18n::tr("Reload the page to get your unsaved files back.")
+    } else if kept == 0 {
+        i18n::tr("Your unsaved files were too large for the browser to keep.")
+    } else {
+        i18n::tr("Reload the page to get back the unsaved files the browser had room for.")
+    };
+    format!("{} {next}", i18n::tr("FigCraft stopped because of an internal error."))
 }
 
 /// The largest file read in the browser: wasm has at most 4 GiB of memory, and a file's contents

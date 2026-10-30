@@ -47,10 +47,14 @@ impl Session {
 
     /// [`Session::execute`] for an AI agent named `agent` (the client's name; empty when it gave
     /// none), or for the user (`None`): the comments it makes are signed with the agent's name and
-    /// marked as an agent's.
+    /// marked as an agent's, and the app shows where it works ([`Session::agent_presence_at`]).
     pub fn execute_as(&mut self, agent: Option<&str>, id: &str, params: &Value) -> Result<Value> {
         let was = std::mem::replace(&mut self.agent, agent.map(cmd::comment::agent_author));
+        let before = agent.and_then(|_| self.agent_before());
         let r = self.execute(id, params);
+        if agent.is_some() {
+            self.note_agent(before);
+        }
         self.agent = was;
         r
     }
@@ -182,18 +186,22 @@ impl Session {
     }
 
     /// A live session's document you may only view (or that is on its way to a server) is
-    /// read-only: refuse an edit (it is rolled back).
+    /// read-only: refuse an edit (it is rolled back). With a comment link, one that changes only
+    /// comment threads goes through.
     fn check_live_access(&self, id: &str, before: &Option<(Arc<Document>, Vec<NodeId>, NodeId, u64)>) -> Result<()> {
         let Some((bdoc, _, _, uid)) = before else { return Ok(()) };
         let Some(ds) = self.docs.iter().find(|d| d.uid == *uid) else { return Ok(()) };
         match self.live_read_only(*uid) {
-            Some(why) if !Arc::ptr_eq(&ds.doc, bdoc) => Err(EngineError::Disabled(id.to_string(), why.into())),
+            Some(why) if !Arc::ptr_eq(&ds.doc, bdoc) && !self.live_comment_edit(*uid, &ds.doc) => {
+                Err(EngineError::Disabled(id.to_string(), why.into()))
+            }
             _ => Ok(()),
         }
     }
 
     /// Instances can't gain, lose or reorder layers, nor move, resize or re-constrain the layers in
-    /// them, and library copies are read-only: refuse such an edit (it is rolled back).
+    /// them, library copies are read-only and components can't contain their own instances: refuse
+    /// such an edit (it is rolled back).
     pub(crate) fn check_instance_structure(&self, id: &str, before: &Option<(Arc<Document>, Vec<NodeId>, NodeId, u64)>) -> Result<()> {
         let Some((bdoc, _, _, uid)) = before else { return Ok(()) };
         let Some(ds) = self.docs.iter().find(|d| d.uid == *uid) else { return Ok(()) };
@@ -208,6 +216,7 @@ impl Session {
         library::check_read_only(effective, bdoc, &ds.doc)
             .and_then(|()| components::check_structure_edit(bdoc, &ds.doc))
             .and_then(|()| components::check_override_edit(bdoc, &ds.doc))
+            .and_then(|()| components::check_component_cycles(bdoc, &ds.doc))
             .map_err(|m| EngineError::Disabled(id.to_string(), m))
     }
 

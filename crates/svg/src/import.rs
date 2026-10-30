@@ -17,6 +17,7 @@
 //! nested clip paths) is left out and reported in the import notes. Linked files are never read: only data URIs.
 
 mod budget;
+mod css_color;
 mod fx;
 mod paint;
 mod shape;
@@ -24,6 +25,8 @@ mod text;
 
 #[cfg(test)]
 mod budget_tests;
+#[cfg(test)]
+mod css_color_tests;
 #[cfg(test)]
 mod fx_tests;
 #[cfg(test)]
@@ -34,8 +37,10 @@ mod paint_tests;
 mod shape_tests;
 #[cfg(test)]
 mod structure_tests;
+#[cfg(test)]
+mod tile_tests;
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use figcraft_color::{BlendMode, ImageScaleMode, Paint};
 use figcraft_doc::{Document, Effect, MaskType, Node, NodeId, NodeKind, StrokeAlign, StrokeCap, StrokeJoin, VectorNetwork, WindingRule};
@@ -96,11 +101,13 @@ pub(crate) struct Ctx<'a> {
     fonts: Option<text::Fonts>,
     /// Patterns being drawn into tile images (inside one another).
     pattern_depth: usize,
+    /// Tiles drawn so far, by pattern and scale (see [`paint`]'s `render_tile`).
+    tiles: HashMap<(*const usvg::Pattern, u64), Option<paint::Tile>>,
 }
 
 impl<'a> Ctx<'a> {
     pub(crate) fn new(doc: &'a mut Document) -> Self {
-        Ctx { doc, count: 0, anonymous: HashSet::new(), notes: BTreeSet::new(), fonts: None, pattern_depth: 0 }
+        Ctx { doc, count: 0, anonymous: HashSet::new(), notes: BTreeSet::new(), fonts: None, pattern_depth: 0, tiles: HashMap::new() }
     }
 
     pub(crate) fn full(&self) -> bool {
@@ -806,6 +813,11 @@ fn import_within(
     if too_deep(&data) {
         return Err(ImportError(format!("elements nested more than {MAX_NESTING} deep")));
     }
+    // usvg reads neither `color()` nor `color-mix()`: they are resolved first.
+    let (data, color_notes) = match css_color::resolve(&data, doc.color_profile) {
+        Some(resolved) => resolved,
+        None => (data, Vec::new()),
+    };
     let tree = usvg::Tree::from_data(&data, &options(&data, limits)).map_err(|e| ImportError(e.to_string()))?;
     let size = tree.size();
     let frame =
@@ -814,6 +826,7 @@ fn import_within(
         f.fills.clear();
     }
     let mut cx = Ctx::new(doc);
+    color_notes.into_iter().for_each(|n| cx.note(n));
     children(&mut cx, tree.root(), frame, Affine::IDENTITY, 0);
     Ok(Imported { frame, notes: cx.notes.into_iter().collect() })
 }

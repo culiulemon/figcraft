@@ -110,7 +110,7 @@ mod tests {
         for (w, h, sigma) in [(320u32, 240u32, 3.0), (640, 480, 12.0)] {
             let mut cpu = scene(w, h);
             let mut on_gpu = cpu.clone();
-            figcraft_render::fx::blur(&mut cpu, sigma);
+            figcraft_render::fx::blur(&mut cpu, sigma, false);
             assert!(gpu.blur(&mut on_gpu, sigma), "{w}×{h}: the GPU drew it");
             let worst = cpu.data().iter().zip(on_gpu.data()).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
             assert!(worst <= 1, "{w}×{h} sigma {sigma}: a channel differs by {worst}");
@@ -151,7 +151,7 @@ mod tests {
             let mut p = scene(w, h);
             let t = std::time::Instant::now();
             for _ in 0..8 {
-                figcraft_render::fx::blur(&mut p, sigma);
+                figcraft_render::fx::blur(&mut p, sigma, false);
             }
             let cpu = t.elapsed().as_secs_f64() * 1000.0 / 8.0;
             let t = std::time::Instant::now();
@@ -307,7 +307,7 @@ mod tests {
         }
         let t = std::time::Instant::now();
         for _ in 0..8 {
-            figcraft_render::fx::blur(&mut p, 6.0);
+            figcraft_render::fx::blur(&mut p, 6.0, false);
         }
         println!("  blur 130 × 130 sigma 6: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / 8.0);
         println!("one render of 600 × 600 (ms):");

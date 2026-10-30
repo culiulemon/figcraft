@@ -595,7 +595,7 @@ pub fn pane(g: &Glass, shape: &Outline, w: u32, h: u32, xf: Affine, scale: f64) 
 /// The glass of a `w` × `h` layer whose `shape` maps through `xf` (local → layer pixels), from
 /// `back`, its backdrop padded by `pad` pixels each way, at `scale` device pixels per unit.
 pub fn glass(g: &Glass, frame: EffectFrame<'_>) -> Option<Pixmap> {
-    let EffectFrame { shape, back, pad, size: (w, h), xf, scale } = frame;
+    let EffectFrame { shape, back, pad, size: (w, h), xf, scale, accelerate } = frame;
     let g = g.sanitized();
     let depth = (g.depth * scale).clamp(1.0, 1024.0);
     let band = (depth * (0.15 + 0.35 * g.splay)).max(1.0);
@@ -607,10 +607,11 @@ pub fn glass(g: &Glass, frame: EffectFrame<'_>) -> Option<Pixmap> {
     let m = depth.max(reach).ceil() as u32 + 4 * r as u32 + 4;
     let (fields, shift) = shape_fields(shape, xf, w, h, m, r)?;
     let mut frosted = back.clone();
-    fx::blur(&mut frosted, g.frost / 2.0 * scale);
+    fx::blur(&mut frosted, g.frost / 2.0 * scale, accelerate);
     // The canvas's GPU, when one is installed, paints the pane from the shape it keeps as
-    // textures; the CPU path below draws the same pixels.
-    if let Some(accelerator) = fx::accelerator()
+    // textures; the CPU path below draws the same pixels. Exports never ask for it.
+    if accelerate
+        && let Some(accelerator) = fx::accelerator()
         && let Some(mut pane) = pane(&g, shape, w, h, xf, scale)
     {
         pane.pad = pad;

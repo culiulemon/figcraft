@@ -23,19 +23,33 @@ pub const SIGNALS: &str = "signals";
 /// [`ServerMsg::Reported`]: a server sends them only to clients that say so.
 pub const HOSTING: &str = "hosting";
 
+/// The word a client puts in its [`Hello::client_version`] (or its managing connection's) when it
+/// reads [`Access::Comment`]: older ones get a comment link as a view link.
+pub const COMMENTS: &str = "comments";
+
 /// The `client_version` this build announces: its version, then what it reads beyond the protocol.
 pub fn client_version() -> String {
-    format!("{} {SIGNALS} {HOSTING}", env!("CARGO_PKG_VERSION"))
+    format!("{} {SIGNALS} {HOSTING} {COMMENTS}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Whether `client_version` announces `word`.
+fn announces(client_version: &str, word: &str) -> bool {
+    client_version.split_whitespace().any(|w| w == word)
 }
 
 /// A [`Hello::client_version`] that announces [`SIGNALS`].
 pub fn reads_signals(client_version: &str) -> bool {
-    client_version.split_whitespace().any(|w| w == SIGNALS)
+    announces(client_version, SIGNALS)
 }
 
 /// A [`Hello::client_version`] that announces [`HOSTING`].
 pub fn reads_hosting(client_version: &str) -> bool {
-    client_version.split_whitespace().any(|w| w == HOSTING)
+    announces(client_version, HOSTING)
+}
+
+/// A [`Hello::client_version`] that announces [`COMMENTS`].
+pub fn reads_comments(client_version: &str) -> bool {
+    announces(client_version, COMMENTS)
 }
 
 /// Join a file's session.
@@ -56,22 +70,72 @@ pub struct Hello {
     pub resume: Option<Resume>,
 }
 
-/// What a participant may do: edit, or only view (a view link). A viewer gets everyone's changes
-/// and presence, and the server refuses every batch it sends.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// What a participant may do: edit, only view (a view link), or view and comment (a comment
+/// link). A viewer gets everyone's changes and presence, and the server refuses every batch it
+/// sends; a commenter's batches are refused unless they only change comment threads. A level
+/// this build doesn't know reads as [`View`](Access::View), and a client that doesn't announce
+/// [`COMMENTS`] is welcomed with a comment link as a viewer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Access {
     #[default]
     Edit,
     View,
+    /// New levels go at the end: the binary form numbers them.
+    Comment,
+}
+
+/// Reads what [`Access`]'s derived `Serialize` writes (a variant's number in the binary form, its
+/// name in JSON); an unknown one reads as [`Access::View`].
+impl<'de> Deserialize<'de> for Access {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{EnumAccess, VariantAccess, Visitor};
+        struct Level(Access);
+        impl<'de> Deserialize<'de> for Level {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct Id;
+                impl Visitor<'_> for Id {
+                    type Value = Level;
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.write_str("an access level")
+                    }
+                    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Level, E> {
+                        Ok(Level(match v {
+                            0 => Access::Edit,
+                            2 => Access::Comment,
+                            _ => Access::View,
+                        }))
+                    }
+                    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Level, E> {
+                        Ok(Level(Access::parse(v).unwrap_or(Access::View)))
+                    }
+                }
+                d.deserialize_identifier(Id)
+            }
+        }
+        struct Unit;
+        impl<'de> Visitor<'de> for Unit {
+            type Value = Access;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an access level")
+            }
+            fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<Access, A::Error> {
+                let (Level(a), v) = data.variant()?;
+                v.unit_variant()?;
+                Ok(a)
+            }
+        }
+        d.deserialize_enum("Access", &["edit", "view", "comment"], Unit)
+    }
 }
 
 impl Access {
-    /// `"edit"` or `"view"`.
+    /// `"edit"`, `"view"` or `"comment"`.
     pub fn id(self) -> &'static str {
         match self {
             Access::Edit => "edit",
             Access::View => "view",
+            Access::Comment => "comment",
         }
     }
 
@@ -80,8 +144,15 @@ impl Access {
         match s.trim().to_ascii_lowercase().as_str() {
             "edit" => Some(Access::Edit),
             "view" => Some(Access::View),
+            "comment" => Some(Access::Comment),
             _ => None,
         }
+    }
+
+    /// This access as a client can read it: a comment link only views for one that doesn't
+    /// announce [`COMMENTS`] (`reads_comments` false).
+    pub fn for_reader(self, reads_comments: bool) -> Access {
+        if self == Access::Comment && !reads_comments { Access::View } else { self }
     }
 }
 
@@ -134,9 +205,11 @@ pub struct EditingText {
 /// ignored: a server drops them, a client skips them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signal {
-    /// [`Signal::CHAT`], [`Signal::SPOTLIGHT`] or (server to client) [`Signal::READY`].
+    /// [`Signal::CHAT`], [`Signal::SPOTLIGHT`], (client to server) [`Signal::NAME`] or (server to
+    /// client) [`Signal::READY`].
     pub kind: String,
-    /// Chat: the message (empty: closed). Spotlight: `"on"`, or empty when it stopped.
+    /// Chat: the message (empty: closed). Spotlight: `"on"`, or empty when it stopped. Name: the
+    /// new name.
     pub text: String,
 }
 
@@ -147,6 +220,11 @@ impl Signal {
     pub const SPOTLIGHT: &str = "spotlight";
     /// From the server, about the client itself, right after its welcome: signals may be sent.
     pub const READY: &str = "ready";
+    /// To the server: the client was renamed. The server keeps the new name and tells everyone,
+    /// the client too, with its [`ServerMsg::PeerJoined`] (it isn't passed on as a signal).
+    pub const NAME: &str = "name";
+    /// Longest name shown to others (characters).
+    pub const MAX_NAME: usize = 64;
     /// Longest chat message (characters).
     pub const MAX_CHAT: usize = 100;
     /// Longest signal on the wire before it is cleaned (bytes of kind and text together).
@@ -164,14 +242,19 @@ impl Signal {
         Signal { kind: Signal::READY.into(), text: String::new() }
     }
 
+    pub fn name(name: &str) -> Signal {
+        Signal { kind: Signal::NAME.into(), text: name.into() }
+    }
+
     /// A spotlight that is on.
     pub fn on(&self) -> bool {
         self.text == "on"
     }
 
     /// Untrusted input made safe to pass on or show: `None` for an unknown kind, a malformed
-    /// spotlight or anything oversized; a chat's control characters become spaces and it is cut to
-    /// [`MAX_CHAT`](Self::MAX_CHAT) characters (an all-blank one is empty: closed).
+    /// spotlight, a blank name or anything oversized; a chat's control characters become spaces and
+    /// it is cut to [`MAX_CHAT`](Self::MAX_CHAT) characters (an all-blank one is empty: closed); a
+    /// name is trimmed, loses its control characters and is cut to [`MAX_NAME`](Self::MAX_NAME).
     pub fn clean(self) -> Option<Signal> {
         if self.kind.len() + self.text.len() > Signal::MAX_BYTES {
             return None;
@@ -183,6 +266,11 @@ impl Signal {
             }
             Signal::SPOTLIGHT if self.text.is_empty() || self.on() => Some(self),
             Signal::READY if self.text.is_empty() => Some(self),
+            Signal::NAME => {
+                let name: String = self.text.trim().chars().filter(|c| !c.is_control()).take(Signal::MAX_NAME).collect();
+                let name = name.trim_end();
+                (!name.is_empty()).then(|| Signal::name(name))
+            }
             _ => None,
         }
     }
@@ -332,6 +420,18 @@ pub struct LinkInfo {
 pub struct NewLink {
     pub link: LinkInfo,
     pub token: String,
+}
+
+impl AdminReply {
+    /// This reply as a managing client can read it ([`Access::for_reader`]).
+    pub fn for_reader(mut self, reads_comments: bool) -> AdminReply {
+        match &mut self {
+            AdminReply::Links(links) => links.iter_mut().for_each(|l| l.access = l.access.for_reader(reads_comments)),
+            AdminReply::Link(l) => l.link.access = l.link.access.for_reader(reads_comments),
+            _ => {}
+        }
+        self
+    }
 }
 
 /// The answer to an [`Admin`] request (the first one on a connection answers [`Manage`]).

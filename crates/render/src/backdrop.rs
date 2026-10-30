@@ -34,6 +34,9 @@ pub struct EffectFrame<'a> {
     pub xf: Affine,
     /// Device pixels per document unit.
     pub scale: f64,
+    /// Whether the effects may run on the canvas's GPU (see [`crate::fx::blur`]): only a canvas
+    /// render asks for that, so exports stay on the CPU.
+    pub accelerate: bool,
 }
 
 /// One isolated surface of a render, and how it will be composited onto the surface below.
@@ -142,7 +145,7 @@ pub fn pad(n: &Node, scale: f64) -> u32 {
 /// from `back`: its backdrop around the layer, `pad` pixels more each way. `shape` maps through
 /// `xf` (local → layer pixels) at `scale` device pixels per unit. `None` when nothing shows.
 pub fn effects(n: &Node, frame: EffectFrame<'_>) -> Option<Pixmap> {
-    let EffectFrame { shape, back, pad, size: (w, h), xf, scale } = frame;
+    let EffectFrame { shape, back, pad, size: (w, h), xf, scale, accelerate } = frame;
     let pad_i = i32::try_from(pad).ok()?;
     let mut out: Option<Pixmap> = None;
     let mut cov: Option<Pixmap> = None;
@@ -150,7 +153,7 @@ pub fn effects(n: &Node, frame: EffectFrame<'_>) -> Option<Pixmap> {
         let layer = match &e.kind {
             EffectKind::BackgroundBlur(blur) if blur.max_radius() > 0.0 => {
                 let mut b = back.clone();
-                crate::blur::apply(&mut b, blur, (n.width, n.height), Affine::translate((f64::from(pad), f64::from(pad))) * xf, scale);
+                crate::blur::apply(&mut b, blur, (n.width, n.height), Affine::translate((f64::from(pad), f64::from(pad))) * xf, scale, accelerate);
                 let mut l = Pixmap::new(w, h)?;
                 let copy = PixmapPaint { blend_mode: tiny_skia::BlendMode::Source, ..Default::default() };
                 l.draw_pixmap(-pad_i, -pad_i, b.as_ref(), &copy, Transform::identity(), None);
@@ -276,6 +279,8 @@ pub fn effects_beneath(doc: &Document, roots: &[NodeId], id: NodeId, view: &View
             size: (view.width, view.height),
             xf: view.transform() * doc.world_transform(id),
             scale: view.scale,
+            // Exports draw through this: they stay on the CPU.
+            accelerate: false,
         },
     )
 }

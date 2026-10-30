@@ -16,6 +16,7 @@ pub mod glass;
 pub mod grain;
 pub mod image_profile;
 pub mod images;
+mod layer_budget;
 mod layers;
 pub mod lod;
 pub mod paint;
@@ -27,7 +28,7 @@ pub use dots::Dots;
 pub use draw::{layer_bounds, node_outline, paint_bounds, stroke_area, stroke_fill, stroke_rule, subtree_outline, ts_path};
 pub use export_depth::{ExportDepthError, MAX_EXPORT_DEPTH, check_export_depth};
 pub use fx::{Accelerator, GlassPaint, set_accelerator};
-pub use retained::{Retained, Work};
+pub use retained::{Begun, Retained, Steps, Work};
 pub use tiny_skia::{FillRule, Pixmap};
 
 use figcraft_color::{Color, ColorProfile};
@@ -92,9 +93,13 @@ pub struct Options {
     /// A dot grid over the background, under the layers (a board's canvas; drawn only where the
     /// background is).
     pub dots: Option<Dots>,
+    /// Whether the raster effects (blur, glass, shadows) may run on the window's GPU: only the
+    /// canvas asks for that, and only while its GPU preference is on. Exports and thumbnails stay
+    /// on the CPU whatever the window has, as they must be exact and independent.
+    pub accelerate: bool,
 }
 
-fn new_pixmap(w: u32, h: u32) -> Option<Pixmap> {
+pub(crate) fn new_pixmap(w: u32, h: u32) -> Option<Pixmap> {
     let w = w.clamp(1, 16_384);
     let h = h.clamp(1, 16_384);
     Pixmap::new(w, h)
@@ -117,7 +122,7 @@ pub(crate) fn backdrop_reach(radius: f64, scale: f64) -> f64 {
 static RENDERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The number of the render that just started.
-fn start_render() -> u64 {
+pub(crate) fn start_render() -> u64 {
     RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
@@ -138,7 +143,7 @@ pub fn render_view(doc: &Document, page: NodeId, view: &View, opts: &Options) ->
             // Layers whose effects read their backdrop (glass, background blur) hand the window's
             // GPU one submission a band and wait for it: with those, a band more costs a round-trip
             // and buys little (the layers below the band are drawn in parallel either way).
-            None if fx::accelerated() && backdrop_effects(doc, page) => threads.min(2),
+            None if opts.accelerate && backdrop_effects(doc, page) => threads.min(2),
             None => threads.min(view.height / 96).max(1),
         };
         if bands > 1
@@ -164,40 +169,59 @@ fn backdrop_effects(doc: &Document, page: NodeId) -> bool {
 fn render_bands(doc: &Document, page: NodeId, view: &View, opts: &Options, bands: u32) -> Option<Pixmap> {
     use rayon::prelude::*;
     let band_h = view.height.div_ceil(bands.max(1));
-    let overlap = backdrop_reach(max_backdrop_blur(doc), view.scale).ceil();
-    if !overlap.is_finite() || overlap > f64::from(band_h) {
-        return None;
-    }
-    let overlap = overlap as u32;
-    let s = view.scale.max(1e-9);
+    let overlap = band_overlap(doc, view, band_h)?;
     let parts: Vec<(u32, Option<Pixmap>)> = (0..bands)
         .into_par_iter()
         .map(|i| {
             let y0 = i * band_h;
-            let h = band_h.min(view.height.saturating_sub(y0)).max(1);
-            let top = y0.saturating_sub(overlap);
-            let bottom = (y0 + h + overlap).min(view.height).max(y0 + h);
-            let v = View { origin: (view.origin.0, view.origin.1 + f64::from(top) / s), scale: view.scale, width: view.width, height: bottom - top };
-            let part = render_one(doc, page, &v, opts);
-            let own = tiny_skia::IntRect::from_xywh(0, (y0 - top) as i32, view.width.clamp(1, 16_384), h);
-            (y0, if overlap == 0 { part } else { part.zip(own).and_then(|(p, r)| p.clone_rect(r)) })
+            (y0, render_band(doc, page, view, opts, y0, band_h, overlap))
         })
         .collect();
     let mut out = new_pixmap(view.width, view.height)?;
-    let row = out.width() as usize * 4;
     for (y0, part) in parts {
-        let Some(part) = part else { continue };
-        // Bands are as wide as the view: their rows go straight into place.
-        let start = y0 as usize * row;
-        let dst = out.data_mut();
-        let n = part.data().len().min(dst.len().saturating_sub(start));
-        if part.width() == view.width.clamp(1, 16_384)
-            && let (Some(d), Some(s)) = (dst.get_mut(start..start + n), part.data().get(..n))
-        {
-            d.copy_from_slice(s);
+        if let Some(part) = part {
+            put_band(&mut out, y0, &part);
         }
     }
     Some(out)
+}
+
+/// How many rows bands of `band_h` rows of `view` overlap (what background blurs read); `None`
+/// when that is more than a band.
+pub(crate) fn band_overlap(doc: &Document, view: &View, band_h: u32) -> Option<u32> {
+    let overlap = backdrop_reach(max_backdrop_blur(doc), view.scale).ceil();
+    (overlap.is_finite() && overlap <= f64::from(band_h)).then_some(overlap as u32)
+}
+
+/// The rows `y0 .. y0 + band_h` of `view` (fewer at the bottom), rendered with `overlap` rows
+/// more each way and cut back to their own.
+pub(crate) fn render_band(doc: &Document, page: NodeId, view: &View, opts: &Options, y0: u32, band_h: u32, overlap: u32) -> Option<Pixmap> {
+    let s = view.scale.max(1e-9);
+    let h = band_h.min(view.height.saturating_sub(y0)).max(1);
+    let top = y0.saturating_sub(overlap);
+    let bottom = (y0 + h + overlap).min(view.height).max(y0 + h);
+    let v = View { origin: (view.origin.0, view.origin.1 + f64::from(top) / s), scale: view.scale, width: view.width, height: bottom - top };
+    let part = render_one(doc, page, &v, opts);
+    if overlap == 0 {
+        return part;
+    }
+    let own = tiny_skia::IntRect::from_xywh(0, (y0 - top) as i32, view.width.clamp(1, 16_384), h);
+    part.zip(own).and_then(|(p, r)| p.clone_rect(r))
+}
+
+/// Copy a band's rows into `out` at row `y0` (bands are as wide as the view: their rows go
+/// straight into place).
+pub(crate) fn put_band(out: &mut Pixmap, y0: u32, part: &Pixmap) {
+    let row = out.width() as usize * 4;
+    let start = y0 as usize * row;
+    let width = out.width();
+    let dst = out.data_mut();
+    let n = part.data().len().min(dst.len().saturating_sub(start));
+    if part.width() == width
+        && let (Some(d), Some(s)) = (dst.get_mut(start..start + n), part.data().get(..n))
+    {
+        d.copy_from_slice(s);
+    }
 }
 
 /// Render a page region on the calling thread.
@@ -237,6 +261,7 @@ fn render_one(doc: &Document, page: NodeId, view: &View, opts: &Options) -> Opti
         page_at: (view.origin.0 * view.scale, view.origin.1 * view.scale),
         cache: (opts.doc_id != 0).then_some(opts.doc_id),
         images: if opts.doc_id != 0 { layers::images_id(doc) } else { 0 },
+        accelerate: opts.accelerate,
     };
     let xf = view.transform();
     let Some(p) = doc.node(page) else { return Some(pix) };
@@ -275,6 +300,7 @@ fn nodes_into(doc: &Document, ids: &[NodeId], view: &View, pix: &mut Pixmap, tim
         page_at: (view.origin.0 * view.scale, view.origin.1 * view.scale),
         cache: None,
         images: 0,
+        accelerate: false,
     };
     for id in ids {
         draw::draw_node(&ctx, pix, *id, view.transform() * parent_transform(doc, *id), 0);
@@ -496,6 +522,8 @@ mod backdrop_tests;
 #[cfg(test)]
 mod band_tests;
 #[cfg(test)]
+mod boolean_budget_tests;
+#[cfg(test)]
 mod boolean_cache_tests;
 #[cfg(test)]
 mod bounds_memo_tests;
@@ -531,6 +559,8 @@ mod layers_tests;
 mod lod_tests;
 #[cfg(test)]
 mod magnified_image_tests;
+#[cfg(test)]
+mod mask_bounds_tests;
 #[cfg(test)]
 mod paint_behaviour_tests;
 #[cfg(test)]

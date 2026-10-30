@@ -475,19 +475,32 @@ fn collect_flatten_parts(
             part
         }
         _ => {
-            let Some((path, rule)) = figcraft_render::node_outline(doc, node) else { return Ok(()) };
-            let mut part = VectorNetwork::from_path(&path);
-            for region in &mut part.regions {
-                if rule == figcraft_render::FillRule::EvenOdd {
-                    region.winding = WindingRule::EvenOdd;
-                }
-            }
+            let Some(part) = outline_part(doc, node)? else { return Ok(()) };
             part
         }
     };
     let into_parent = parent_world.inverse() * doc.world_transform(id);
     append_flatten_part(node, fallback_fills, output_fills, into_parent, part, net);
     Ok(())
+}
+
+/// What a layer other than a vector or a container flattens into: its outline (`None`: it has
+/// none). A boolean group has no outline only past the path operations' caps; flattening it would
+/// drop it, so that is refused.
+fn outline_part(doc: &Document, node: &Node) -> Result<Option<VectorNetwork>> {
+    let Some((path, rule)) = figcraft_render::node_outline(doc, node) else {
+        if matches!(node.kind, NodeKind::BooleanOp { .. }) {
+            return Err(bad("vector.flatten", figcraft_pathops::PathOpsError::TooComplex.to_string()));
+        }
+        return Ok(None);
+    };
+    let mut part = VectorNetwork::from_path(&path);
+    for region in &mut part.regions {
+        if rule == figcraft_render::FillRule::EvenOdd {
+            region.winding = WindingRule::EvenOdd;
+        }
+    }
+    Ok(Some(part))
 }
 
 fn append_flatten_part(
@@ -587,11 +600,14 @@ fn outline_stroke(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"ids": out}))
 }
 
-/// Infer direction, gap and padding from where children are (Figma's "Add auto layout").
+/// Infer direction, gap and padding from visible, non-absolute children, matching the layout flow.
 fn infer_layout(doc: &Document, frame: NodeId) -> AutoLayout {
     let Some(f) = doc.node(frame) else { return AutoLayout::default() };
-    let boxes: Vec<Rect> =
-        f.children.iter().filter_map(|c| doc.node(*c)).map(|c| figcraft_geom::transform_rect_bbox(c.transform, c.local_rect())).collect();
+    let boxes: Vec<Rect> = figcraft_layout::flow_children(doc, frame)
+        .iter()
+        .filter_map(|c| doc.node(*c))
+        .map(|c| figcraft_geom::transform_rect_bbox(c.transform, c.local_rect()))
+        .collect();
     if boxes.is_empty() {
         return AutoLayout { padding: [10.0; 4], gap: 10.0, ..Default::default() };
     }
@@ -608,12 +624,43 @@ fn infer_layout(doc: &Document, frame: NodeId) -> AutoLayout {
     AutoLayout { mode: if vertical { LayoutMode::Vertical } else { LayoutMode::Horizontal }, gap, padding: pad, ..Default::default() }
 }
 
+/// Sort unmasked spans by position along the layout axis. Masks stay at their original indices;
+/// each visible mask's following content keeps its paint order until the next mask, hidden or not.
+fn sort_layout_children(doc: &Document, kids: &mut [NodeId], vertical: bool) {
+    let mut start = 0;
+    let mut masked = false;
+    for end in 0..=kids.len() {
+        let mask = kids.get(end).and_then(|id| doc.node(*id)).filter(|n| n.is_mask);
+        if end != kids.len() && mask.is_none() {
+            continue;
+        }
+        if !masked && let Some(span) = kids.get_mut(start..end) {
+            span.sort_by(|a, b| {
+                let pa = doc.node(*a).map(|n| figcraft_geom::transform_rect_bbox(n.transform, n.local_rect())).unwrap_or_default();
+                let pb = doc.node(*b).map(|n| figcraft_geom::transform_rect_bbox(n.transform, n.local_rect())).unwrap_or_default();
+                if vertical { pa.y0.total_cmp(&pb.y0) } else { pa.x0.total_cmp(&pb.x0) }
+            });
+        }
+        start = end + 1;
+        masked = mask.is_some_and(|n| n.visible);
+    }
+}
+
+/// Add inferred auto layout to existing frames or one group converted in place; wrap other
+/// selections. Preserve mask boundaries and a converted group's Fill sizing in its parent.
 fn layout_add(s: &mut Session, p: &Value) -> Result<Value> {
     let ids = req_targets("layout.add", s, p)?;
     let dir = string(p, "direction");
     let doc = s.doc()?;
     let all_frames = ids.iter().all(|i| doc.node(*i).is_some_and(|n| n.kind.is_frame_like() && n.layout.is_none()));
-    let targets = if all_frames {
+    let single_group = ids.len() == 1 && ids.first().and_then(|i| doc.node(*i)).is_some_and(|n| matches!(n.kind, NodeKind::Group));
+    let in_place = all_frames || single_group;
+    let targets = if in_place {
+        if single_group {
+            // Layout must arrange the group's children directly. Wrapping the group would
+            // leave them in a single fixed-size layout item and add an unnecessary layer.
+            convert(s, &json!({"ids": ids}), "layout.add", true)?;
+        }
         ids
     } else {
         // Wrap non-frames in a new frame without a fill, then add auto layout to it.
@@ -634,23 +681,21 @@ fn layout_add(s: &mut Session, p: &Value) -> Result<Value> {
                 _ => LayoutMode::Horizontal,
             };
         }
-        // Children in reading order along the axis.
         let mut kids = doc.get(*f)?.children.clone();
-        let vertical = al.mode == LayoutMode::Vertical;
-        kids.sort_by(|a, b| {
-            let pa = doc.node(*a).map(|n| figcraft_geom::transform_rect_bbox(n.transform, n.local_rect())).unwrap_or_default();
-            let pb = doc.node(*b).map(|n| figcraft_geom::transform_rect_bbox(n.transform, n.local_rect())).unwrap_or_default();
-            if vertical { pa.y0.total_cmp(&pb.y0) } else { pa.x0.total_cmp(&pb.x0) }
-        });
+        sort_layout_children(doc, &mut kids, al.mode == LayoutMode::Vertical);
         let empty = doc.node(*f).is_some_and(|n| n.children.iter().filter_map(|c| doc.node(*c)).all(|c| !c.visible || c.child_layout.absolute));
         let n = doc.get_mut(*f)?;
         n.children = kids;
         n.layout = Some(al);
-        if !all_frames || !empty {
+        if !in_place || !empty {
             // A frame wrapped around the selection hugs it; an existing frame with no flow
             // children keeps its size instead of collapsing to its padding.
-            n.child_layout.sizing_h = Sizing::Hug;
-            n.child_layout.sizing_v = Sizing::Hug;
+            if !single_group || n.child_layout.sizing_h != Sizing::Fill {
+                n.child_layout.sizing_h = Sizing::Hug;
+            }
+            if !single_group || n.child_layout.sizing_v != Sizing::Fill {
+                n.child_layout.sizing_v = Sizing::Hug;
+            }
         }
     }
     s.set_selection(targets.clone());

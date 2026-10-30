@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
+use figcraft_engine::branches::{needs_copy, recovery_copy, stamp};
 use figcraft_engine::{DocState, Session};
 use figcraft_format::{Branch, Version};
 use serde_json::json;
@@ -203,8 +204,7 @@ impl Recovery {
             if entry.done.as_ref() == Some(&stamp) || entry.flight.is_some() {
                 continue;
             }
-            let doc = d.doc.clone();
-            let (versions, branches) = (d.versions.clone(), figcraft_engine::branches::current(s, d.uid));
+            let (doc, versions, branches) = recovery_copy(s, d);
             // Which online file it is and what of the server's this very copy has (a line each:
             // the server, the file's id, then the session, client id, last change and the secret the
             // client id resumes with), while it
@@ -319,23 +319,6 @@ fn rejoin_online(file: &Path, s: &mut Session) -> Option<u64> {
     let params =
         json!({"path": file.to_string_lossy(), "server": server, "file": id, "session": session, "client": client, "seq": seq, "secret": secret});
     s.execute("collab.recoverFile", &params).ok()?.get("session")?.as_u64()
-}
-
-/// A file whose changes would be lost: in its document, its history or one of its branch tabs
-/// (a branch tab's edits are saved with its main file, so the tab has no copy of its own).
-fn needs_copy(s: &Session, d: &DocState) -> bool {
-    d.branch_of.is_none() && (d.is_dirty() || branch_tabs(s, d.uid).any(DocState::is_dirty))
-}
-
-/// The tabs showing branches of the file in tab `uid`.
-fn branch_tabs(s: &Session, uid: u64) -> impl Iterator<Item = &DocState> {
-    s.docs.iter().filter(move |t| t.branch_of.as_ref().is_some_and(|(main, _)| *main == uid))
-}
-
-/// The revisions a copy of `d` is of: its own and its branch tabs' (a branch tab's edits change
-/// only its own revision). A new copy is due when they change.
-fn stamp(s: &Session, d: &DocState) -> Vec<u64> {
-    std::iter::once(d.revision).chain(branch_tabs(s, d.uid).map(|t| t.revision)).collect()
 }
 
 /// Write `doc` with its version history and branches to `path` through a temporary file; false

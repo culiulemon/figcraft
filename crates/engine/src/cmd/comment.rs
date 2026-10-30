@@ -7,7 +7,7 @@
 
 use std::fmt::Write as _;
 
-use figcraft_doc::{Comment, Document, Message, Node, NodeId, NodeKind, geom};
+use figcraft_doc::{Comment, Document, Message, Node, NodeId, NodeKind, geom, mentions};
 use serde_json::{Value, json};
 
 use super::{CommandSpec, ok};
@@ -326,25 +326,66 @@ fn local(doc: &Document, anchor: Option<NodeId>, x: f64, y: f64) -> (f64, f64) {
     }
 }
 
-fn message_json(m: &Message) -> Value {
+/// The names an @mention resolves to: the file's people (`Document::comment_people`) and `user`,
+/// as the thread view highlights them.
+fn mentionable<'a>(people: &'a [String], user: &'a str) -> Vec<&'a str> {
+    people.iter().map(String::as_str).chain([user]).collect()
+}
+
+/// The names `text` @mentions by the rule the thread view highlights them with
+/// ([`figcraft_doc::mentions`]), and whether each is one of `people` (else it is the letters and
+/// digits after the `@`).
+fn mentioned<'a>(text: &'a str, people: &[&'a str]) -> impl Iterator<Item = (&'a str, bool)> {
+    mentions(text, people).into_iter().map(move |(r, who)| (who.or_else(|| text.get(r.start + 1..r.end)).unwrap_or_default(), who.is_some()))
+}
+
+/// Whether a message of `c` @mentions `name` (any case), as `comment.list` reports mentions;
+/// `name` resolves like one of `people`, so a name nobody in the file has can be several words.
+fn thread_mentions(c: &Comment, people: &[&str], name: &str) -> bool {
+    let people: Vec<&str> = people.iter().copied().chain([name]).collect();
+    c.messages().any(|m| mentioned(&m.text, &people).any(|(n, _)| n.eq_ignore_ascii_case(name)))
+}
+
+/// `comment.list`'s `mentions` filter: a name (a leading `@` is fine), or none.
+fn mentions_param(p: &Value) -> crate::Result<Option<String>> {
+    match get(p, "mentions") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if !s.trim().trim_start_matches('@').trim().is_empty() => {
+            Ok(Some(s.trim().trim_start_matches('@').trim().to_string()))
+        }
+        Some(_) => Err(bad("comment.list", "`mentions` must be a name")),
+    }
+}
+
+/// A message as JSON, with the names it @mentions: `{name, known, you}` each, resolved against
+/// `people` (`mentionable`); `known: false` is a name nobody in the file has.
+fn message_json(m: &Message, people: &[&str], user: &str) -> Value {
+    let mut named: Vec<Value> = Vec::new();
+    for (name, known) in mentioned(&m.text, people) {
+        let v = json!({"name": name, "known": known, "you": known && name.eq_ignore_ascii_case(user)});
+        if !named.contains(&v) {
+            named.push(v);
+        }
+    }
     json!({
         "author": m.author, "agent": m.agent, "text": m.text, "created": m.created, "edited": m.edited,
         "reactions": m.reactions.iter().map(|r| json!({"emoji": r.emoji, "users": r.users})).collect::<Vec<_>>(),
+        "mentions": named,
     })
 }
 
 /// JSON view of a comment as `user` sees it: its page position, frame, read state and link, the
-/// first message's fields, and the replies.
-pub fn comment_json(doc: &Document, c: &Comment, user: &str) -> Value {
+/// first message's fields, and the replies; mentions resolve against `people` (`mentionable`).
+pub fn comment_json(doc: &Document, c: &Comment, user: &str, people: &[&str]) -> Value {
     let (x, y) = c.position(doc);
     let frame = frame_of(doc, c);
-    let mut v = message_json(&c.first);
+    let mut v = message_json(&c.first, people, user);
     let extra = json!({
         "id": c.id, "page": c.page, "pageName": doc.node(c.page).map(|n| n.name.as_str()),
         "x": x, "y": y, "anchor": c.anchor,
         "frame": frame, "frameName": frame.and_then(|f| doc.node(f)).map(|n| n.name.as_str()),
         "resolved": c.resolved, "unread": c.is_unread(user), "link": link(c.id),
-        "replies": c.replies.iter().map(message_json).collect::<Vec<_>>(),
+        "replies": c.replies.iter().map(|m| message_json(m, people, user)).collect::<Vec<_>>(),
     });
     if let (Some(m), Value::Object(e)) = (v.as_object_mut(), extra) {
         m.extend(e);
@@ -410,7 +451,8 @@ fn open(s: &mut Session, id: u64, how: &str, who: &str) -> crate::Result<Value> 
     s.request_ui("comment.open", json!({"id": id}));
     let doc = s.doc()?;
     let c = doc.comment(id).ok_or_else(|| bad("comment.open", "no comment"))?;
-    Ok(comment_json(doc, c, who))
+    let people = doc.comment_people();
+    Ok(comment_json(doc, c, who, &mentionable(&people, who)))
 }
 
 /// A list's page (None: every page), filter, sort and search text from params.
@@ -789,14 +831,21 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "comment.list",
             "List comments",
-            "{page? (default: current; \"all\" for every page), filter? (all|open|resolved|mine|unread; default all), sort? (date|page; default date), query? (search text), frame? (a top-level frame id), resolved? (false hides resolved ones), author? (whose threads and read state)}",
+            "{page? (default: current; \"all\" for every page), filter? (all|open|resolved|mine|unread; default all), sort? (date|page; default date), query? (search text), frame? (a top-level frame id), resolved? (false hides resolved ones), author? (whose threads and read state), mentions? (a name, any case: only threads where a message @mentions it, as each message's `mentions` reports)}",
             false,
             |s, p| {
                 let doc = s.doc()?;
                 let (page, filter, sort, text) = list_params("comment.list", s, p)?;
+                let want = mentions_param(p)?;
                 let who = author(s, p);
                 let q = Query { page, frame: id(p, "frame"), filter, sort, text: &text };
-                let list: Vec<Value> = query(doc, &q, &who).into_iter().map(|c| comment_json(doc, c, &who)).collect();
+                let people = doc.comment_people();
+                let people = mentionable(&people, &who);
+                let list: Vec<Value> = query(doc, &q, &who)
+                    .into_iter()
+                    .filter(|c| want.as_deref().is_none_or(|w| thread_mentions(c, &people, w)))
+                    .map(|c| comment_json(doc, c, &who, &people))
+                    .collect();
                 Ok(json!({"comments": list}))
             }
         ),

@@ -19,6 +19,14 @@ The server lives in `crates/mcp` (`figcraft-mcp`) and is started by the CLI:
 
 `--attach` also takes `host:port`. The control channel only listens on 127.0.0.1.
 
+While an attached agent works, the app shows where, as it shows a person in a live session: its
+avatar, in a colour of its own and named as its comments are signed ("Claude (agent)", see
+Comments), joins the people row at the top of the right panel, and the canvas outlines the layers
+its last edit changed, or that it last selected, with its name. Both go 8 seconds after its last
+command, and only the file it works in shows them. This is display only: no undo step, nothing
+saved, nothing sent to a live session's other people, and nothing changes in what the agent may
+do.
+
 Attached calls are never automatically replayed after a transport failure: the app may have
 applied the request before its reply was lost. The error reports that the operation may have
 completed; inspect the document before retrying an edit. The next explicit call reconnects.
@@ -351,7 +359,7 @@ a later step can use `{"$step": 0, "field": "ids/0"}` to target the first match.
 | `select {ids}` | Replace the selection (`[]` deselects). |
 | `export {ids, format, scale \| size, path?, bleed?, cropMarks?, bleedMarks?, cmyk?, contentsOnly?, includeBoundingBox?, svgOutlineText?, svgIdAttribute?, svgSimplifyStroke?, vdCompat?}` | png, jpg, svg, webp, pdf, xml (an Android Vector Drawable: `svgIdAttribute` writes `android:name`, `vdCompat` is `bestEffort` (default: approximated with a warning), `exact` (left out with a warning) or `ignore` (no warnings: overlapping layer opacity dropped, even-odd fills kept as `fillType="evenOdd"`, diamond gradients left out), and the result lists `warnings` for what was changed or left out), or `fig`: the whole file as `.fig`, experimental (see Exporting `.fig` files below); `size` is `2x`, `512w` or `512h`. The image covers what the layers paint (shadows towards their offset, strokes, unclipped children, a mask group's mask; hidden layers take no room; a slice is its area with everything under it, or only the frame or group it sits in while `contentsOnly` is on); `contentsOnly: false` also draws every other layer showing in that area, `includeBoundingBox` exports the layers' own boxes; SVG: `svgOutlineText: false` keeps `<text>`, `svgIdAttribute` writes unique ids from layer names, `svgSimplifyStroke: false` writes every stroke as an outline. The same options go in export settings (`export.add` / `export.update`). PDF: frames one page each (sized in points), anything else together on one page; print options: `bleed` (points or a length like `"3mm"`, `"0.125in"`), crop and bleed marks, CMYK colour (see Exports below), also taken by `file.export`, `file.exportLayers`, `file.exportFramesPdf` and stored per export setting by `export.add` / `export.update`; `run_command` `file.exportFramesPdf {page?, path?}` writes every top-level frame of a page. Without `path`, images come back as MCP image content, SVG as text, XML as text followed by `{format, bytes, warnings}`. Layers' own export settings: `run_command` with `export.add` / `export.update {index, size?, suffix?, format?}` / `export.remove` and `file.exportLayers {ids?, dir?, assets?}` (every layer once per setting, named `<layer><suffix>.<format>`, a slash in a layer name making a folder; `assets: true` exports the Inspect tab's assets instead: icons as SVG, images as PNG). |
 | `screenshot {ids?, scale?, maxSize?, window?}` | PNG of the page (with background) or of layers, scaled to fit `maxSize` (default 1600). `window: true` captures the app window in front when attached, a window id (see Windows below) that window. |
-| `open_file {path, variables?, reload?}` / `save_file {path?}` | Open `.figcraft`, `.json` (FigCraft JSON or REST API file JSON with its variables, see below), `.fig` (best effort, see below), `.sketch` (Sketch 48 and newer, best effort), `.svg` (see Importing SVG below) or an image; save as `.figcraft`. `open_file` returns `opened` (for a file opened anew, a `summary` of `name`, `pages`, `layers` and `images`, and `warnings` or `repairs`; a file that was already open gives its `index`, with `stale: true` when the file changed on disk since that tab read or saved it; `reload: true` reads it again into the tab, refused while the tab has unsaved changes) and the document's `document` outline. |
+| `open_file {path, variables?, reload?}` / `save_file {path?}` | Open `.figcraft`, `.json` (FigCraft JSON or REST API file JSON with its variables, see below), `.fig` or FigJam `.jam` (best effort, see below), `.sketch` (Sketch 48 and newer, best effort), `.svg` (see Importing SVG below) or an image; save as `.figcraft`. `open_file` returns `opened` (for a file opened anew, a `summary` of `name`, `pages`, `layers` and `images`, and `warnings` or `repairs`; a file that was already open gives its `index`, with `stale: true` when the file changed on disk since that tab read or saved it; `reload: true` reads it again into the tab, refused while the tab has unsaved changes) and the document's `document` outline. |
 | `undo` / `redo` | Step through history. |
 | `pointer {kind, x, y, to?, steps?, tool?, shift, alt, cmd, pressure?, pressureTo?}` | Mouse gestures in page coordinates with the current tool: `click`, `double`, `drag`, `down`, `move`, `up`, `hover`. A dragged layer drops into the frame or auto layout slot under the pointer, except one inside a group, a boolean group or an instance (outside its slots), which only moves. `pressure` (0–1) is pen pressure; a drag goes from `pressure` to `pressureTo` (see Brushes and pen pressure). |
 | `key {key, shift, alt, cmd}` | A shortcut or key as if typed on the canvas (every default shortcut, tool keys, Escape, Delete, arrows, number keys for opacity, arrows that pan the view when nothing is selected; while editing text, the text shortcuts and then text editing keys). Keys are names like `A`, `0`, `Enter`, `ArrowLeft`, `=`, `/`, or egui's (`Plus`, `Questionmark`); `cmd` is Cmd on macOS and Ctrl elsewhere. |
@@ -951,7 +959,9 @@ remove and reorder layers there, unlike the rest of an instance). It is a compon
 `value: {layer, edited, layers}`).
 
 - **Define** (on the main): `component.makeSlot {id (a frame inside a main component), name?,
-  preferred? [component or set ids]}` (the property is named after the frame by default);
+  preferred? [component or set ids]}` (the property is named after the frame by default; a new
+  property goes last, as `component.properties` lists them in the order they were made, a rename
+  keeping the place);
   `component.editProperty {name, preferred}`; `component.removeSlot {id}` (instances lose their own
   content in it). `component.addProperty {type: "slot", layer}` and `component.bindProperty {field:
   "slot"}` work too (one frame per component for a slot).
@@ -1177,8 +1187,18 @@ someone (`comment.people` lists the names used in the file and, as `you`, who is
 Read state is kept per name: a new message is unread for everyone but its author;
 `comment.markRead {id? | link?, read?}` marks one thread (or, without `id`, all of them) read or
 unread (not an undo step). `comment.list {page? | "all", filter? (all|open|resolved|mine|unread),
-sort? (date|page), query?, frame?}` returns the threads with their position, `frame`/`frameName`,
-`pageName`, `unread`, `link` and replies (with `edited` times and `reactions`). Links are
+sort? (date|page), query?, frame?, mentions?}` returns the threads with their position, `frame`/`frameName`,
+`pageName`, `unread`, `link` and replies (with `edited` times and `reactions`). Each message, the
+first and every reply, has `mentions`: the names it @mentions by the rule the app highlights them
+with, `{name, known, you}` each. `known` means the file's people (`comment.people`, or you) have
+the name, spelt as they spell it; `you` means it names you (or `author`). `@Name` counts at the
+start of the text or after a character that isn't a letter or digit, so `a@b.com` mentions nobody;
+an unknown name is the letters and digits after the `@`. `mentions: "<name>"` (any case; a leading
+`@` is fine) lists only the threads where a message, the first or a reply, mentions that name as
+those `mentions` report it, combined with the other filters: `{"mentions": "Claude", "filter":
+"unread"}` is the unread threads that tag Claude. `@Ada Lovelace` mentions "Ada Lovelace", not
+"Ada", when the file knows Ada Lovelace; a name nobody in the file has can still be several words
+(`"Zoe Smith"` finds `@Zoe Smith`). Links are
 `figcraft://comment/<id>`: `comment.link {id}` returns one, `comment.open {id | link, view?}` goes
 to its page, zooms to its frame (`fit`, the default; `center` keeps the zoom; `keep` doesn't move)
 and opens it in the app, and `comment.next {id?, dir?, …list params}` steps to the next or previous
@@ -1324,7 +1344,8 @@ joined file opens as a new document).
 
 Sessions are per document: every open document has its own session or none, and several run at
 once (host one document, join another, publish a third). They keep syncing while another document
-is active; there your presence is empty (no cursor, selection or view). The `collab.*` commands
+is active; there your presence is empty (no cursor, selection or view). An attached agent's own
+presence in the app (above) is never part of a live session's presence. The `collab.*` commands
 and `collab.peers` are about the **active document's** session (`doc.switch {index}` changes which
 one that is), and `sessions` in `collab.peers` lists them all. Closing a document ends its session
 only: a host stops hosting it, a guest leaves it.
@@ -1335,10 +1356,12 @@ only: a host stops hosting it, a guest leaves it.
   FigCraft server unless changed; `{url: ""}` turns online sharing off, `{}` goes back to the
   built-in one; `server` names another for this call, with `?key=…` when it needs its key) and
   returns `status: "connecting"`; once `collab.peers` says `"live"`, `code` is the code to give
-  others (`K7M-2QX-9TD`) and `share` is `{via, access, shared, editCode, viewCode, editLink,
-  viewLink}`: links and codes made for others (`published.edit` / `published.view` and `link` are
+  others (`K7M-2QX-9TD`) and `share` is `{via, access, shared, editCode, viewCode, commentCode, editLink,
+  viewLink, commentLink}`: links and codes made for others (`published.edit` / `published.view` and `link` are
   your own way in; keep them). `access: "view"` (or calling again with it while shared) makes
-  `code` the view-only one. A server older than join codes leaves `code` null: give
+  `code` the view-only one, and `access: "comment"` the one for viewing and commenting (whoever
+  joins with it adds, replies to, reacts to and resolves comments but can't change the design;
+  `commentCode` is null from a server older than comment links, and asking for it then fails). A server older than join codes leaves `code` null: give
   `share.editLink` / `share.viewLink` instead. `via: "local"`
   hosts the document for people on the same network and returns at once with a longer `code`
   (20 symbols, carrying this machine's IPv4 address, the port and the session's secret; `bind:
@@ -1373,7 +1396,8 @@ only: a host stops hosting it, a guest leaves it.
   session, a revoked link, an unreachable host, a `wss://` server whose certificate isn't trusted:
   see `FIGCRAFT_CA_FILE` in [`server.md`](server.md#behind-a-reverse-proxy-tls)). `collab.leave {}`
   leaves the active document's session (or ends a join started from it that is still on its way
-  or failed); the synced document stays open as your copy.
+  or failed), and `collab.leave {session}` the session with that id (from `sessions`), whichever
+  document is active; the synced document stays open as your copy.
 - `collab.publish {server, name?, key?}` puts the active document on a `figcraft-server`
   ([`server.md`](server.md)) and syncs it from there (as that document's session; others go on): `server` is the address
   `figcraft-server key` prints (`ws://host:47900/?key=…`; or give `key` separately), `name` the
@@ -1382,6 +1406,8 @@ only: a host stops hosting it, a guest leaves it.
   file, name, edit, view}` with the file's first edit link and view link (they carry their
   tokens: share them like passwords). Someone joining with the view link gets `access: "view"`:
   every edit on the synced document is refused with "View only: …" (the server refuses them too).
+  With a comment link (`access: "comment"`) the comment commands work and sync, and every other edit
+  is refused with "Can comment: …".
   On a server open to the public ([`server.md`](server.md#running-a-public-server)) `server` needs no
   key (`wss://figcraft.example.com/`): `published` then also has `owner` (the owner token, shown this
   once: keep it) and `expires` (when the server deletes the file unless someone opens it, seconds
@@ -1442,10 +1468,11 @@ only: a host stops hosting it, a guest leaves it.
   and the rest is null or empty), status
   (off|connecting|live|reconnecting|failed), reason?,
   attempt?, role (host|guest), me, name, color, fileName, pages, link, url, address, network,
-  access (edit|view), readOnly (the active document can't be edited now: view only, or being
-  published), published (a file you published: {server, file, name, edit, view, owner, expires}),
+  access (edit|view|comment), readOnly (the active document can't be edited now: view only,
+  comment only, or being published), published (a file you published: {server, file, name, edit, view, owner, expires}),
   code (the join code to give others when the document was shared with `collab.share`, else
-  null), share ({via: online|local, access, shared, editCode, viewCode, editLink, viewLink}, or
+  null), share ({via: online|local, access, shared, editCode, viewCode, commentCode, editLink, viewLink,
+  commentLink}, or
   null; `shared: false`: your file on a server, not shared now),
   hosting (what the server of the file you're in says: {open, operator, terms, idleDays, maxFileMb,
   expires}, or null),
@@ -2062,6 +2089,20 @@ the two can be mixed. Names are any non-empty string and must be unique within t
   {"command":"edit.duplicate","as":"copy","params":{"ids":[5]}},
   {"command":"node.set","params":{"ids":[{"$ref":"copy","field":"ids/0"}],"props":{"name":"Card copy"}}}]}}}
 ```
+
+To edit inside a copy, pass `"map": true`: `edit.duplicate` then also returns `map`, each original
+layer's id (as a string, since JSON keys are strings), descendants included, paired with its copy's
+id, e.g. `{"ids": [8], "map": {"5": 8, "6": 9, "7": 10}}`. Nested frames, groups and instances (and
+their sublayers) are in it; a main component's copy is an instance of it, so its sublayers pair with
+the instance's. So `"field": "map/6"` is the copy of layer 6:
+
+```json
+{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"batch","arguments":{"label":"Copy","commands":[
+  {"command":"edit.duplicate","as":"copy","params":{"ids":[5],"map":true}},
+  {"command":"node.set","params":{"ids":[{"$ref":"copy","field":"map/6"}],"props":{"text":"Copy title"}}}]}}}
+```
+
+Without `map` the result is `{"ids": [...]}` as before.
 
 A path may start with `/`, as in JSON Pointer (`/ids/0`). A key that itself holds `/` is matched as
 written before it is read as a path. A path ends at whatever value it reaches, so `"field": "ids"` is

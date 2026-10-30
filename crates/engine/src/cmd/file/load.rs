@@ -4,7 +4,13 @@ use super::{DocState, Document, EngineError, LineHeight, NodeId, NodeKind, Resul
 
 /// The recovery copy at `path` as a document with unsaved changes and no path.
 pub(crate) fn recovered(path: &str) -> Result<DocState> {
-    let loaded = read(path).and_then(|b| figcraft_format::load_bytes_with_versions(&b).map_err(|e| EngineError::Other(e.to_string())))?;
+    recovered_from(&read(path)?)
+}
+
+/// A recovery copy's bytes as a document with unsaved changes and no path (the browser keeps its
+/// copies in the page's storage, not in files).
+pub(crate) fn recovered_from(bytes: &[u8]) -> Result<DocState> {
+    let loaded = figcraft_format::load_bytes_with_versions(bytes).map_err(|e| EngineError::Other(e.to_string()))?;
     Ok(DocState::new(loaded.doc, None).with_versions(loaded.versions).with_branches(loaded.branches).unsaved())
 }
 
@@ -70,7 +76,20 @@ pub fn load_path(path: &str, variables: Option<&Value>) -> Result<(figcraft_form
 /// Load from bytes. Returns the document with its notes (repairs of a native file, or import
 /// warnings) and version history, and whether it was imported from REST API file JSON or a `.fig`
 /// file (such a file is never saved over). `variables`: the local variables JSON for a REST API file JSON.
+/// Components containing each other's instances are broken apart, with a note.
 pub(super) fn load_with(
+    bytes: &[u8],
+    name_hint: &str,
+    variables: Option<&Value>,
+    images: figcraft_format::rest::ImageResolver,
+) -> Result<(figcraft_format::Loaded, bool)> {
+    let (mut loaded, rest) = load_any(bytes, name_hint, variables, images)?;
+    let notes = crate::components::break_component_cycles(&mut loaded.doc);
+    loaded.issues.extend(notes);
+    Ok((loaded, rest))
+}
+
+fn load_any(
     bytes: &[u8],
     name_hint: &str,
     variables: Option<&Value>,
